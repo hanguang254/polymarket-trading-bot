@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Polymarket 全自动交易机器人 v3
-核心策略：提前下注 + 结束前30秒平仓，完全不依赖结算
+Polymarket 全自动交易机器人 v3.1
+核心策略：预热观察 → 趋势确认下注 → 实时盯盘平仓
 
 时间线（5分钟=300秒市场）：
-  0s   市场开始
-  60s  开始分析（已有1分钟数据）
-  80s  执行下注（如果满足条件）
-  250s 检查当前赔率，准备平仓
-  270s 执行卖出（结束前30秒）
-  300s 市场结束（我们已经退出）
+  0s    市场开始
+  60s   预热扫描开始（积累趋势数据）
+  120s  下注窗口开启（已有60秒观察数据）
+  180s  下注窗口关闭
+  下注后 立即进入实时监控（止盈/止损/趋势反转）
+  120s  时间止盈（盈利中挂单锁利）
+  60s   强制平仓开始
+  30s   激进清仓
+  10s   地板价清仓
+  0s    市场结束
 """
 import sys
 import time
@@ -225,6 +229,8 @@ class MarketTracker:
         self.ptb_cache = {}
         self.analyzed = set()
         self.positions = {}  # slug -> Position
+        self.warmup_data = {}  # slug -> [{price, direction, timestamp}, ...]
+        self.warmup_started = set()  # 已开始预热的市场
     
     def update_markets(self):
         """更新市场列表"""
@@ -247,34 +253,91 @@ class MarketTracker:
         return markets
     
     def check_analysis_trigger(self):
-        """检查是否需要分析（市场开始后60秒）"""
+        """预热观察 + 趋势确认下注"""
         now = datetime.now(timezone.utc)
         
         for slug, market in list(self.tracked.items()):
-            if slug in self.analyzed:
-                continue
-            
             end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
             start_dt = end_dt - timedelta(minutes=5)
             elapsed = (now - start_dt).total_seconds()
+            remaining = (end_dt - now).total_seconds()
             
-            # 市场开始后 60-80 秒触发分析
-            if 60 <= elapsed <= 80:
+            # === 预热期：60s-120s（市场开始后60秒开始采集） ===
+            if 60 <= elapsed <= 180 and slug not in self.analyzed:
+                if slug not in self.warmup_started:
+                    self.warmup_started.add(slug)
+                    self.warmup_data[slug] = []
+                    print(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s")
+                
+                # 每5秒采集一次趋势数据
+                samples = self.warmup_data.get(slug, [])
+                if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= 5:
+                    try:
+                        from ai_trader.binance_api import get_binance_price
+                        price = get_binance_price(market["coin"])
+                        if price:
+                            direction = "UP" if len(samples) > 0 and price > samples[-1].get("price", price) else "DOWN"
+                            samples.append({"price": price, "direction": direction, "ts": time.time()})
+                            self.warmup_data[slug] = samples
+                    except:
+                        pass
+            
+            # === 下注窗口：120s-180s（已有60秒观察数据） ===
+            if 120 <= elapsed <= 180 and slug not in self.analyzed:
                 self.analyzed.add(slug)
-                self.analyze_and_trade(slug, market)
+                
+                # 趋势确认（参考，不阻止分析）
+                samples = self.warmup_data.get(slug, [])
+                trend_strength = self._calc_trend_strength(samples)
+                
+                # 趋势信息传递给分析引擎
+                extra_info = {"trend_strength": trend_strength, "warmup_samples": len(samples)}
+                
+                if trend_strength == "震荡":
+                    print(f"\n⚠️ {market['coin']} | {slug} | 趋势震荡，提高阈值到15%")
+                    extra_info["min_discount"] = 0.15  # 震荡时提高折价阈值
+                
+                self.analyze_and_trade(slug, market, extra_info)
+    
+    def _calc_trend_strength(self, samples):
+        """计算趋势强度"""
+        if len(samples) < 4:
+            return "震荡"
+        
+        # 计算价格方向
+        ups = 0
+        for i in range(1, len(samples)):
+            if samples[i]["price"] > samples[i-1]["price"]:
+                ups += 1
+        
+        total = len(samples) - 1
+        if total == 0:
+            return "震荡"
+        
+        ratio = ups / total
+        
+        if ratio >= 0.75 or ratio <= 0.25:
+            return "强趋势"
+        elif ratio >= 0.6 or ratio <= 0.4:
+            return "中趋势"
+        else:
+            return "震荡"
     
     def check_close_trigger(self):
         """平仓逻辑已移至position_monitor.py统一管理"""
         pass
     
-    def analyze_and_trade(self, slug, market):
-        """分析并下注"""
+    def analyze_and_trade(self, slug, market, extra_info=None):
+        """分析并下注（带趋势确认）"""
         coin = market["coin"]
         up_odds = market["up_odds"]
         down_odds = market["down_odds"]
+        trend = extra_info.get("trend_strength", "未知") if extra_info else "未知"
+        warmup_n = extra_info.get("warmup_samples", 0) if extra_info else 0
         
         print(f"\n{'='*60}")
         print(f"🔔 分析市场: {coin} | {slug}")
+        print(f"  📊 趋势: {trend} | 预热采样: {warmup_n}个")
         
         # 获取 PTB
         ptb = self.ptb_cache.get(slug) or get_ptb_multi_strategy(slug, coin)
@@ -410,15 +473,16 @@ class MarketTracker:
 
 
 def main():
-    print("🤖 Polymarket 全自动交易机器人 v3 启动")
-    print("   策略: 60秒分析 → 立即下注 → 270秒平仓")
-    print("   优化: Playwright按需启动，用完即关闭")
+    print("🤖 Polymarket 全自动交易机器人 v3.1 启动")
+    print("   策略: 60s预热观察 → 趋势确认下注 → 实时盯盘平仓")
+    print("   下注窗口: 120s-180s（市场开始后）")
+    print("   趋势确认: 强/中趋势正常阈值，震荡提高到15%")
     print("   容错: 自动捕获异常，避免EPIPE崩溃")
     print()
     
     tracker = MarketTracker()
     error_count = 0
-    max_errors = 10
+    max_errors = 100
     
     try:
         while True:

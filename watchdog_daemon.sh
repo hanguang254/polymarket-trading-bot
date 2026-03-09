@@ -14,14 +14,14 @@ while true; do
     if ! pgrep -f "auto_bot_v3.py" > /dev/null; then
         echo "[$(date)] auto_bot_v3.py 已停止，重启中..." >> /tmp/watchdog.log
         cd "$SCRIPT_DIR"
-        nohup python3 -u auto_bot_v3.py > "$LOG_DIR/auto_bot.log" 2>&1 &
+        nohup python3 -u auto_bot_v3.py >> "$LOG_DIR/bot_v3.log" 2>> "$LOG_DIR/bot_v3_err.log" &
     fi
     
     # 检查 position_monitor.py
     if ! pgrep -f "position_monitor.py" > /dev/null; then
         echo "[$(date)] position_monitor.py 已停止，重启中..." >> /tmp/watchdog.log
         cd "$SCRIPT_DIR"
-        nohup python3 -u position_monitor.py > "$LOG_DIR/position_monitor.log" 2>&1 &
+        nohup python3 -u position_monitor.py >> "$LOG_DIR/position_monitor.log" 2>> "$LOG_DIR/position_monitor_err.log" &
     fi
     
     # 每60秒检查一次

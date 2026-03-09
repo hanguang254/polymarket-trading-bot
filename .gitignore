@@ -46,3 +46,4 @@ Thumbs.db
 # Node modules (if any)
 node_modules/
 wallet_backup.txt
+.env.systemd

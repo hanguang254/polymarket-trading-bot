@@ -588,7 +588,9 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    print("🔍 持仓监控 v2 启动（4阶段平仓 | 120s→90s→60s→30s）...")
+    print("🔍 持仓监控 v3 启动（实时盯盘 + 4阶段平仓）...")
+    print("   实时盯盘: 止盈15%/8% | 止损10% | 趋势反转3%")
+    print("   阶段1: 180s | 阶段2: 120s | 阶段3: 60s | 阶段4: 30s")
     
     close_attempts = {}  # slug -> attempts count
     
@@ -624,8 +626,8 @@ def monitor():
                 end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
                 remaining = (end_time - now).total_seconds()
                 
-                # 自动清理：市场结束超过60秒的持仓标记关闭
-                if remaining < -60:
+                # 自动清理：市场结束超过30秒的持仓标记关闭
+                if remaining < -30:
                     close_position(pos, 0)
                     print(f"  🗑️ 清理过期持仓: {slug} (过期{-remaining:.0f}s)")
                     continue
@@ -641,8 +643,58 @@ def monitor():
                 
                 sold = False
                 
-                # ═══ 阶段1：结束前120-90秒（流动性健康期）═══
-                if 90 < remaining <= 120:
+                # ═══ 实时盯盘：任何时间段都检查止盈止损 ═══
+                if remaining > 60:  # 60秒内交给强制平仓阶段处理
+                    
+                    # 动态止盈：盈利 > 15% → 立即卖出
+                    if profit_rate >= 0.15:
+                        print(f"  🚀 实时止盈！盈利{profit_rate*100:.1f}% ≥ 15%")
+                        best_bid = get_best_bid(token_id)
+                        if best_bid:
+                            success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
+                            if success:
+                                sold = True
+                                self_notify(pos, actual_price or best_bid, coin, direction, size, "实时止盈(15%)")
+                    
+                    # 动态止盈：盈利 > 8% → 挂单止盈（比市价高一点）
+                    elif profit_rate >= 0.08:
+                        print(f"  📈 实时挂单止盈（盈利{profit_rate*100:.1f}%）")
+                        sell_price = round(current_price + 0.01, 2)
+                        success, output, actual_price = sell_position(token_id, size, sell_price, max_retries=1)
+                        if success:
+                            sold = True
+                            self_notify(pos, actual_price or sell_price, coin, direction, size, "实时止盈(8%)")
+                    
+                    # 动态止损：亏损 > 10% → 立即止损
+                    elif profit_rate <= -0.10:
+                        print(f"  🛑 实时止损！亏损{profit_rate*100:.1f}% ≤ -10%")
+                        best_bid = get_best_bid(token_id)
+                        if best_bid and best_bid > 0.01:
+                            success, output, actual_price = sell_position(token_id, size, best_bid - 0.01, max_retries=2)
+                            if success:
+                                sold = True
+                                self_notify(pos, actual_price or best_bid, coin, direction, size, "实时止损(-10%)")
+                    
+                    # 趋势反转检测：方向反转 + 亏损中 → 止损
+                    elif is_losing and profit_rate < -0.03:
+                        print(f"  ⚠️ 趋势反转+亏损{profit_rate*100:.1f}%，止损")
+                        best_bid = get_best_bid(token_id)
+                        if best_bid and best_bid > 0.01:
+                            success, output, actual_price = sell_position(token_id, size, best_bid - 0.01, max_retries=2)
+                            if success:
+                                sold = True
+                                self_notify(pos, actual_price or best_bid, coin, direction, size, "趋势反转止损")
+                    
+                    # 亏损 > 5% → 警戒（只打印，不操作）
+                    elif profit_rate <= -0.05:
+                        print(f"  ⚠️ 警戒：亏损{profit_rate*100:.1f}%，继续观察")
+                    
+                    if sold:
+                        close_position(pos, 0)
+                        continue
+                
+                # ═══ 阶段1：结束前180-120秒（流动性健康期）═══
+                if 120 < remaining <= 180:
                     
                     # 利润≥10%直接止盈
                     if profit_rate >= 0.10:
@@ -674,8 +726,8 @@ def monitor():
                             sold = True
                             self_notify(pos, actual_price or sell_price, coin, direction, size, "阶段1必输止损")
                 
-                # ═══ 阶段2：结束前90-60秒（流动性下降期）═══
-                elif 60 < remaining <= 90:
+                # ═══ 阶段2：结束前120-60秒（流动性下降期）═══
+                elif 60 < remaining <= 120:
                     print(f"  ⚠️ 阶段2：{'分批挂单' if size > 5 else '挂单确认'}")
                     
                     best_bid = get_best_bid(token_id)
@@ -742,7 +794,7 @@ def monitor():
                     close_attempts.pop(slug, None)
                     continue
                 
-                if remaining <= 120:
+                if remaining <= 180:
                     close_attempts[slug] = close_attempts.get(slug, 0) + 1
                     if close_attempts[slug] % 5 == 0:
                         print(f"  ⚠️ {slug} 已尝试{close_attempts[slug]}次未成功")
