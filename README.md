@@ -1,140 +1,123 @@
-# Polymarket Trading Bot v2.1
+# Polymarket Trading Bot v3.2
 
-Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets using discount arbitrage strategy with 1/4 Kelly position sizing and 4-stage exit.
+Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets using discount arbitrage strategy with warmup observation, trend confirmation, real-time monitoring, and auto settlement.
 
 ## Strategy
 
-**Discount Arbitrage** (not direction prediction):
+**Discount Arbitrage + Trend Confirmation**:
 
-1. Calculate ATR deviation from Price-To-Beat (PTB)
-2. Estimate token value based on deviation
-3. Calculate discount: `estimated_value - market_odds`
-4. Bet when discount ≥10% + momentum confirmation
-5. Exit in 4 stages before market close
+1. 60s warmup observation (collect Binance price samples)
+2. Trend confirmation (strong/medium/oscillating)
+3. Calculate ATR deviation from Price-To-Beat (PTB)
+4. Estimate token value based on deviation
+5. Calculate discount: `estimated_value - market_odds`
+6. Bet when discount ≥10% (≥15% for oscillating) + momentum confirmation
+7. Real-time TP/SL monitoring after entry
+8. 4-stage exit before market close
+9. Auto redeem settled positions (fallback)
 
-**Why?** 889 trades analysis shows price converges to PTB at close (deviation shrinks 91.7%). Real profit comes from buying undervalued tokens and exiting early.
-
-## Features
-
-- **Discount Arbitrage**: Token undervaluation detection
-- **1/4 Kelly Sizing**: Conservative position management for 5-min markets
-- **Liquidity Filter**: Dynamic threshold based on odds spread
-- **4-Stage Exit**: Staged selling before market close (120s/90s/60s/30s)
-- **Auto-Cleanup**: Expired positions auto-closed after 60s
-- **Watchdog Daemon**: Background process auto-restarts crashed bots
-- **Telegram Push**: Auto-push warmup data every 10 minutes
-- **Gnosis Safe**: Secure wallet integration
+**Why?** 889 trades analysis shows price converges to PTB at close (deviation shrinks 91.7%). Real profit comes from buying undervalued tokens.
 
 ## Architecture
 
 ```
-auto_bot_v3.py          Main loop: scan markets → AI analysis → bet
-ai_analyze_v2.py        Decision engine: discount calc + Kelly sizing
-position_monitor.py     4-stage exit + auto-cleanup expired positions
-watchdog_daemon.sh      Background daemon, restarts crashed processes
-ai_trader/
-  ai_model_v2.py        Token valuation model (conservative)
-  binance_api.py        Binance K-line data
-  indicators.py         ATR, EMA, RSI calculations
+systemd services (auto-restart, boot-start):
+
+polymarket-bot.service     → auto_bot_v3.py (betting engine)
+polymarket-monitor.service → position_monitor.py (position monitor)
+polymarket-redeem.service  → auto_redeem.py (auto settlement, 30min)
 ```
 
-## Betting Conditions (all 4 required)
+## Features
+
+- **Discount Arbitrage**: Token undervaluation detection
+- **Warmup Observation**: 60s price sampling before betting
+- **Trend Confirmation**: Strong/medium/oscillating classification
+- **1/4 Kelly Sizing**: Conservative position management (5-10 shares)
+- **Real-time TP/SL**: Take profit 8%/15%, stop loss 10%, trend reversal 3%
+- **4-Stage Exit**: 180s→120s→60s→30s graduated closing
+- **Auto Redeem**: Claim settled winning positions via CLI (every 30min)
+- **Telegram Notifications**: Bets, exits, settlements, errors
+- **systemd Management**: Auto-restart on crash, boot-start
+
+## Components
+
+| File | Role |
+|------|------|
+| `auto_bot_v3.py` | Main betting engine (v3.1 warmup + trend) |
+| `ai_analyze_v2.py` | AI analysis (ATR/EMA/RSI/Volume) |
+| `position_monitor.py` | Real-time TP/SL + 4-stage exit |
+| `auto_redeem.py` | Auto claim settled positions (CLI-based) |
+| `ai_trader/ai_model_v2.py` | Valuation model |
+| `ai_trader/binance_api.py` | Binance data source |
+| `ai_trader/indicators.py` | Technical indicators |
+| `ai_trader/playwright_ptb.py` | PTB extraction via browser |
+
+## Timeline (5-min market = 300s)
 
 ```
-1. Discount ≥ 10%       (15% if low liquidity)
-2. EV > 0.05            Positive expected value
-3. Odds < 0.85          Don't buy expensive tokens
-4. Confidence ≥ 50%     Momentum confirmation
+0s    Market starts
+60s   Warmup begins (price sampling every 5s)
+120s  Bet window opens (trend confirmed)
+      → Real-time monitoring starts (TP/SL every 3s)
+180s  Stage 1: Healthy liquidity exit
+120s  Stage 2: Declining liquidity (multi-price orders)
+60s   Stage 3: Aggressive exit
+30s   Stage 4: Floor price ($0.01)
+0s    Market ends
+-30s  Auto cleanup expired positions
 ```
 
-## Token Valuation Model
+## Betting Conditions (all must be met)
 
-```
-ATR Deviation    Value     Meaning
-> 3.0            $0.80     Huge lead
-> 2.0            $0.72     Clear lead
-> 1.5            $0.67     Moderate lead
-> 1.0            $0.62     Small lead
-> 0.7            $0.58     Slight lead
-> 0.5            $0.55     Weak lead
-≤ 0.5            $0.51     Flat, skip
-```
-
-## Position Sizing (1/4 Kelly)
-
-```python
-p_win = 0.5 + (confidence * 0.3)  # 50%-80%
-kelly_full = (p * b - q) / b
-kelly_quarter = kelly_full * 0.25
-# Min 5 shares (Polymarket minimum)
-```
-
-## 4-Stage Exit
-
-```
-Stage 1 (120-90s)  Sell high if winning, stop-loss if losing
-Stage 2 (90-60s)   Batch selling, confirm fills
-Stage 3 (60-30s)   Aggressive multi-price ladder
-Stage 4 (30-0s)    Floor price $0.01 clearance
-```
+| Condition | Normal | Oscillating |
+|-----------|--------|-------------|
+| Discount | ≥ 10% | ≥ 15% |
+| EV | > 0.05 | > 0.05 |
+| Odds | < 0.85 | < 0.85 |
+| Confidence | ≥ 50% | ≥ 50% |
 
 ## Setup
 
-```bash
-# Install
-npm install -g @polymarket/clob-client
-pip install requests playwright pandas numpy
-playwright install chromium
+1. Install dependencies: `pip install requests`
+2. Install Playwright: `playwright install chromium`
+3. Install Polymarket CLI: [polymarket-rs](https://github.com/polymarket/polymarket-rs)
+4. Configure `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=your_bot_token
+   ```
+5. Configure Polymarket CLI with your private key
+6. Create systemd services (see `systemd/` examples)
+7. Start: `systemctl start polymarket-bot polymarket-monitor polymarket-redeem`
 
-# Configure wallet (NEVER commit keys!)
-polymarket config set-key <your_private_key>
-polymarket config set-safe <your_safe_address>
-```
-
-## Run
-
-```bash
-# Start bot
-nohup python3 -u auto_bot_v3.py > logs/bot_v3.log 2>&1 &
-
-# Start position monitor
-nohup python3 -u position_monitor.py > logs/position_monitor.log 2>&1 &
-
-# Start watchdog daemon
-nohup ./watchdog_daemon.sh > /tmp/watchdog_daemon.log 2>&1 &
-```
-
-## Monitoring
+## Commands
 
 ```bash
-# Check processes
-ps aux | grep -E "(auto_bot_v3|position_monitor|watchdog)"
+# Check status
+systemctl status polymarket-bot
+systemctl status polymarket-monitor
+systemctl status polymarket-redeem
 
-# View decisions
-tail -f logs/decisions_v2.jsonl | jq .
+# View logs
+journalctl -u polymarket-bot -f
+tail -f logs/bot_v3.log
+tail -f logs/auto_redeem.log
+
+# Restart
+systemctl restart polymarket-bot
 
 # Check balance
 polymarket clob balance --asset-type collateral --signature-type gnosis-safe
 ```
 
-## Security
-
-⚠️ **NEVER upload private keys to git!**
-- `.gitignore` excludes: `.env`, `wallet_backup.txt`, `tg_push.sh`
-- Use Polymarket CLI config for wallet setup
-- Review files before committing
-
 ## Version History
 
-- **v2.1.1** (2026-03-09): Fix min 5 shares, auto-cleanup expired positions, liquidity filter, 1/4 Kelly
-- **v2.1.0** (2026-03-09): Discount arbitrage strategy, 4-stage exit
-- **v2.0.0** (2026-03-07): Direction prediction strategy
-- **v1.0.0** (2026-03-05): Initial release
+- **v3.2**: Auto redeem + systemd + stability fixes
+- **v3.1**: Warmup observation + trend confirmation + real-time TP/SL
+- **v2.1**: Discount arbitrage + Kelly sizing + liquidity filter
+- **v2.0**: Direction prediction strategy
+- **v1.0**: Initial version
 
 ## License
 
 MIT
-
-## Disclaimer
-
-Educational purposes only. Crypto trading involves risk. Use at your own risk.
