@@ -5,14 +5,23 @@
 private_key*
 PRIVATE_KEY*
 wallet.json
+wallet_backup.txt
 config.local.json
 *secret*
+
+# Telegram push script (contains bot token)
+tg_push.sh
+push_data.sh
+push_data_v2.sh
 
 # Logs
 logs/*.log
 logs/*.jsonl
 logs/*.backup
 *.log
+
+# Trading state (contains runtime data)
+logs/trading_state.json
 
 # Python
 __pycache__/

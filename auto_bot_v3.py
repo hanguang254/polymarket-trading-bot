@@ -96,7 +96,7 @@ def send_notification(coin, direction, confidence, ev, price, size):
         f"价格: ${price:.2f} × {size}份 = ${price*size:.2f}"
     )
     try:
-        TELEGRAM_BOT_TOKEN = "8315083265:AAGM_rUxfOzmnTDYd6v2n6n-kEArK37tKKk"
+        TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         TELEGRAM_CHAT_ID = "1609325006"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": notify_text, "parse_mode": "HTML"}, timeout=10)
@@ -117,7 +117,7 @@ def send_close_notification(coin, direction, entry_price, exit_price, size, pnl)
         f"{pnl_text}: <b>${abs(pnl):.2f}</b>"
     )
     try:
-        TELEGRAM_BOT_TOKEN = "8315083265:AAGM_rUxfOzmnTDYd6v2n6n-kEArK37tKKk"
+        TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         TELEGRAM_CHAT_ID = "1609325006"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": notify_text, "parse_mode": "HTML"}, timeout=10)

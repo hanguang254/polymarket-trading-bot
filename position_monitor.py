@@ -14,7 +14,7 @@ POSITIONS_FILE = "/root/.openclaw/workspace/polymarket-arb-bot/logs/positions.js
 PROFIT_THRESHOLD = 0.15  # 15% 止盈
 
 # Telegram 通知配置
-TELEGRAM_BOT_TOKEN = "8315083265:AAGM_rUxfOzmnTDYd6v2n6n-kEArK37tKKk"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = "1609325006"
 
 def send_telegram(text):
@@ -623,6 +623,12 @@ def monitor():
                 now = datetime.now(timezone.utc)
                 end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
                 remaining = (end_time - now).total_seconds()
+                
+                # 自动清理：市场结束超过60秒的持仓标记关闭
+                if remaining < -60:
+                    close_position(pos, 0)
+                    print(f"  🗑️ 清理过期持仓: {slug} (过期{-remaining:.0f}s)")
+                    continue
                 
                 # 获取PTB和实时价格判断赢输
                 ptb_price = get_ptb_from_slug(slug)

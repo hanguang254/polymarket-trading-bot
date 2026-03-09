@@ -65,19 +65,33 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
     ev = details.get("expected_value", 0)
     discount = details.get("discount", 0)
 
+    # 流动性估计（基于赔率接近度）
+    # 赔率越接近0.5，流动性越好
+    odds_spread = abs(up_odds - down_odds)
+    is_liquid = odds_spread < 0.15  # 价差<15%认为流动性好
+    
+    # 动态折价阈值
+    if is_liquid:
+        discount_threshold = 0.10  # 流动性好，10%折价
+    else:
+        discount_threshold = 0.15  # 流动性差，要求15%折价
+    
     should_bet = (
-        discount >= 0.10       # 折价空间≥10%
-        and ev > 0.05          # 正期望
-        and target_odds < 0.85 # 不买太贵
-        and confidence >= 0.50 # 动量确认
+        discount >= discount_threshold  # 动态折价阈值
+        and ev > 0.05                   # 正期望
+        and target_odds < 0.85          # 不买太贵
+        and confidence >= 0.50          # 动量确认
     )
 
     details["should_bet"] = should_bet
+    details["liquidity"] = "good" if is_liquid else "poor"
+    details["odds_spread"] = round(odds_spread, 3)
     details["bet_reason"] = (
-        f"折价={discount:.3f}({'✅' if discount>=0.10 else '❌'}≥0.10) "
+        f"折价={discount:.3f}({'✅' if discount>=discount_threshold else '❌'}≥{discount_threshold:.2f}) "
         f"ev={ev:+.3f}({'✅' if ev>0.05 else '❌'}) "
         f"odds={target_odds:.3f}({'✅' if target_odds<0.85 else '❌'}) "
-        f"conf={confidence:.0%}({'✅' if confidence>=0.50 else '❌'}≥50%)"
+        f"conf={confidence:.0%}({'✅' if confidence>=0.50 else '❌'}≥50%) "
+        f"流动性:{details['liquidity']}"
     )
 
     return should_bet, direction, confidence, details
@@ -85,13 +99,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
 
 def calculate_kelly_size(confidence, ev, balance):
     """
-    折价策略仓位计算（基于折价空间而非胜率）
+    1/4 Kelly仓位计算（5分钟市场专用）
     
-    折价越大 → 安全边际越高 → 仓位越大
+    基于真实胜率而非折价收益率
     
     Args:
-        confidence: 置信度（折价策略下代表折价评分）
-        ev: 折价收益率（discount/odds）
+        confidence: 置信度（动量评分转换的胜率估计）
+        ev: 折价收益率
         balance: 当前余额
     
     Returns:
@@ -100,22 +114,40 @@ def calculate_kelly_size(confidence, ev, balance):
     if ev <= 0:
         return 3
     
-    # 基于折价收益率分配仓位
-    # ev = discount / odds（折价相对于买入价的比率）
-    if ev >= 0.30:
-        size = 10  # 30%+折价，极好机会
-    elif ev >= 0.20:
-        size = 8   # 20%折价
-    elif ev >= 0.15:
-        size = 7   # 15%折价
-    elif ev >= 0.10:
-        size = 5   # 10%折价，正常
-    elif ev >= 0.05:
-        size = 3   # 5%折价，最小仓位
-    else:
-        size = 3
+    # 将置信度转换为胜率估计
+    # confidence来自动量评分，范围0-1
+    # 需要映射到合理的胜率范围（0.5-0.8）
+    p_win = 0.5 + (confidence * 0.3)  # 50%-80%
+    p_win = max(0.5, min(0.8, p_win))
     
-    # 安全约束：根据余额调整
+    # 计算净赔率 b
+    # 假设赔率在0.5附近，净赔率约为1
+    implied_odds = 0.5 + ev  # 粗略估计
+    if implied_odds >= 1.0:
+        implied_odds = 0.99
+    b = (1 / implied_odds) - 1
+    
+    # Kelly公式: f = (p*b - q) / b
+    q = 1 - p_win
+    kelly_full = (p_win * b - q) / b if b > 0 else 0
+    
+    # 1/4 Kelly（保守）
+    kelly_quarter = kelly_full * 0.25
+    kelly_quarter = max(0, min(0.25, kelly_quarter))
+    
+    # 转换为份数（Polymarket最低5份）
+    if kelly_quarter <= 0.05:
+        size = 5   # 最小5份（Polymarket最低要求）
+    elif kelly_quarter < 0.10:
+        size = 5
+    elif kelly_quarter < 0.15:
+        size = 7
+    elif kelly_quarter < 0.20:
+        size = 8
+    else:
+        size = 10
+    
+    # 余额约束
     if balance < 20:
         max_by_balance = 10
     elif balance < 50:

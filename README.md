@@ -1,88 +1,114 @@
 # Polymarket Trading Bot v2.1
 
-Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets using discount arbitrage strategy.
-
-## Features
-
-- **Discount Arbitrage Strategy**: Calculate token undervaluation and bet when discount ≥10%
-- **4-Stage Exit**: Exit positions before market close (don't wait for settlement)
-- **AI-Powered Analysis**: Binance technical analysis (ATR, momentum, volume)
-- **Gnosis Safe Support**: Secure wallet integration
-- **Auto-Restart**: Watchdog monitors and restarts crashed processes
+Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets using discount arbitrage strategy with 1/4 Kelly position sizing and 4-stage exit.
 
 ## Strategy
 
-v2.1 uses discount arbitrage instead of direction prediction:
+**Discount Arbitrage** (not direction prediction):
 
 1. Calculate ATR deviation from Price-To-Beat (PTB)
 2. Estimate token value based on deviation
-3. Calculate discount: `value - market_odds`
+3. Calculate discount: `estimated_value - market_odds`
 4. Bet when discount ≥10% + momentum confirmation
-5. Exit in 4 stages (120s/90s/60s/30s before close)
+5. Exit in 4 stages before market close
 
-**Why it works:** 889 trades analysis shows price converges to PTB at close (deviation shrinks 91.7%). Real profit comes from buying undervalued tokens and exiting early.
+**Why?** 889 trades analysis shows price converges to PTB at close (deviation shrinks 91.7%). Real profit comes from buying undervalued tokens and exiting early.
 
-## Requirements
+## Features
 
-```bash
-# Polymarket CLI
-npm install -g @polymarket/clob-client
+- **Discount Arbitrage**: Token undervaluation detection
+- **1/4 Kelly Sizing**: Conservative position management for 5-min markets
+- **Liquidity Filter**: Dynamic threshold based on odds spread
+- **4-Stage Exit**: Staged selling before market close (120s/90s/60s/30s)
+- **Auto-Cleanup**: Expired positions auto-closed after 60s
+- **Watchdog Daemon**: Background process auto-restarts crashed bots
+- **Telegram Push**: Auto-push warmup data every 10 minutes
+- **Gnosis Safe**: Secure wallet integration
 
-# Python dependencies
-pip install requests playwright pandas numpy
+## Architecture
 
-# Playwright browsers
-playwright install chromium
+```
+auto_bot_v3.py          Main loop: scan markets → AI analysis → bet
+ai_analyze_v2.py        Decision engine: discount calc + Kelly sizing
+position_monitor.py     4-stage exit + auto-cleanup expired positions
+watchdog_daemon.sh      Background daemon, restarts crashed processes
+ai_trader/
+  ai_model_v2.py        Token valuation model (conservative)
+  binance_api.py        Binance K-line data
+  indicators.py         ATR, EMA, RSI calculations
+```
+
+## Betting Conditions (all 4 required)
+
+```
+1. Discount ≥ 10%       (15% if low liquidity)
+2. EV > 0.05            Positive expected value
+3. Odds < 0.85          Don't buy expensive tokens
+4. Confidence ≥ 50%     Momentum confirmation
+```
+
+## Token Valuation Model
+
+```
+ATR Deviation    Value     Meaning
+> 3.0            $0.80     Huge lead
+> 2.0            $0.72     Clear lead
+> 1.5            $0.67     Moderate lead
+> 1.0            $0.62     Small lead
+> 0.7            $0.58     Slight lead
+> 0.5            $0.55     Weak lead
+≤ 0.5            $0.51     Flat, skip
+```
+
+## Position Sizing (1/4 Kelly)
+
+```python
+p_win = 0.5 + (confidence * 0.3)  # 50%-80%
+kelly_full = (p * b - q) / b
+kelly_quarter = kelly_full * 0.25
+# Min 5 shares (Polymarket minimum)
+```
+
+## 4-Stage Exit
+
+```
+Stage 1 (120-90s)  Sell high if winning, stop-loss if losing
+Stage 2 (90-60s)   Batch selling, confirm fills
+Stage 3 (60-30s)   Aggressive multi-price ladder
+Stage 4 (30-0s)    Floor price $0.01 clearance
 ```
 
 ## Setup
 
-### 1. Configure Wallet
-
-⚠️ **NEVER commit private keys to git!**
-
 ```bash
-# Option 1: Polymarket CLI config (recommended)
-polymarket config set-key <your_private_key>
-polymarket config set-safe <your_gnosis_safe_address>
+# Install
+npm install -g @polymarket/clob-client
+pip install requests playwright pandas numpy
+playwright install chromium
 
-# Option 2: Environment variables
-echo "PRIVATE_KEY=your_key_here" > .env
-echo "GNOSIS_SAFE_ADDRESS=your_safe_here" >> .env
+# Configure wallet (NEVER commit keys!)
+polymarket config set-key <your_private_key>
+polymarket config set-safe <your_safe_address>
 ```
 
-### 2. Run Bot
+## Run
 
 ```bash
-# Start main bot
-nohup python3 -u auto_bot_v3.py > logs/auto_bot.log 2>&1 &
+# Start bot
+nohup python3 -u auto_bot_v3.py > logs/bot_v3.log 2>&1 &
 
 # Start position monitor
 nohup python3 -u position_monitor.py > logs/position_monitor.log 2>&1 &
 
-# Setup watchdog (auto-restart)
-crontab -e
-# Add: * * * * * /path/to/watchdog_v3.sh >> /tmp/watchdog.log 2>&1
-```
-
-## Configuration
-
-Edit `ai_analyze_v2.py` to adjust betting conditions:
-
-```python
-should_bet = (
-    discount >= 0.10       # Discount threshold (10%)
-    and ev > 0.05          # Positive expected value
-    and target_odds < 0.85 # Don't buy expensive tokens
-    and confidence >= 0.50 # Momentum confirmation
-)
+# Start watchdog daemon
+nohup ./watchdog_daemon.sh > /tmp/watchdog_daemon.log 2>&1 &
 ```
 
 ## Monitoring
 
 ```bash
 # Check processes
-ps aux | grep -E "(auto_bot_v3|position_monitor)"
+ps aux | grep -E "(auto_bot_v3|position_monitor|watchdog)"
 
 # View decisions
 tail -f logs/decisions_v2.jsonl | jq .
@@ -91,26 +117,19 @@ tail -f logs/decisions_v2.jsonl | jq .
 polymarket clob balance --asset-type collateral --signature-type gnosis-safe
 ```
 
-## Files
-
-- `auto_bot_v3.py` - Main bot (market scanning + AI analysis)
-- `ai_analyze_v2.py` - Decision engine (discount calculation)
-- `position_monitor.py` - 4-stage exit strategy
-- `watchdog_v3.sh` - Auto-restart watchdog
-- `ai_trader/` - AI model + Binance API
-
-## Performance
-
-- **v2.0**: 20.7% bet frequency (2.5 times/hour)
-- **v2.1**: 33.3% bet frequency (4 times/hour, +60%)
-
 ## Security
 
-⚠️ **Important:**
-- Never upload private keys to git
-- Use `.env` file (already in .gitignore)
-- Check for sensitive data before committing
-- Review `.gitignore` before pushing
+⚠️ **NEVER upload private keys to git!**
+- `.gitignore` excludes: `.env`, `wallet_backup.txt`, `tg_push.sh`
+- Use Polymarket CLI config for wallet setup
+- Review files before committing
+
+## Version History
+
+- **v2.1.1** (2026-03-09): Fix min 5 shares, auto-cleanup expired positions, liquidity filter, 1/4 Kelly
+- **v2.1.0** (2026-03-09): Discount arbitrage strategy, 4-stage exit
+- **v2.0.0** (2026-03-07): Direction prediction strategy
+- **v1.0.0** (2026-03-05): Initial release
 
 ## License
 
@@ -118,4 +137,4 @@ MIT
 
 ## Disclaimer
 
-This bot is for educational purposes. Cryptocurrency trading involves risk. Use at your own risk.
+Educational purposes only. Crypto trading involves risk. Use at your own risk.
