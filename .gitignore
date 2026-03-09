@@ -1,0 +1,39 @@
+# Private keys and sensitive data
+.env
+*.key
+*_key.txt
+private_key*
+PRIVATE_KEY*
+wallet.json
+config.local.json
+*secret*
+
+# Logs
+logs/*.log
+logs/*.jsonl
+logs/*.backup
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Playwright
+.playwright/
+playwright-state.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node modules (if any)
+node_modules/
+wallet_backup.txt
