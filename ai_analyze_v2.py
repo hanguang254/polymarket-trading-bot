@@ -78,9 +78,9 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
     
     should_bet = (
         discount >= discount_threshold  # 动态折价阈值
-        and ev > 0.05                   # 正期望
+        and ev > 0.5                   # 正期望
         and target_odds < 0.85          # 不买太贵
-        and confidence >= 0.50          # 动量确认
+        and confidence >= 0.80          # 动量确认（80%置信度）
     )
 
     details["should_bet"] = should_bet
@@ -90,7 +90,7 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
         f"折价={discount:.3f}({'✅' if discount>=discount_threshold else '❌'}≥{discount_threshold:.2f}) "
         f"ev={ev:+.3f}({'✅' if ev>0.05 else '❌'}) "
         f"odds={target_odds:.3f}({'✅' if target_odds<0.85 else '❌'}) "
-        f"conf={confidence:.0%}({'✅' if confidence>=0.50 else '❌'}≥50%) "
+        f"conf={confidence:.0%}({'✅' if confidence>=0.80 else '❌'}≥80%) "
         f"流动性:{details['liquidity']}"
     )
 

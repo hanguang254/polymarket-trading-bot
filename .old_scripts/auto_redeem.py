@@ -12,6 +12,7 @@ import time
 import os
 import sys
 from datetime import datetime, timezone
+import requests # 新增导入 requests 库
 
 # ============================================================
 # 配置
@@ -19,10 +20,31 @@ from datetime import datetime, timezone
 
 WALLET_ADDRESS = "0x602E35d45A59182C8c3231C8Fbd0A3e886f4aDE8"
 CHECK_INTERVAL = 1800  # 30分钟
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "auto_redeem.log")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "auto_redeem.log")
+REDEEMED_FILE = os.path.join(SCRIPT_DIR, "logs", "redeemed_conditions.json")
 
 # Telegram 通知
 TELEGRAM_CHAT_ID = "1609325006"
+
+def load_redeemed():
+    """加载已领取记录"""
+    try:
+        if os.path.exists(REDEEMED_FILE):
+            with open(REDEEMED_FILE, "r") as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_redeemed(redeemed):
+    """保存已领取记录"""
+    try:
+        os.makedirs(os.path.dirname(REDEEMED_FILE), exist_ok=True)
+        with open(REDEEMED_FILE, "w") as f:
+            json.dump(redeemed, f, indent=2)
+    except:
+        pass
 
 def log(msg):
     """打印并写入日志"""
@@ -53,26 +75,28 @@ def send_telegram(text):
         pass
 
 def get_positions():
-    """查询所有持仓"""
+    """通过Data API查询所有持仓"""
     try:
-        result = subprocess.run(
-            ["polymarket", "data", "positions", WALLET_ADDRESS, "-o", "json"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            log(f"❌ 查询持仓失败: {result.stderr.strip()}")
-            return []
+        # Data API URL
+        api_url = f"https://data-api.polymarket.com/positions?user={WALLET_ADDRESS}"
         
-        positions = json.loads(result.stdout)
+        # 发送HTTP GET请求
+        response = requests.get(api_url, timeout=30)
+        response.raise_for_status() # 如果状态码不是200，则抛出HTTPError
+
+        positions = response.json()
         return positions
-    except subprocess.TimeoutExpired:
-        log("❌ 查询持仓超时")
+    except requests.exceptions.Timeout:
+        log("❌ 查询持仓超时 (Data API)")
+        return []
+    except requests.exceptions.RequestException as e:
+        log(f"❌ 查询持仓请求失败 (Data API): {e}")
         return []
     except json.JSONDecodeError:
-        log(f"❌ 持仓数据解析失败: {result.stdout[:200]}")
+        log(f"❌ 持仓数据解析失败 (Data API): {response.text[:200]}")
         return []
     except Exception as e:
-        log(f"❌ 查询持仓异常: {e}")
+        log(f"❌ 查询持仓异常 (Data API): {e}")
         return []
 
 def redeem_position(condition_id):
@@ -126,10 +150,21 @@ def check_and_redeem():
     
     log(f"🎯 发现 {len(redeemable)} 个可领取持仓！")
     
+    # 加载已领取记录，去重
+    redeemed_record = load_redeemed()
+    new_redeemable = [p for p in redeemable if p.get("condition_id") not in redeemed_record]
+    
+    if not new_redeemable:
+        log(f"📋 {len(redeemable)}个可领取，但全部已领取过，跳过")
+        return 0
+    
+    log(f"🆕 其中 {len(new_redeemable)} 个是新的，开始领取")
+    
     total_redeemed = 0.0
     success_count = 0
+    success_positions = []
     
-    for pos in redeemable:
+    for pos in new_redeemable:
         condition_id = pos.get("condition_id", "")
         slug = pos.get("slug", "unknown")
         outcome = pos.get("outcome", "?")
@@ -143,6 +178,16 @@ def check_and_redeem():
         if ok:
             success_count += 1
             total_redeemed += current_value
+            success_positions.append(pos)
+            # 记录已领取
+            redeemed_record[condition_id] = {
+                "slug": slug,
+                "outcome": outcome,
+                "size": size,
+                "value": current_value,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            save_redeemed(redeemed_record)
             log(f"   ✅ 领取成功！${current_value:.2f}")
         else:
             log(f"   ❌ 领取失败: {msg[:100]}")
@@ -163,11 +208,11 @@ def check_and_redeem():
         notify_text = (
             f"💰 <b>自动结算领取成功</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"✅ 成功: {success_count}/{len(redeemable)}笔\n"
+            f"✅ 成功: {success_count}/{len(new_redeemable)}笔\n"
             f"💵 领取: ${total_redeemed:.2f} USDC\n"
             f"━━━━━━━━━━━━━━━━\n"
         )
-        for pos in redeemable:
+        for pos in success_positions:
             slug = pos.get("slug", "?")
             outcome = pos.get("outcome", "?")
             size = pos.get("size", "0")
