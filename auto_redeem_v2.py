@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Polymarket 自动结算领取脚本 v2
-使用官方 Python SDK + Relayer API 实现 gasless redeem
+Polymarket 自动领取已结算收益脚本
+- 浏览器钱包（OKX / MetaMask 等）+ Gnosis Safe 代理
+- 使用 Relayer API gasless 链上 redeem，无需 MATIC
 """
-
 import os
 import sys
 import time
-import json
 import logging
 from datetime import datetime, timezone
-from dotenv import load_dotenv
 
 import requests
+from dotenv import load_dotenv
+
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from py_builder_relayer_client.client import RelayClient
@@ -23,30 +23,38 @@ from poly_web3.web3_service.base import BaseWeb3Service
 from poly_web3.schema import WalletType
 from poly_web3.const import RELAYER_URL
 
-# 加载 .env 文件
+# ==============================================================================
+# 加载 .env
+# ==============================================================================
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 # ==============================================================================
-# 配置
+# 配置（固定值直接写，敏感值从环境变量读）
 # ==============================================================================
 
-PROXY_WALLET = "0x602E35d45A59182C8c3231C8Fbd0A3e886f4aDE8"
+# ⚠️ 必须填 Gnosis Safe 代理地址（右上角那个），不是 OKX EOA 地址
+PROXY_WALLET = "0x33aDb455c8133799Af4202e8c8e1bA6a30575B48"
+
 CLOB_API_KEY = "019cd562-af00-7324-81b0-540510d8be6a"
 CLOB_API_SECRET = "_giIPpY0fJpJuvEyMvdnYmJq4N_t4SV9veeGOEBxbGM="
 CLOB_API_PASSPHRASE = "20116594757532b440694328e1b9191dc6fdf31645a2d8af0da93facfbe2545f"
 
-PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-BUILDER_KEY = os.environ.get("BUILDER_KEY", "")
-BUILDER_SECRET = os.environ.get("BUILDER_SECRET", "")
-BUILDER_PASSPHRASE = os.environ.get("BUILDER_PASSPHRASE", "")
+# 私钥等敏感信息从 .env 读取
+PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+BUILDER_KEY = os.environ.get("BUILDER_KEY", "").strip()
+BUILDER_SECRET = os.environ.get("BUILDER_SECRET", "").strip()
+BUILDER_PASSPHRASE = os.environ.get("BUILDER_PASSPHRASE", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1609325006").strip()
 
-CHECK_INTERVAL = 1800
-BATCH_SIZE = 5
+REDEEM_INTERVAL = 1800  # 秒，30 分钟轮询一次
+BATCH_SIZE = 5  # 每批 redeem 的 condition 数量
 
-LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "auto_redeem_v2.log")
-REDEEMED_FILE = os.path.join(SCRIPT_DIR, "logs", "redeemed_conditions_v2.json")
-TELEGRAM_CHAT_ID = "1609325006"
+# ==============================================================================
+# 日志
+# ==============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,65 +62,41 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("auto_redeem_v2")
+log = logging.getLogger("auto_redeem")
 
 # ==============================================================================
-# 工具函数
+# Telegram 通知
 # ==============================================================================
 
-def load_redeemed():
-    try:
-        if os.path.exists(REDEEMED_FILE):
-            with open(REDEEMED_FILE, "r") as f:
-                return json.load(f)
-    except:
-        pass
-    return {}
-
-def save_redeemed(redeemed):
-    try:
-        os.makedirs(os.path.dirname(REDEEMED_FILE), exist_ok=True)
-        with open(REDEEMED_FILE, "w") as f:
-            json.dump(redeemed, f, indent=2)
-    except:
-        pass
-
-def send_telegram(text):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if not token:
+def send_telegram(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN:
         return
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=10)
-    except:
-        pass
-
-def get_positions():
-    """通过Data API查询所有持仓"""
-    try:
-        api_url = f"https://data-api.polymarket.com/positions?user={PROXY_WALLET}"
-        response = requests.get(api_url, timeout=30)
-        response.raise_for_status()
-        return response.json()
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
     except Exception as e:
-        log.error(f"❌ 查询持仓失败: {e}")
-        return []
+        log.warning(f"Telegram 通知失败: {e}")
 
-def create_services():
-    """创建 SDK 服务"""
+# ==============================================================================
+# 服务初始化
+# ==============================================================================
+
+def create_services() -> ProxyWeb3Service:
+    """创建并返回 ProxyWeb3Service（浏览器钱包 / Gnosis Safe 模式）"""
     if not PRIVATE_KEY:
-        log.error("❌ 缺少 POLYMARKET_PRIVATE_KEY 环境变量")
+        log.error("❌ 缺少 POLYMARKET_PRIVATE_KEY，请在 .env 中配置")
         sys.exit(1)
-    
+
+    # signature_type=0 → POLY_PROXY，对应 CLI 代理钱包
     clob = ClobClient(
-        "clob.polymarket.com",
+        host="https://clob.polymarket.com",
         key=PRIVATE_KEY,
         chain_id=137,
-        signature_type=2,  # POLY_PROXY
+        signature_type=0,
         funder=PROXY_WALLET,
         creds=ApiCreds(
             api_key=CLOB_API_KEY,
@@ -120,126 +104,146 @@ def create_services():
             api_passphrase=CLOB_API_PASSPHRASE,
         ),
     )
-    
-    if BUILDER_KEY and BUILDER_SECRET and BUILDER_PASSPHRASE:
-        bc = BuilderConfig(local_builder_creds=BuilderApiKeyCreds(
-            key=BUILDER_KEY,
-            secret=BUILDER_SECRET,
-            passphrase=BUILDER_PASSPHRASE
-        ))
+
+    has_builder = all([BUILDER_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE])
+    if has_builder:
+        builder_config = BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(
+                key=BUILDER_KEY,
+                secret=BUILDER_SECRET,
+                passphrase=BUILDER_PASSPHRASE,
+            )
+        )
         relay = RelayClient(
             relayer_url=RELAYER_URL,
             chain_id=137,
             private_key=PRIVATE_KEY,
-            builder_config=bc,
+            builder_config=builder_config,
         )
     else:
-        log.warning("⚠️  未配置 Builder API，将使用默认 Relayer")
+        log.warning("⚠️ 未配置 Builder API，使用默认 Relayer")
         relay = RelayClient(
             relayer_url=RELAYER_URL,
             chain_id=137,
             private_key=PRIVATE_KEY,
         )
-    
+
+    # ProxyWeb3Service 构造后设置 wallet_type
     svc = ProxyWeb3Service(clob, relay)
     svc.wallet_type = WalletType.PROXY
     return svc
 
-def do_redeem(svc: ProxyWeb3Service):
-    """执行一次领取，返回领取的总金额"""
-    positions = get_positions()
-    
-    if not positions:
-        log.info("📋 无持仓")
-        return 0.0
-    
-    # 过滤可领取的持仓
-    redeemable = [p for p in positions if p.get("redeemable") == True]
-    active = [p for p in positions if not p.get("redeemable")]
-    
-    if active:
-        log.info(f"📊 当前活跃持仓: {len(active)}个")
-    
-    if not redeemable:
-        log.info(f"📋 {len(positions)}个持仓，0个可领取")
-        return 0.0
-    
-    # 去重已领取
-    redeemed_record = load_redeemed()
-    new_redeemable = [p for p in redeemable if p.get("condition_id") not in redeemed_record]
-    
-    if not new_redeemable:
-        log.info(f"📋 {len(redeemable)}个可领取，但全部已领取过")
-        return 0.0
-    
-    total_size = sum(float(p.get("size", 0)) for p in new_redeemable)
-    log.info(f"🎯 发现 {len(new_redeemable)} 个新的可领取头寸，约 ${total_size:.2f} USDC")
-    
+# ==============================================================================
+# 核心逻辑
+# ==============================================================================
+
+def fetch_resolved_positions(wallet_address: str) -> list:
+    """拉取已结算（redeemable=True）的持仓，过滤掉进行中的市场"""
     try:
-        results = svc.redeem_all(batch_size=BATCH_SIZE)
-        success = sum(1 for r in results if r and r.get("state") in ("STATE_MINED", "STATE_CONFIRMED"))
-        
-        # 记录已领取
-        for pos in new_redeemable:
-            condition_id = pos.get("condition_id", "")
-            redeemed_record[condition_id] = {
-                "slug": pos.get("slug", "?"),
-                "outcome": pos.get("outcome", "?"),
-                "size": pos.get("size", 0),
-                "value": pos.get("current_value", 0),
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-        save_redeemed(redeemed_record)
-        
-        log.info(f"✅ 领取完成: {success}/{len(results)} 笔交易成功，约 ${total_size:.2f} USDC")
-        
-        # 发送通知
-        if success > 0:
-            notify_text = (
-                f"💰 <b>自动结算领取成功</b>\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"✅ 成功: {success}/{len(new_redeemable)}笔\n"
-                f"💵 领取: ${total_size:.2f} USDC\n"
-            )
-            send_telegram(notify_text)
-        
-        return total_size
+        all_positions = BaseWeb3Service.fetch_positions(wallet_address)
     except Exception as e:
-        log.error(f"❌ 领取失败: {type(e).__name__}: {e}")
+        log.error(f"❌ 拉取持仓失败: {e}")
+        return []
+
+    if not all_positions:
+        return []
+
+    resolved = [
+        p for p in all_positions
+        if p.get("redeemable") is True
+        or p.get("resolved") is True
+        or p.get("game_status") == "resolved"
+    ]
+    log.info(f"📋 持仓总数: {len(all_positions)}，已结算可领取: {len(resolved)}")
+    return resolved
+
+
+def do_redeem(svc: ProxyWeb3Service) -> float:
+    """执行一轮领取，返回本轮领取的 USDC 总额"""
+    # 直接使用配置的代理地址，不调用私有方法
+    positions = fetch_resolved_positions(PROXY_WALLET)
+
+    if not positions:
+        log.info("✅ 暂无已结算头寸可领取")
         return 0.0
 
-def main():
-    log.info("=" * 50)
-    log.info("🔄 自动结算守护进程启动 (SDK版)")
-    log.info(f"   钱包: {PROXY_WALLET}")
-    log.info(f"   间隔: {CHECK_INTERVAL}s ({CHECK_INTERVAL // 60}分钟)")
-    log.info(f"   批量: {BATCH_SIZE} conditions/batch")
-    log.info("=" * 50)
-    
+    total_value = sum(float(p.get("current_value", 0)) for p in positions)
+    n = len(positions)
+    preview_slugs = ", ".join(p.get("slug", "?")[:40] for p in positions[:5])
+    if n > 5:
+        preview_slugs += f" ... 共 {n} 个"
+    log.info(f"🎯 准备领取 {n} 个头寸，约 ${total_value:.2f} USDC: {preview_slugs}")
+
+    try:
+        results = svc.redeem_all(batch_size=BATCH_SIZE)
+    except Exception as e:
+        log.error(f"❌ redeem_all 执行异常: {type(e).__name__}: {e}")
+        return 0.0
+
+    success_states = {"STATE_MINED", "STATE_CONFIRMED"}
+    success = sum(1 for r in results if r and r.get("state") in success_states)
+    failed = len(results) - success
+    log.info(
+        f"{'✅' if success > 0 else '⚠️ '} 领取完成: "
+        f"{success} 成功 / {failed} 失败 / {len(results)} 总计，"
+        f"约 ${total_value:.2f} USDC"
+    )
+
+    if failed > 0:
+        for i, r in enumerate(results):
+            if r and r.get("state") not in success_states:
+                log.warning(f" 第 {i+1} 笔失败: {r}")
+
+    if success > 0 and total_value > 0:
+        send_telegram(
+            f"💰 <b>Polymarket 自动结算领取</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"✅ 成功: {success}/{len(results)} 笔\n"
+            f"💵 领取: ${total_value:.2f} USDC\n"
+            f"📅 时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+
+    return total_value
+
+# ==============================================================================
+# 主循环
+# ==============================================================================
+
+def main() -> None:
+    log.info("=" * 55)
+    log.info("🔄 Polymarket 自动领取守护进程启动")
+    log.info(f"   代理钱包 : {PROXY_WALLET}")
+    log.info(f"   签名类型 : POLY_GNOSIS_SAFE (浏览器钱包)")
+    log.info(f"   轮询间隔 : {REDEEM_INTERVAL}s ({REDEEM_INTERVAL // 60} 分钟)")
+    log.info(f"   批次大小 : {BATCH_SIZE} conditions/batch")
+    log.info("=" * 55)
+
     svc = create_services()
     total_redeemed = 0.0
     cycle = 0
-    
+
     while True:
         cycle += 1
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        log.info(f"--- 第{cycle}轮 ({now} UTC) ---")
-        
+        log.info(f"─── 第 {cycle} 轮 [{now} UTC] ───")
+
         try:
             amount = do_redeem(svc)
             total_redeemed += amount
             if amount > 0:
-                log.info(f"📊 累计已领取: ${total_redeemed:.2f}")
+                log.info(f"📊 累计已领取: ${total_redeemed:.2f} USDC")
         except Exception as e:
-            log.error(f"❌ 本轮异常: {type(e).__name__}: {e}")
+            log.error(f"❌ 本轮出现未捕获异常: {type(e).__name__}: {e}")
+            log.info("🔁 尝试重建服务连接...")
             try:
                 svc = create_services()
-                log.info("已重建服务连接")
+                log.info("✅ 服务连接已重建")
             except Exception as e2:
                 log.error(f"重建失败: {e2}")
-        
-        log.info(f"⏳ 等待 {CHECK_INTERVAL // 60} 分钟...")
-        time.sleep(CHECK_INTERVAL)
+
+        log.info(f"⏳ 等待 {REDEEM_INTERVAL // 60} 分钟后进行下一轮...\n")
+        time.sleep(REDEEM_INTERVAL)
+
 
 if __name__ == "__main__":
     main()

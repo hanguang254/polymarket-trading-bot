@@ -14,7 +14,7 @@ from ai_trader.ai_model_v2 import analyze_market
 import subprocess
 
 
-def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, details):
+def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, details, action="SKIP"):
     """记录决策到统计文件"""
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -33,6 +33,7 @@ def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, det
         "diff_in_atr": details.get("diff_in_atr", 0),
         "current_price": details.get("current_price", 0),
         "total_score": details.get("total_score", 0),
+        "action": action,
     }
 
     with open("logs/decisions_v2.jsonl", "a") as f:
@@ -51,9 +52,6 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
 
     if not direction:
         return False, None, 0, details
-
-    # 记录决策
-    log_decision(slug, coin, price_to_beat, direction, confidence, up_odds, down_odds, details)
 
     # ── 下注条件（v2.1 折价套利策略） ──
     # 核心：折价空间足够大，提前平仓能锁利
@@ -78,9 +76,9 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
     
     should_bet = (
         discount >= discount_threshold  # 动态折价阈值
-        and ev > 0.5                   # 正期望
+        and ev > 0.1                   # 正期望
         and target_odds < 0.85          # 不买太贵
-        and confidence >= 0.80          # 动量确认（80%置信度）
+        and confidence >= 0.65          # 动量确认（65%置信度）
     )
 
     details["should_bet"] = should_bet
@@ -90,9 +88,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
         f"折价={discount:.3f}({'✅' if discount>=discount_threshold else '❌'}≥{discount_threshold:.2f}) "
         f"ev={ev:+.3f}({'✅' if ev>0.05 else '❌'}) "
         f"odds={target_odds:.3f}({'✅' if target_odds<0.85 else '❌'}) "
-        f"conf={confidence:.0%}({'✅' if confidence>=0.80 else '❌'}≥80%) "
+        f"conf={confidence:.0%}({'✅' if confidence>=0.65 else '❌'}≥65%) "
         f"流动性:{details['liquidity']}"
     )
+
+    # 记录决策（在计算 should_bet 之后）
+    action = "BET" if should_bet else "SKIP"
+    log_decision(slug, coin, price_to_beat, direction, confidence, up_odds, down_odds, details, action)
 
     return should_bet, direction, confidence, details
 
@@ -179,7 +181,7 @@ def execute_bet(slug, direction, token_id, confidence=0.85, ev=0.5, amount=None)
     balance = 100  # 默认值
     try:
         result = subprocess.run(
-            ["polymarket", "clob", "balance", "--signature-type", "gnosis-safe", "--asset-type", "collateral"],
+            ["polymarket", "clob", "balance", "--signature-type", "eoa", "--asset-type", "collateral"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
@@ -210,7 +212,7 @@ def execute_bet(slug, direction, token_id, confidence=0.85, ev=0.5, amount=None)
     
     cmd = [
         "polymarket", "clob", "create-order",
-        "--signature-type", "gnosis-safe",
+        "--signature-type", "eoa",
         "--token", token_id,
         "--side", "buy",
         "--price", str(price),

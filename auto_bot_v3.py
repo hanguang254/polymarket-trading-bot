@@ -15,12 +15,28 @@ Polymarket 全自动交易机器人 v3.1
   10s   地板价清仓
   0s    市场结束
 """
+import logging
 import sys
 import time
 import json
 import os
 import requests
 from datetime import datetime, timezone, timedelta
+
+# --- 新增日志配置 ---
+LOG_FILE = "logs/polymarket-bot.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True) # 确保logs目录存在
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode='a'), # 使用追加模式
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+# --- 日志配置结束 ---
 
 sys.path.insert(0, "/root/.openclaw/workspace/polymarket-arb-bot")
 
@@ -186,7 +202,7 @@ def close_position(token_id, size=5, time_remaining=None):
         for price in valid_prices:
             cmd = [
                 "polymarket", "clob", "create-order",
-                "--signature-type", "gnosis-safe",
+                "--signature-type", "eoa",
                 "--token", token_id,
                 "--side", "sell",
                 "--price", str(price),
@@ -244,8 +260,10 @@ class MarketTracker:
                 self.tracked[slug] = market
                 end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
                 remaining = (end_dt - now).total_seconds()
-                print(f"\n🆕 新市场: {market['coin']} | {slug}")
-                print(f"   结束: {end_dt.strftime('%H:%M:%S')} UTC | 剩余: {remaining:.0f}s")
+                logger.info(f"\n🆕 新市场: {market['coin']} | {slug}")
+                # 转换为美国东部时间显示
+                et_dt = end_dt - timedelta(hours=5)  # UTC-5 (EST)
+                logger.info(f"   结束: {et_dt.strftime('%H:%M:%S')} ET | 剩余: {remaining:.0f}s")
             else:
                 self.tracked[slug]["up_odds"] = market["up_odds"]
                 self.tracked[slug]["down_odds"] = market["down_odds"]
@@ -253,7 +271,7 @@ class MarketTracker:
         return markets
     
     def check_analysis_trigger(self):
-        """预热观察 + 趋势确认下注"""
+        """预热观察 + 趋势确认下注（优化版）"""
         now = datetime.now(timezone.utc)
         
         for slug, market in list(self.tracked.items()):
@@ -262,28 +280,39 @@ class MarketTracker:
             elapsed = (now - start_dt).total_seconds()
             remaining = (end_dt - now).total_seconds()
             
-            # === 预热期：60s-120s（市场开始后60秒开始采集） ===
-            if 60 <= elapsed <= 180 and slug not in self.analyzed:
+            # === PTB 获取期：30s-60s ===
+            if 30 <= elapsed < 60 and slug not in self.ptb_cache:
+                logger.info(f"\n💰 获取 PTB: {market['coin']} | {slug}")
+                ptb = get_ptb_multi_strategy(slug, market['coin'])
+                if ptb:
+                    self.ptb_cache[slug] = ptb
+                    logger.info(f"   PTB: ${ptb:,.2f}")
+                else:
+                    logger.warning(f"   ⚠️ PTB 获取失败")
+            
+            # === 预热期：40s-100s（60秒采样） ===
+            if 40 <= elapsed <= 100 and slug not in self.analyzed:
                 if slug not in self.warmup_started:
                     self.warmup_started.add(slug)
                     self.warmup_data[slug] = []
-                    print(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s")
+                    logger.info(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s")
                 
                 # 每5秒采集一次趋势数据
                 samples = self.warmup_data.get(slug, [])
                 if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= 5:
                     try:
-                        from ai_trader.binance_api import get_binance_price
-                        price = get_binance_price(market["coin"])
+                        from ai_trader.binance_api import get_current_price
+                        symbol = f"{market['coin']}USDT"
+                        price = get_current_price(symbol)
                         if price:
                             direction = "UP" if len(samples) > 0 and price > samples[-1].get("price", price) else "DOWN"
                             samples.append({"price": price, "direction": direction, "ts": time.time()})
                             self.warmup_data[slug] = samples
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ 预热采样失败: {e}")
             
-            # === 下注窗口：120s-180s（已有60秒观察数据） ===
-            if 120 <= elapsed <= 180 and slug not in self.analyzed:
+            # === 下注窗口：100s-160s（已有60秒观察数据） ===
+            if 100 <= elapsed <= 160 and slug not in self.analyzed:
                 self.analyzed.add(slug)
                 
                 # 趋势确认（参考，不阻止分析）
@@ -294,7 +323,7 @@ class MarketTracker:
                 extra_info = {"trend_strength": trend_strength, "warmup_samples": len(samples)}
                 
                 if trend_strength == "震荡":
-                    print(f"\n⚠️ {market['coin']} | {slug} | 趋势震荡，提高阈值到15%")
+                    logger.warning(f"\n⚠️ {market['coin']} | {slug} | 趋势震荡，提高阈值到15%")
                     extra_info["min_discount"] = 0.15  # 震荡时提高折价阈值
                 
                 self.analyze_and_trade(slug, market, extra_info)
@@ -335,15 +364,20 @@ class MarketTracker:
         trend = extra_info.get("trend_strength", "未知") if extra_info else "未知"
         warmup_n = extra_info.get("warmup_samples", 0) if extra_info else 0
         
-        print(f"\n{'='*60}")
-        print(f"🔔 分析市场: {coin} | {slug}")
-        print(f"  📊 趋势: {trend} | 预热采样: {warmup_n}个")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🔔 分析市场: {coin} | {slug}")
+        logger.info(f"  📊 趋势: {trend} | 预热采样: {warmup_n}个")
         
-        # 获取 PTB
-        ptb = self.ptb_cache.get(slug) or get_ptb_multi_strategy(slug, coin)
+        # 获取 PTB（优先使用缓存）
+        ptb = self.ptb_cache.get(slug)
+        if not ptb:
+            logger.warning("  ⚠️ PTB 未缓存，尝试实时获取...")
+            ptb = get_ptb_multi_strategy(slug, coin)
+            if ptb:
+                self.ptb_cache[slug] = ptb
         if not ptb:
             print("  ❌ 无法获取 PTB")
-            print(f"{'='*60}\n")
+            logger.info(f"{'='*60}\n")
             return
         
         self.ptb_cache[slug] = ptb
@@ -355,40 +389,40 @@ class MarketTracker:
             coin, ptb, up_odds, down_odds, slug
         )
         
-        print(f"  🤖 AI: {direction} | 置信度: {confidence*100:.0f}%")
-        print(f"  💵 折价: ${details.get('discount',0):.3f} | 估值: ${details.get('estimated_value',0):.2f} | ATR偏离: {details.get('diff_in_atr',0):.2f}")
+        logger.info(f"  🤖 AI: {direction} | 置信度: {confidence*100:.0f}%")
+        logger.info(f"  💵 折价: ${details.get('discount',0):.3f} | 估值: ${details.get('estimated_value',0):.2f} | ATR偏离: {details.get('diff_in_atr',0):.2f}")
         
         if not should_bet:
-            print(f"  ❌ 不满足: {details.get('bet_reason','')}")
+            logger.warning(f"  ❌ 不满足: {details.get('bet_reason','')}")
             decrease_cooldown()
-            print(f"{'='*60}\n")
+            logger.info(f"{'='*60}\n")
             return
         
-        print(f"  ✅ 满足下注条件！")
+        logger.info(f"  ✅ 满足下注条件！")
         
         # 检查冷却期
         if not should_trade():
             cooldown = decrease_cooldown()
             print(f"  ⏸️ 冷却期中，观望剩余 {cooldown} 期")
-            print(f"{'='*60}\n")
+            logger.info(f"{'='*60}\n")
             return
         
         # 获取 token_id
         up_token, down_token = get_token_ids(slug)
         if not up_token or not down_token:
-            print(f"  ❌ 无法获取 token_id")
-            print(f"{'='*60}\n")
+            logger.error(f"  ❌ 无法获取 token_id")
+            logger.info(f"{'='*60}\n")
             return
         
         token_id = up_token if direction == "UP" else down_token
         
         # 执行下注
-        print(f"  💸 执行下注: {direction} | Token: {token_id[:16]}...")
+        logger.info(f"  💸 执行下注: {direction} | Token: {token_id[:16]}...")
         from ai_analyze_v2 import execute_bet
         success, entry_price, bet_size, output = execute_bet(slug, direction, token_id, confidence=confidence, ev=details.get('expected_value', 0.5))
         
         if success:
-            print(f"  ✅ 下注成功！（{bet_size}份）")
+            logger.info(f"  ✅ 下注成功！（{bet_size}份）")
             
             # 记录持仓（使用实际下单价格和动态仓位）
             position = Position(
@@ -402,10 +436,10 @@ class MarketTracker:
             # 发送通知
             send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
         else:
-            print(f"  ❌ 下注失败: {output[:150]}")
+            logger.error(f"  ❌ 下注失败: {output[:150]}")
             record_bet_result(False, slug)
         
-        print(f"  📊 {get_state_summary()}")
+        logger.info(f"  📊 {get_state_summary()}")
         print(f"{'='*60}\n")
     
     def close_position(self, slug, position):
@@ -473,9 +507,9 @@ class MarketTracker:
 
 
 def main():
-    print("🤖 Polymarket 全自动交易机器人 v3.1 启动")
-    print("   策略: 60s预热观察 → 趋势确认下注 → 实时盯盘平仓")
-    print("   下注窗口: 120s-180s（市场开始后）")
+    print("🤖 Polymarket 全自动交易机器人 v3.2 启动")
+    print("   策略: PTB预获取 → 预热观察 → 趋势确认下注")
+    print("   时间线: 30-60s获取PTB → 40-100s预热 → 100-160s下注")
     print("   趋势确认: 强/中趋势正常阈值，震荡提高到15%")
     print("   容错: 自动捕获异常，避免EPIPE崩溃")
     print()

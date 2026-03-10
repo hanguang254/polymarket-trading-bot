@@ -158,7 +158,7 @@ def sell_position(token_id, size, price, max_retries=3):
     for attempt in range(max_retries):
         cmd = [
             "polymarket", "clob", "create-order",
-            "--signature-type", "gnosis-safe",
+            "--signature-type", "eoa",
             "--token", token_id,
             "--side", "sell",
             "--price", str(price),
@@ -509,7 +509,7 @@ def has_pre_order(slug):
 def cancel_all_orders(token_id):
     """取消所有活跃订单"""
     try:
-        cmd = ["polymarket", "clob", "cancel-all", "--token", token_id, "--signature-type", "gnosis-safe"]
+        cmd = ["polymarket", "clob", "cancel-all", "--token", token_id, "--signature-type", "eoa"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         return result.returncode == 0
     except:
@@ -518,7 +518,7 @@ def cancel_all_orders(token_id):
 def check_balance_changed(token_id, expected_size):
     """通过查询token余额判断是否成交（余额减少=卖出成功）"""
     try:
-        cmd = ["polymarket", "clob", "balance", "--signature-type", "gnosis-safe"]
+        cmd = ["polymarket", "clob", "balance", "--signature-type", "eoa"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             # 解析余额输出，检查token是否还在
