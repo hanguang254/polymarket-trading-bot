@@ -43,8 +43,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # --- 日志配置结束 ---
 
-sys.path.insert(0, "/root/.openclaw/workspace/polymarket-arb-bot")
-
 from ai_trader.polymarket_api import get_current_markets
 from ai_analyze_v2 import analyze_and_decide
 from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result
