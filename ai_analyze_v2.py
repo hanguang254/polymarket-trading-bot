@@ -5,6 +5,7 @@ AI 分析和下注决策 v2
 - 用期望值（EV）决定是否下注，而不是固定阈值
 """
 import sys
+import os
 import json
 from datetime import datetime, timezone
 
@@ -40,7 +41,7 @@ def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, det
         f.write(json.dumps(record) + "\n")
 
 
-def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
+def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info=None):
     """
     执行 AI 分析并返回决策
 
@@ -63,17 +64,61 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
     ev = details.get("expected_value", 0)
     discount = details.get("discount", 0)
 
-    # 流动性估计（基于赔率接近度）
-    # 赔率越接近0.5，流动性越好
-    odds_spread = abs(up_odds - down_odds)
-    is_liquid = odds_spread < 0.15  # 价差<15%认为流动性好
+    # ── LMSR 流动性评估（替代粗糙的 odds_spread 判断）──
+    # 用订单簿深度反推流动性参数 b，计算真实滑点
+    liquidity_info = None
+    token_id = extra_info.get("token_id") if extra_info else None
+    if token_id:
+        try:
+            from ai_trader.lmsr_liquidity import estimate_lmsr_b, get_dynamic_discount_threshold
+            liquidity_info = estimate_lmsr_b(token_id)
+            discount_threshold = get_dynamic_discount_threshold(liquidity_info)
+            details["lmsr_b"] = liquidity_info["b"]
+            details["liquidity_score"] = liquidity_info["liquidity_score"]
+            details["spread"] = liquidity_info["spread"]
+            details["slippage_5"] = liquidity_info["slippage_5"]
+        except Exception:
+            liquidity_info = None
+
+    if not liquidity_info:
+        # fallback: 原有逻辑
+        odds_spread = abs(up_odds - down_odds)
+        is_liquid = odds_spread < 0.15
+        discount_threshold = 0.10 if is_liquid else 0.15
+
+    # 预热gap趋势覆盖（只能提高阈值，不能降低）
+    if extra_info and "min_discount" in extra_info:
+        discount_threshold = max(discount_threshold, extra_info["min_discount"])
     
-    # 动态折价阈值
-    if is_liquid:
-        discount_threshold = 0.10  # 流动性好，10%折价
-    else:
-        discount_threshold = 0.15  # 流动性差，要求15%折价
-    
+    # 贝叶斯后验覆盖置信度（如果有预热数据）
+    bayesian_info = extra_info.get("bayesian") if extra_info else None
+    if bayesian_info:
+        # 用贝叶斯后验 p_hat 计算真正的 EV = p_hat - price
+        p_hat = bayesian_info.get("p_hat", 0.5)
+        bayesian_conf = bayesian_info.get("confidence", 0)
+        bayesian_dir = bayesian_info.get("direction", direction)
+
+        # 贝叶斯方向与折价方向一致时，增强信号
+        if bayesian_dir == direction and bayesian_conf > 0.3:
+            # 用贝叶斯后验替代启发式置信度（加权融合）
+            confidence = confidence * 0.4 + bayesian_conf * 0.6
+            # 论文公式: EV = p̂ - p
+            ev_bayesian = p_hat - target_odds
+            if ev_bayesian > 0:
+                ev = max(ev, ev_bayesian)
+                details["ev_bayesian"] = round(ev_bayesian, 4)
+            details["confidence_source"] = "bayesian_fused"
+        elif bayesian_dir != direction:
+            # 贝叶斯方向与折价方向矛盾，降低置信度
+            confidence = confidence * 0.5
+            details["confidence_source"] = "bayesian_conflict"
+        else:
+            details["confidence_source"] = "discount_only"
+
+        details["bayesian_p_hat"] = round(p_hat, 4)
+        details["bayesian_confidence"] = round(bayesian_conf, 4)
+        details["bayesian_direction"] = bayesian_dir
+
     should_bet = (
         discount >= discount_threshold  # 动态折价阈值
         and ev > 0.1                   # 正期望
@@ -82,14 +127,15 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
     )
 
     details["should_bet"] = should_bet
-    details["liquidity"] = "good" if is_liquid else "poor"
-    details["odds_spread"] = round(odds_spread, 3)
+    liq_label = f"LMSR:{liquidity_info['liquidity_score']:.2f}" if liquidity_info else "fallback"
+    details["liquidity"] = liq_label
+    details["discount_threshold"] = discount_threshold
     details["bet_reason"] = (
-        f"折价={discount:.3f}({'✅' if discount>=discount_threshold else '❌'}≥{discount_threshold:.2f}) "
-        f"ev={ev:+.3f}({'✅' if ev>0.05 else '❌'}) "
+        f"折价={discount:.3f}({'✅' if discount>=discount_threshold else '❌'}≥{discount_threshold:.3f}) "
+        f"ev={ev:+.3f}({'✅' if ev>0.1 else '❌'}) "
         f"odds={target_odds:.3f}({'✅' if target_odds<0.85 else '❌'}) "
         f"conf={confidence:.0%}({'✅' if confidence>=0.65 else '❌'}≥65%) "
-        f"流动性:{details['liquidity']}"
+        f"流动性:{liq_label}"
     )
 
     # 记录决策（在计算 should_bet 之后）
@@ -99,47 +145,51 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug):
     return should_bet, direction, confidence, details
 
 
-def calculate_kelly_size(confidence, ev, balance):
+def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None):
     """
-    1/4 Kelly仓位计算（5分钟市场专用）
-    
-    基于真实胜率而非折价收益率
-    
+    修正的 1/4 Kelly 仓位计算（5分钟市场专用）
+
+    正确公式（二元市场）:
+        b = (1 - price) / price     — 净赔率
+        f* = (p*b - q) / b = (p - price) / (1 - price)
+    其中 p 是贝叶斯后验概率，price 是买入价格
+
+    论文注释: "NEVER full Kelly on 5min markets!" → 1/4 Kelly
+
     Args:
-        confidence: 置信度（动量评分转换的胜率估计）
-        ev: 折价收益率
+        confidence: 置信度（用于 fallback）
+        ev: 期望值
         balance: 当前余额
-    
-    Returns:
-        size: 下注份数 (3-10)
+        target_price: 买入价格（市场赔率）
+        p_hat: 贝叶斯后验概率（如果有的话，优先使用）
     """
     if ev <= 0:
-        return 3
-    
-    # 将置信度转换为胜率估计
-    # confidence来自动量评分，范围0-1
-    # 需要映射到合理的胜率范围（0.5-0.8）
-    p_win = 0.5 + (confidence * 0.3)  # 50%-80%
-    p_win = max(0.5, min(0.8, p_win))
-    
-    # 计算净赔率 b
-    # 假设赔率在0.5附近，净赔率约为1
-    implied_odds = 0.5 + ev  # 粗略估计
-    if implied_odds >= 1.0:
-        implied_odds = 0.99
-    b = (1 / implied_odds) - 1
-    
-    # Kelly公式: f = (p*b - q) / b
-    q = 1 - p_win
-    kelly_full = (p_win * b - q) / b if b > 0 else 0
-    
-    # 1/4 Kelly（保守）
+        return 5
+
+    # 胜率估计: 优先用贝叶斯后验，否则用 confidence 映射
+    if p_hat and p_hat > 0.5:
+        p_win = min(p_hat, 0.85)  # 上限保护
+    else:
+        p_win = 0.5 + (confidence * 0.3)
+        p_win = max(0.5, min(0.80, p_win))
+
+    # 买入价格: 优先用实际 target_price
+    price = target_price if target_price and 0.01 < target_price < 0.99 else 0.50
+
+    # 正确的二元市场 Kelly 公式:
+    # f* = (p - price) / (1 - price)
+    kelly_full = (p_win - price) / (1 - price) if price < 1.0 else 0
+
+    if kelly_full <= 0:
+        return 5  # 无正期望，最小仓位
+
+    # 1/4 Kelly（论文: NEVER full Kelly on 5min markets!）
     kelly_quarter = kelly_full * 0.25
     kelly_quarter = max(0, min(0.25, kelly_quarter))
-    
-    # 转换为份数（Polymarket最低5份）
+
+    # 转换为份数
     if kelly_quarter <= 0.05:
-        size = 5   # 最小5份（Polymarket最低要求）
+        size = 5
     elif kelly_quarter < 0.10:
         size = 5
     elif kelly_quarter < 0.15:
@@ -148,7 +198,7 @@ def calculate_kelly_size(confidence, ev, balance):
         size = 8
     else:
         size = 10
-    
+
     # 余额约束
     if balance < 20:
         max_by_balance = 10
@@ -157,16 +207,16 @@ def calculate_kelly_size(confidence, ev, balance):
     else:
         max_by_balance = max(5, int(balance * 0.10))
     size = min(size, max_by_balance)
-    
-    # 硬约束：3-10份
-    size = max(3, min(10, size))
-    
-    print(f"  📊 仓位: ev={ev:+.3f} balance=${balance:.2f} → {size}份")
-    
+
+    # 硬约束: 5-10份
+    size = max(5, min(10, size))
+
+    print(f"  📊 Kelly仓位: p={p_win:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f} → {size}份")
+
     return size
 
 
-def execute_bet(slug, direction, token_id, confidence=0.85, ev=0.5, amount=None):
+def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None, p_hat=None):
     """执行下注（通过 Polymarket CLI）
     
     Args:
@@ -178,7 +228,7 @@ def execute_bet(slug, direction, token_id, confidence=0.85, ev=0.5, amount=None)
         amount: 下注金额（美元），None则自动计算
     """
     # 获取当前余额
-    balance = 100  # 默认值
+    balance = 0  # 默认0，必须成功获取才下注
     try:
         result = subprocess.run(
             ["polymarket", "clob", "balance", "--signature-type", "eoa", "--asset-type", "collateral"],
@@ -191,24 +241,45 @@ def execute_bet(slug, direction, token_id, confidence=0.85, ev=0.5, amount=None)
                 balance = float(match.group(1))
     except:
         pass
-    
-    # 获取当前价格
+
+    # 余额不足时直接跳过，不记录为失败
+    MIN_BALANCE = float(os.environ.get("MIN_BALANCE", "5.0"))
+    if balance < MIN_BALANCE:
+        print(f"  ⚠️ 余额不足: ${balance:.2f} < ${MIN_BALANCE:.2f}，跳过下注")
+        return False, 0, 0, "SKIP_NO_BALANCE"
+
+    # 获取买入价：用订单簿 best_ask（确保吃单成交），失败回退 midpoint+0.01
+    import requests
+    price = 0.5
     try:
-        import requests
-        resp = requests.get(f"https://clob.polymarket.com/midpoint?token_id={token_id}", timeout=5)
+        resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
         if resp.status_code == 200:
-            data = resp.json()
-            price = float(data.get('mid', 0.5))
-        else:
-            price = 0.5
+            asks = resp.json().get('asks', [])
+            if asks:
+                price = float(asks[0]['price'])  # 最优卖价即为买方成交价
     except:
-        price = 0.5
-    
+        pass
+
+    if price == 0.5:
+        # 回退：midpoint + 0.01 滑点
+        try:
+            resp = requests.get(f"https://clob.polymarket.com/midpoint?token_id={token_id}", timeout=5)
+            if resp.status_code == 200:
+                mid = float(resp.json().get('mid', 0.5))
+                price = min(round(mid + 0.01, 2), 0.99)
+        except:
+            pass
+
     # 价格四舍五入到2位小数（Polymarket要求）
     price = round(price, 2)
-    
-    # Kelly动态仓位（替代固定5份）
-    size = calculate_kelly_size(confidence, ev, balance)
+
+    # 安全检查：price 仍为默认值说明订单簿和 midpoint 都获取失败
+    if price == 0.5:
+        print(f"  ⚠️ 无法获取真实价格（订单簿+midpoint均失败），跳过下注")
+        return False, 0, 0, "SKIP_NO_PRICE"
+
+    # Kelly动态仓位（修正公式，传入实际买入价和贝叶斯后验）
+    size = calculate_kelly_size(confidence, ev, balance, target_price=price, p_hat=p_hat)
     
     cmd = [
         "polymarket", "clob", "create-order",

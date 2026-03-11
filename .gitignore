@@ -22,6 +22,7 @@ logs/*.backup
 
 # Trading state (contains runtime data)
 logs/trading_state.json
+logs/pre_orders.json
 
 # Python
 __pycache__/
@@ -38,6 +39,9 @@ playwright-state.json
 .idea/
 *.swp
 *.swo
+
+# Old/archived scripts (may contain hardcoded secrets)
+.old_scripts/
 
 # OS
 .DS_Store

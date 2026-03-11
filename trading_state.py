@@ -4,9 +4,11 @@
 """
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
-STATE_FILE = "/root/.openclaw/workspace/polymarket-arb-bot/logs/trading_state.json"
+MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", "10.0"))  # 每日最大亏损额（USDC）
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "trading_state.json")
 
 def load_state():
     """加载交易状态"""
@@ -21,6 +23,8 @@ def load_state():
         "total_bets": 0,
         "total_wins": 0,
         "total_losses": 0,
+        "daily_pnl": 0.0,
+        "daily_pnl_date": str(date.today()),
     }
 
 def save_state(state):
@@ -30,17 +34,33 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 def should_trade():
-    """检查是否应该交易（考虑冷却期）"""
+    """检查是否应该交易（考虑冷却期 + 日亏损上限）"""
     state = load_state()
-    return state["cooldown_remaining"] == 0
+    if state["cooldown_remaining"] > 0:
+        return False
+    # 日期切换时重置当日PnL
+    today = str(date.today())
+    if state.get("daily_pnl_date") != today:
+        return True
+    daily_pnl = state.get("daily_pnl", 0.0)
+    if daily_pnl <= -MAX_DAILY_LOSS:
+        return False  # 当日亏损超限，停止交易
+    return True
 
-def record_bet_result(success, slug):
-    """记录下注结果"""
+def record_bet_result(success, slug, pnl=0.0):
+    """记录下注结果，pnl 为本次盈亏（正=盈利，负=亏损）"""
     state = load_state()
     state["total_bets"] += 1
     state["last_bet_time"] = datetime.now(timezone.utc).isoformat()
     state["last_bet_result"] = "win" if success else "loss"
-    
+
+    # 日期切换时重置当日PnL
+    today = str(date.today())
+    if state.get("daily_pnl_date") != today:
+        state["daily_pnl"] = 0.0
+        state["daily_pnl_date"] = today
+    state["daily_pnl"] = round(state.get("daily_pnl", 0.0) + pnl, 4)
+
     if success:
         state["total_wins"] += 1
         state["consecutive_losses"] = 0
@@ -49,7 +69,7 @@ def record_bet_result(success, slug):
         state["total_losses"] += 1
         state["consecutive_losses"] += 1
         state["cooldown_remaining"] = 3  # 观望3期
-    
+
     save_state(state)
     return state
 
@@ -69,5 +89,6 @@ def get_state_summary():
         f"胜: {state['total_wins']} | "
         f"负: {state['total_losses']} | "
         f"连败: {state['consecutive_losses']} | "
-        f"观望剩余: {state['cooldown_remaining']}期"
+        f"观望剩余: {state['cooldown_remaining']}期 | "
+        f"今日PnL: ${state.get('daily_pnl', 0.0):+.2f}"
     )

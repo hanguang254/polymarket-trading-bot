@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""
-requirements.txt - 依赖包
-"""
 requests>=2.31.0
-web3>=6.0.0
+python-dotenv>=1.0.0
+playwright>=1.40.0

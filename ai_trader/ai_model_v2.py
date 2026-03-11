@@ -29,8 +29,8 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
     """
     symbol = f"{coin}USDT"
 
-    # ── 数据采集 ──
-    klines_1m = get_klines(symbol, "1m", 15)
+    # ── 数据采集（30根K线，更稳定的ATR估算） ──
+    klines_1m = get_klines(symbol, "1m", 30)
     current_price = get_current_price(symbol)
 
     if not klines_1m or not current_price or not price_to_beat:
@@ -86,14 +86,16 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
     # 实际价值 = 0.5 + 偏离贡献
     # 偏离贡献随ATR倍数递增但有上限（因为会回归）
     # 偏离越大，翻盘越难，但要保守估值（5分钟会均值回归）
-    if diff_in_atr > 3.0:
-        estimated_value = 0.80  # 大幅领先
+    if diff_in_atr > 4.0:
+        estimated_value = 0.88  # 极大幅领先，翻盘概率极低
+    elif diff_in_atr > 3.0:
+        estimated_value = 0.83  # 大幅领先
     elif diff_in_atr > 2.0:
-        estimated_value = 0.72
+        estimated_value = 0.75
     elif diff_in_atr > 1.5:
-        estimated_value = 0.67
+        estimated_value = 0.69
     elif diff_in_atr > 1.0:
-        estimated_value = 0.62
+        estimated_value = 0.63
     elif diff_in_atr > 0.7:
         estimated_value = 0.58
     elif diff_in_atr > 0.5:

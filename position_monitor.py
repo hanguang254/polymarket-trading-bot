@@ -14,8 +14,11 @@ POSITIONS_FILE = "/root/.openclaw/workspace/polymarket-arb-bot/logs/positions.js
 PROFIT_THRESHOLD = 0.15  # 15% 止盈
 
 # Telegram 通知配置
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = "1609325006"
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 def send_telegram(text):
     """发送 Telegram 通知"""
@@ -483,13 +486,34 @@ def try_sell_with_multiple_prices(token_id, size, best_bid, current_price, entry
     
     return False, None, "所有价格尝试均失败"
 
-# 预挂单状态追踪
-_pre_orders = {}  # slug -> {"type": "take_profit"|"close", "time": timestamp}
+# 预挂单状态追踪（持久化到文件，进程重启不丢失）
+PRE_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "pre_orders.json")
+
+def _load_pre_orders():
+    """从文件加载预挂单状态"""
+    try:
+        if os.path.exists(PRE_ORDERS_FILE):
+            with open(PRE_ORDERS_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_pre_orders(data):
+    """保存预挂单状态到文件"""
+    try:
+        os.makedirs(os.path.dirname(PRE_ORDERS_FILE), exist_ok=True)
+        with open(PRE_ORDERS_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+_pre_orders = _load_pre_orders()
 
 def place_pre_order(token_id, size, price, slug, order_type):
     """预挂卖单"""
     global _pre_orders
-    
+
     success, output, actual_price = sell_position(token_id, size, price)
     if success:
         _pre_orders[slug] = {
@@ -497,6 +521,7 @@ def place_pre_order(token_id, size, price, slug, order_type):
             "price": actual_price or price,
             "time": datetime.now(timezone.utc).isoformat()
         }
+        _save_pre_orders(_pre_orders)
         print(f"  📋 预挂单成功: {order_type} @ ${(actual_price or price):.2f}")
     else:
         print(f"  ❌ 预挂单失败: {output[:80]}")
