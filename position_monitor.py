@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 import requests
 
-POSITIONS_FILE = "/root/.openclaw/workspace/polymarket-arb-bot/logs/positions.jsonl"
+POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
 PROFIT_THRESHOLD = 0.15  # 15% 止盈
 
 # Telegram 通知配置
@@ -284,8 +284,9 @@ def get_current_crypto_price(coin):
 def get_ptb_from_slug(slug):
     """从slug获取PTB价格"""
     try:
+        ptb_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_trader", "playwright_ptb.py")
         result = subprocess.run(
-            ["python3", "/root/.openclaw/workspace/polymarket-arb-bot/playwright_ptb.py", slug],
+            ["python3", ptb_script, slug],
             capture_output=True,
             text=True,
             timeout=15
