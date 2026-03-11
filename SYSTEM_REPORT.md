@@ -199,6 +199,10 @@ f/4 = f* × 0.25 × kelly_reduction  # 1/4 Kelly + 缩减
 #### 下注执行
 - 买入价：订单簿 best_ask → midpoint + $0.01 → 拒绝默认值
 - CLI 命令：`polymarket clob create-order --side buy --price X --size Y`
+- **成交确认**：解析 CLI 输出的 `Status` / `Taking` 字段
+  - 仅 `Status: MATCHED` 视为成功（`LIVE` 挂单不记录持仓）
+  - 实际成交价 = `Taking / Size`（非限价单价格）
+- 日志记录 `price`（实际成交价）+ `limit_price`（提交的限价）
 - 持仓记录丰富字段：`ptb, atr_val, diff_in_atr, base_rate, p_win_final, estimated_value`
 
 ---

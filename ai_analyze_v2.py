@@ -319,33 +319,51 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
 
     print(f"  💸 下注命令: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    
-    success = result.returncode == 0
-    output = result.stdout if success else result.stderr
-    
-    # 记录下注结果
+
+    output = result.stdout if result.returncode == 0 else result.stderr
+
+    # 解析CLI输出，提取实际成交状态和价格
+    from position_monitor import parse_order_output
+    info = parse_order_output(output) if result.returncode == 0 else {}
+
+    # 仅 MATCHED 视为成功（LIVE=挂单未成交，不记录持仓）
+    success = result.returncode == 0 and info.get("matched", False)
+
+    # 计算实际成交价：Taking/Size（与 sell_position 逻辑一致）
+    if success and info.get("taking", 0) > 0 and size > 0:
+        actual_price = round(info["taking"] / size, 4)
+        print(f"  📊 成交确认: Status={info['status']} | Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f} (限价=${price})")
+    else:
+        actual_price = price  # 回退：解析失败时用限价
+
+    if not success and result.returncode == 0:
+        # returncode=0 但未 MATCHED（LIVE 挂单）
+        print(f"  ⏳ 挂单未成交: Status={info.get('status')} | 不记录持仓")
+
+    # 记录下注结果（使用实际成交价）
     log_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "slug": slug,
         "direction": direction,
         "token_id": token_id,
-        "price": price,
+        "price": actual_price,
+        "limit_price": price,
         "size": size,
-        "amount": price * size,
+        "amount": actual_price * size,
         "success": success,
         "output": output[:200],  # 截断输出
     }
-    
+
     with open("logs/bets.jsonl", "a") as f:
         f.write(json.dumps(log_entry) + "\n")
-    
+
     # 如果下注成功，记录持仓（丰富字段供 position_monitor 使用）
     if success:
         position = {
             "token_id": token_id,
             "slug": slug,
             "direction": direction,
-            "entry_price": price,
+            "entry_price": actual_price,
             "size": size,
             "confidence": confidence,
             "ev": ev,
@@ -365,8 +383,8 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                 position["ptb"] = entry_details["price_to_beat"]
         with open("logs/positions.jsonl", "a") as f:
             f.write(json.dumps(position) + "\n")
-    
-    return success, price, size, output
+
+    return success, actual_price, size, output
 
 
 if __name__ == "__main__":
