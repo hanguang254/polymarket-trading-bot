@@ -112,6 +112,10 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
     details["discount"] = round(discount, 3)
     details["discount_pct"] = round(discount_pct, 1)
 
+    # Base Rate 校准的概率估计（保守先验，比 estimated_value 更谨慎）
+    from ai_trader.base_rate import get_base_rate
+    details["p_win"] = round(get_base_rate(diff_in_atr), 4)
+
     # ═══════════════════════════════════════
     # 辅助指标：动量（判断偏离是否在扩大）
     # ═══════════════════════════════════════

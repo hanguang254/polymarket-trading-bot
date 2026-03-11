@@ -59,6 +59,34 @@ CIRCUIT_BREAK_THRESHOLD = 5   # 连续失败N次触发熔断
 CIRCUIT_BREAK_DURATION = 300  # 熔断持续时间（秒）
 
 
+def get_correlated_exposure(direction, coin):
+    """P3: 相关性暴露控制 — BTC/ETH 相关性~0.85，同方向持仓需减仓
+
+    读 logs/positions.jsonl 中未关闭持仓，如果已有同方向的 BTC 或 ETH 持仓，
+    返回 0.5（Kelly 减半），否则返回 1.0。
+    """
+    try:
+        positions_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
+        if not os.path.exists(positions_file):
+            return 1.0
+        with open(positions_file) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    p = json.loads(line)
+                    if p.get("closed", False):
+                        continue
+                    # 同方向的任何 crypto 持仓（BTC/ETH 高度相关）
+                    if p.get("direction") == direction:
+                        return 0.5
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return 1.0
+
+
 def circuit_breaker_check():
     """检查熔断器状态，返回 True 表示可以继续"""
     global _circuit_open_until
@@ -574,8 +602,14 @@ class MarketTracker:
             return
 
         token_id = up_token if direction == "UP" else down_token
-        
-        # 执行下注（传入贝叶斯后验概率）
+
+        # P3: 相关性暴露控制 — BTC/ETH 相关性~0.85，同方向仓位减半
+        correlation_factor = get_correlated_exposure(direction, coin)
+        kelly_reduction = details.get("kelly_reduction", 1.0) * correlation_factor
+        if correlation_factor < 1.0:
+            logger.info(f"  ⚠️ 相关性控制: 已有同方向持仓，Kelly×{correlation_factor}")
+
+        # 执行下注（传入贝叶斯后验概率 + entry_details + kelly_reduction）
         logger.info(f"  💸 执行下注: {direction} | Token: {token_id[:16]}...")
         from ai_analyze_v2 import execute_bet
         bayesian_info = extra_info.get("bayesian") if extra_info else None
@@ -584,7 +618,9 @@ class MarketTracker:
             slug, direction, token_id,
             confidence=confidence,
             ev=details.get('expected_value', 0),
-            p_hat=p_hat
+            p_hat=p_hat,
+            entry_details=details,
+            kelly_reduction=kelly_reduction,
         )
         
         if success:
