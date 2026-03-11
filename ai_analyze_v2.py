@@ -329,10 +329,11 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     # 仅 MATCHED 视为成功（LIVE=挂单未成交，不记录持仓）
     success = result.returncode == 0 and info.get("matched", False)
 
-    # 计算实际成交价：Taking/Size（与 sell_position 逻辑一致）
-    if success and info.get("taking", 0) > 0 and size > 0:
-        actual_price = round(info["taking"] / size, 4)
-        print(f"  📊 成交确认: Status={info['status']} | Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f} (限价=${price})")
+    # 计算实际成交价：BUY 用 Making/Size（USDC花费/token数），SELL 用 Taking/Size
+    # BUY 时 Taking=收到的token数(≈size)，Making=花费的USDC；之前误用 Taking/Size ≈ 1.0
+    if success and size > 0 and info.get("making", 0) > 0:
+        actual_price = round(info["making"] / size, 4)
+        print(f"  📊 成交确认: Status={info['status']} | Making=${info['making']:.4f} | Taking=${info.get('taking', 0):.4f} | 实际价=${actual_price:.4f} (限价=${price})")
     else:
         actual_price = price  # 回退：解析失败时用限价
 

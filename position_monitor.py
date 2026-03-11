@@ -44,7 +44,32 @@ def get_open_positions():
     return positions
 
 def get_market_price(token_id):
-    """获取当前市场中间价"""
+    """获取当前市场价格 — 优先用订单簿 bid/ask 中间价，回退到 midpoint API
+
+    midpoint API 有时返回不准确的值（如 $1.00），因为它可能基于缓存/稀疏订单簿。
+    从实际 orderbook 计算的 (best_bid + best_ask) / 2 更可靠。
+    """
+    # 方案1：从订单簿直接计算中间价
+    try:
+        resp = requests.get(
+            f"https://clob.polymarket.com/book?token_id={token_id}",
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            bids = data.get('bids', [])
+            asks = data.get('asks', [])
+            best_bid = float(bids[0]['price']) if bids else None
+            best_ask = float(asks[0]['price']) if asks else None
+            if best_bid and best_ask:
+                return round((best_bid + best_ask) / 2, 4)
+            if best_bid:
+                return best_bid
+            if best_ask:
+                return best_ask
+    except:
+        pass
+    # 方案2：回退到 midpoint API
     try:
         resp = requests.get(
             f"https://clob.polymarket.com/midpoint?token_id={token_id}",
