@@ -335,6 +335,11 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 无法获取真实价格（订单簿+midpoint均失败），跳过下注")
         return False, 0, 0, "SKIP_NO_PRICE"
 
+    # 安全检查：实际买入价不能超过 0.85（与决策条件 target_odds < 0.85 对齐）
+    if price >= 0.85:
+        print(f"  ⚠️ 实际买入价${price:.2f}≥$0.85，上行空间不足，跳过下注")
+        return False, 0, 0, "SKIP_PRICE_TOO_HIGH"
+
     # P2: 退出流动性检查 — 下注前检查能否卖出
     bid_depth = check_bid_depth(token_id)
     if bid_depth is not None:
