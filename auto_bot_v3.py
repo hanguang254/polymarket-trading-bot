@@ -612,6 +612,9 @@ class MarketTracker:
         from ai_analyze_v2 import execute_bet
         bayesian_info = extra_info.get("bayesian") if extra_info else None
         p_hat = bayesian_info.get("p_hat") if bayesian_info else None
+        # P1: 记录反向token_id，供对冲使用
+        details["opposite_token_id"] = down_token if direction == "UP" else up_token
+
         success, entry_price, bet_size, output = execute_bet(
             slug, direction, token_id,
             confidence=confidence,

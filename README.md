@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v3.6
+# Polymarket Trading Bot v3.7
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses discount arbitrage with EV-driven position management, Base Rate calibration, Bayesian sequential updating, and correlated exposure control.
 
@@ -45,14 +45,18 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Bayesian Fusion**: Base rate (40%) + Bayesian posterior (60%) when direction-aligned with confidence > 30%.
 - **Cross-Validation**: Flags overestimation when `estimated_value > p_win + 0.15` (reduces confidence 15%).
 - **LMSR Liquidity Assessment**: Orderbook spread/depth/slippage scoring → dynamic discount threshold (8%-20%).
+- **Exit Liquidity Gate (P2)**: Before entering, checks bid-side depth of the chosen token. `bid_depth < 5` → skip entry entirely. Prevents entering positions that can't be exited.
 - **Correlated Exposure Control**: BTC/ETH correlation ~0.85. Same-direction position halves Kelly sizing.
 - **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds.
+- **Liquidity-Capped Sizing (P3)**: Kelly size capped at 50% of exit bid depth. Works with P2 — P2 gates entry, P3 adjusts size.
 
-### Exit (P1 + P4)
+### Exit (P0-P1 + P4)
+- **Early Profit-Taking (P0)**: When profit ≥ 20%, remaining > 90s, and `best_bid > entry_price`, sell immediately to lock profit instead of waiting for $1.00 settlement. Prevents boundary reversals from turning winners into losers.
+- **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
 - **Direction-Based Exit**: Uses crypto price vs PTB to determine win/loss (not token orderbook price, which can be misleading due to wide bid-ask spreads near settlement).
   - Direction correct → **Hold to settlement** (collect $1.00)
   - Direction wrong → Progressive stop-loss with price escalation
-  - No buyers (bid < $0.05) → Skip futile sell attempts, wait for expiry
+  - No buyers (bid < $0.05) → Attempt hedge (P1), fall back to wait for expiry
 - **Wide Spread Protection**: `get_market_price()` detects bid-ask spread > 50% and falls back to midpoint API, preventing false loss signals (e.g., $0.01/$0.99 → midpoint $0.50 for a token worth $0.99).
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
 - **4-Stage Graduated Exit**: For losing positions — Stage 1 (180-120s), Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) floor prices.
@@ -106,16 +110,20 @@ Layer 1 — Entry Filters
   ├─ Dynamic discount threshold (LMSR: 8%-20%)
   ├─ Strict binary EV > 3%
   ├─ Odds < 0.85, Confidence ≥ 65%
-  └─ Base Rate calibration (weak edge → Kelly halved)
+  ├─ Base Rate calibration (weak edge → Kelly halved)
+  └─ P2: Exit liquidity gate (bid_depth < 5 → skip entry)
 
 Layer 2 — Position Sizing
   ├─ 1/4 Kelly (binary formula)
   ├─ Base Rate reduction (× 0.5 if < 0.55)
   ├─ Correlation reduction (× 0.5 if same-direction open)
+  ├─ P3: Liquidity cap (≤ 50% of exit bid depth)
   ├─ Hard bounds: 5-10 shares
   └─ Balance constraints (10-20% of balance)
 
 Layer 3 — Position Management
+  ├─ P0: Early profit-taking (≥20% profit + >90s → sell immediately)
+  ├─ P1: Opposite token hedge (bid < $0.05 → buy opposite for $1 pair)
   ├─ Direction-based exit (correct → hold, wrong → stop-loss)
   ├─ Wide spread detection (prevents false loss signals)
   ├─ Post-close safety (no trades after market ends)
@@ -242,6 +250,7 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 
 ## Version History
 
+- **v3.7**: 4-layer quantitative defense — P0: early profit-taking (≥20% profit + >90s → sell immediately, don't risk boundary reversal). P1: opposite token hedge (bid < $0.05 → buy opposite token to form $1.00 pair at settlement). P2: exit liquidity gate (bid_depth < 5 → skip entry). P3: liquidity-capped sizing (Kelly ≤ 50% of exit bid depth). Opposite token_id recorded at entry for hedge execution.
 - **v3.6**: Direction-based exit — uses crypto price vs PTB (not token orderbook) to determine win/loss. Winning positions hold to settlement ($1.00) instead of being sold at misleading prices. Wide bid-ask spread detection prevents false losses. Post-close safety prevents trades after market ends. Auto redeem now shows USDC balance.
 - **v3.5**: Fill price fix — parse CLI output (Taking/Size) for actual fill price instead of limit price. MATCHED status check prevents recording unfilled LIVE orders. Fixes inflated entry_price in notifications, logs, and PnL calculations.
 - **v3.4**: Trading Desk Protocol implementation — Base Rate calibration (P0), EV-driven exit (P1), strict binary EV formula (P2), correlated exposure control (P3), EV pricing protection for stages 3-4 (P4), outcome learning loop, cross-validation guard

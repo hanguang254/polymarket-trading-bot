@@ -161,8 +161,22 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     return should_bet, direction, confidence, details
 
 
+def check_bid_depth(token_id):
+    """P2: 检查token的买方深度（bid-side总量），评估退出流动性"""
+    import requests
+    try:
+        resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
+        if resp.status_code == 200:
+            bids = resp.json().get('bids', [])
+            total_depth = sum(float(b['size']) for b in bids)
+            return total_depth
+    except:
+        pass
+    return None
+
+
 def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
-                          p_win=None, kelly_reduction=1.0):
+                          p_win=None, kelly_reduction=1.0, exit_bid_depth=None):
     """
     修正的 1/4 Kelly 仓位计算（5分钟市场专用）
 
@@ -226,11 +240,19 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
         max_by_balance = max(5, int(balance * 0.10))
     size = min(size, max_by_balance)
 
+    # P3: 流动性上限 — 不超过退出流动性的50%
+    if exit_bid_depth and exit_bid_depth > 0:
+        max_by_liquidity = max(5, int(exit_bid_depth * 0.5))
+        if size > max_by_liquidity:
+            print(f"  📊 P3流动性上限: bid_depth={exit_bid_depth:.1f} → max={max_by_liquidity}份")
+            size = min(size, max_by_liquidity)
+
     # 硬约束: 5-10份
     size = max(5, min(10, size))
 
     red_label = f" red={kelly_reduction}" if kelly_reduction < 1.0 else ""
-    print(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f}{red_label} → {size}份")
+    liq_label = f" liq_cap={exit_bid_depth:.0f}" if exit_bid_depth else ""
+    print(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f}{red_label}{liq_label} → {size}份")
 
     return size
 
@@ -301,11 +323,20 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 无法获取真实价格（订单簿+midpoint均失败），跳过下注")
         return False, 0, 0, "SKIP_NO_PRICE"
 
-    # Kelly动态仓位（修正公式 + base_rate/相关性缩减）
+    # P2: 退出流动性检查 — 下注前检查能否卖出
+    bid_depth = check_bid_depth(token_id)
+    if bid_depth is not None:
+        print(f"  📊 P2退出流动性: bid_depth={bid_depth:.1f}份")
+        if bid_depth < 5:
+            print(f"  ⚠️ 退出流动性极低({bid_depth:.1f}<5)，跳过下注")
+            return False, 0, 0, "SKIP_NO_EXIT_LIQUIDITY"
+
+    # Kelly动态仓位（修正公式 + base_rate/相关性缩减 + P3流动性上限）
     p_win_final = entry_details.get("p_win_final") if entry_details else None
     size = calculate_kelly_size(
         confidence, ev, balance, target_price=price, p_hat=p_hat,
-        p_win=p_win_final, kelly_reduction=kelly_reduction
+        p_win=p_win_final, kelly_reduction=kelly_reduction,
+        exit_bid_depth=bid_depth
     )
     
     cmd = [
@@ -382,6 +413,9 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                 position["atr_val"] = entry_details["atr"]
             if "price_to_beat" in entry_details:
                 position["ptb"] = entry_details["price_to_beat"]
+            # P1: 反向token_id（供对冲使用）
+            if "opposite_token_id" in entry_details:
+                position["opposite_token_id"] = entry_details["opposite_token_id"]
         with open("logs/positions.jsonl", "a") as f:
             f.write(json.dumps(position) + "\n")
 

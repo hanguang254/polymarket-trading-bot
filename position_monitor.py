@@ -118,6 +118,57 @@ def get_best_bid(token_id):
         pass
     return None
 
+def get_best_ask(token_id):
+    """获取最佳卖价（用于买入对冲）- 从订单簿获取"""
+    try:
+        resp = requests.get(
+            f"https://clob.polymarket.com/book?token_id={token_id}",
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            asks = data.get('asks', [])
+            if asks and len(asks) > 0:
+                return float(asks[0]['price'])
+    except:
+        pass
+    return None
+
+def buy_opposite_token(token_id, size, price, max_retries=2):
+    """买入对冲token（BUY订单）
+    返回: (success, output, actual_price)
+    """
+    price = round(price, 2)
+    for attempt in range(max_retries):
+        cmd = [
+            "polymarket", "clob", "create-order",
+            "--signature-type", "eoa",
+            "--token", token_id,
+            "--side", "buy",
+            "--price", str(price),
+            "--size", str(size)
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                info = parse_order_output(result.stdout)
+                if info["matched"]:
+                    actual_price = round(info["making"] / size, 4) if size > 0 and info["making"] > 0 else price
+                    print(f"    📊 对冲成交: Status={info['status']} | 实际价=${actual_price:.4f}")
+                    return True, result.stdout, actual_price
+                else:
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                    continue
+            if attempt < max_retries - 1:
+                time.sleep(2)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                return False, str(e), None
+    return False, "All retries failed", None
+
 def analyze_liquidity(token_id, target_size):
     """分析订单簿流动性"""
     try:
@@ -799,6 +850,19 @@ def monitor():
                     print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%，市场信号矛盾，不再盲目持有")
                     direction_correct = False  # 降级为方向未知，走正常止损流程
 
+                # ═══ P0: 早期止盈 — 利润≥20% + 剩余>90s → 锁利，不等结算 ═══
+                if profit_rate >= 0.20 and remaining > 90:
+                    best_bid = get_best_bid(token_id)
+                    if best_bid and best_bid > entry_price:
+                        print(f"  💰 P0早期止盈: 利润{profit_rate*100:.1f}%≥20% | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
+                        success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
+                        if success:
+                            sold = True
+                            sold_price = actual_price or best_bid
+                            self_notify(pos, sold_price, coin, direction, size, "P0早期止盈")
+                            close_position(pos, sold_price)
+                            continue
+
                 # ═══ 必赢持有：方向正确 + 剩余<120s → 不卖，等结算拿 $1.00 ═══
                 if direction_correct and remaining <= 120:
                     print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
@@ -818,10 +882,31 @@ def monitor():
                     attempts = close_attempts.get(slug, 0)
                     best_bid = get_best_bid(token_id)
 
-                    # 输的 token best_bid 极低（<$0.05）→ 没有买方，放弃卖出等过期
+                    # 输的 token best_bid 极低（<$0.05）→ 没有买方，尝试P1对冲
                     if best_bid and best_bid < 0.05:
-                        if attempts == 0:
-                            print(f"  🔴 方向错误但无买方(bid=${best_bid:.3f})，等过期结算 | 剩余{remaining:.0f}s")
+                        opposite_token = pos.get("opposite_token_id")
+                        if opposite_token:
+                            opposite_ask = get_best_ask(opposite_token)
+                            # 对冲条件：opposite_ask < (1.00 - entry_price - 0.02)，即净利润>$0.02
+                            if opposite_ask and opposite_ask < (1.00 - entry_price - 0.02):
+                                print(f"  🔄 P1对冲: bid=${best_bid:.3f}<$0.05 | 买反向token @ ${opposite_ask:.3f} | 净成本=${entry_price+opposite_ask:.3f}")
+                                h_success, h_output, h_actual = buy_opposite_token(opposite_token, size, opposite_ask)
+                                if h_success:
+                                    hedge_price = h_actual or opposite_ask
+                                    net_settle = 1.00 - entry_price - hedge_price
+                                    print(f"  ✅ 对冲成功！结算$1.00 - 入场${entry_price:.3f} - 对冲${hedge_price:.3f} = 净利${net_settle:.3f}")
+                                    self_notify(pos, entry_price + net_settle, coin, direction, size, "P1对冲止损")
+                                    close_position(pos, entry_price + net_settle)
+                                    sold = True
+                                    continue
+                                else:
+                                    print(f"  ❌ 对冲下单失败，等过期结算")
+                            else:
+                                ask_str = f"${opposite_ask:.3f}" if opposite_ask else "N/A"
+                                print(f"  🔴 对冲不划算: ask={ask_str} ≥ ${1.00 - entry_price - 0.02:.3f}，等过期结算 | 剩余{remaining:.0f}s")
+                        else:
+                            if attempts == 0:
+                                print(f"  🔴 方向错误但无买方(bid=${best_bid:.3f})且无对冲token，等过期结算 | 剩余{remaining:.0f}s")
                         continue
 
                     if best_bid and best_bid > 0.01:
