@@ -737,8 +737,8 @@ def monitor():
                     print(f"  🗑️ 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
                     continue
                 
-                # 获取PTB和实时价格判断赢输
-                ptb_price = get_ptb_from_slug(slug)
+                # PTB 在下注时已记录，直接从持仓数据读取
+                ptb_price = pos.get("ptb") or pos.get("price_to_beat")
                 crypto_price = get_current_crypto_price(coin)
                 is_losing = is_losing_direction(direction, crypto_price, ptb_price, remaining) if ptb_price and crypto_price else False
                 # 只有在 remaining <= 60 且方向正确时才算"必赢"，避免 is_losing_direction 在 >60s 时返回 False 导致误判
