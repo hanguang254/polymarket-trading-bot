@@ -9,7 +9,6 @@ import os
 import json
 from datetime import datetime, timezone
 
-sys.path.insert(0, "/root/.openclaw/workspace/polymarket-arb-bot")
 
 from ai_trader.ai_model_v2 import analyze_market
 from ai_trader.base_rate import get_base_rate
