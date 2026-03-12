@@ -44,12 +44,18 @@ def get_open_positions():
     return positions
 
 def get_market_price(token_id):
-    """获取当前市场价格 — 优先用订单簿 bid/ask 中间价，回退到 midpoint API
+    """获取当前市场价格 — 多源融合，防止宽价差导致虚假中间价
 
-    midpoint API 有时返回不准确的值（如 $1.00），因为它可能基于缓存/稀疏订单簿。
-    从实际 orderbook 计算的 (best_bid + best_ask) / 2 更可靠。
+    5分钟市场临近结束时，bid/ask 可能极端分散（如 $0.01/$0.99），
+    此时 midpoint=$0.50 完全不代表真实价值。
+    策略：
+      1. 订单簿价差合理（<50%）→ 用 midpoint
+      2. 价差过大 → 用 midpoint API（服务端计算，通常更准）
+      3. 都失败 → 返回 None
     """
-    # 方案1：从订单簿直接计算中间价
+    best_bid = None
+    best_ask = None
+    # 方案1：从订单簿获取 bid/ask
     try:
         resp = requests.get(
             f"https://clob.polymarket.com/book?token_id={token_id}",
@@ -62,14 +68,15 @@ def get_market_price(token_id):
             best_bid = float(bids[0]['price']) if bids else None
             best_ask = float(asks[0]['price']) if asks else None
             if best_bid and best_ask:
-                return round((best_bid + best_ask) / 2, 4)
-            if best_bid:
-                return best_bid
-            if best_ask:
-                return best_ask
+                spread = best_ask - best_bid
+                mid = (best_bid + best_ask) / 2
+                # 价差合理（<50% of mid）→ 信任 midpoint
+                if mid > 0 and spread / mid < 0.50:
+                    return round(mid, 4)
+                # 价差过大 → 不信任订单簿 midpoint，回退
     except:
         pass
-    # 方案2：回退到 midpoint API
+    # 方案2：midpoint API（服务端计算，5分钟市场通常更准）
     try:
         resp = requests.get(
             f"https://clob.polymarket.com/midpoint?token_id={token_id}",
@@ -82,6 +89,14 @@ def get_market_price(token_id):
                 return float(mid)
     except:
         pass
+    # 方案3：只有 bid 或 ask，返回有的那个
+    if best_bid and best_ask:
+        # 价差大但至少有值，返回 midpoint API 失败时的保底
+        return round((best_bid + best_ask) / 2, 4)
+    if best_bid:
+        return best_bid
+    if best_ask:
+        return best_ask
     return None
 
 def get_best_bid(token_id):
@@ -731,10 +746,17 @@ def monitor():
                 
                 # 自动清理：市场结束超过30秒的持仓标记关闭
                 if remaining < -30:
-                    # 用当前市场价作为结算参考，避免用0导致 base_rate 校准数据失真
-                    settle_price = current_price if current_price else entry_price
+                    # 用加密货币价格判断真实结算结果（不依赖可能失真的 token 价格）
+                    ptb = pos.get("ptb") or pos.get("price_to_beat")
+                    crypto = get_current_crypto_price(coin)
+                    if ptb and crypto:
+                        won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
+                        settle_price = 1.00 if won else 0.00
+                    else:
+                        settle_price = current_price if current_price else entry_price
                     close_position(pos, settle_price)
-                    print(f"  🗑️ 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
+                    result_emoji = "🟢" if settle_price > 0.5 else "🔴"
+                    print(f"  {result_emoji} 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
                     continue
                 
                 # PTB 在下注时已记录，直接从持仓数据读取
@@ -747,11 +769,27 @@ def monitor():
                 else:
                     is_winning = False
                 
+                # 用加密货币价格判断实际方向（不依赖可能失真的 token 价格）
+                if ptb_price and crypto_price:
+                    direction_correct = (direction == "UP" and crypto_price > ptb_price) or (direction == "DOWN" and crypto_price < ptb_price)
+                else:
+                    direction_correct = None
+
                 status = "🟢赢" if is_winning else "🔴输" if is_losing else "⚪"
-                print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status}")
-                
+                # 补充显示：用加密货币方向替代可能失真的 token 利润率
+                if direction_correct is not None:
+                    dir_icon = "✅" if direction_correct else "❌"
+                    print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status} | 方向{dir_icon}")
+                else:
+                    print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status}")
+
                 sold = False
                 sold_price = 0
+
+                # ═══ 必赢持有：方向正确 + 剩余<120s → 不卖，等结算拿 $1.00 ═══
+                if direction_correct and remaining <= 120:
+                    print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
+                    continue
                 
                 # ═══ 实时盯盘：EV 驱动退出（替代固定%阈值）═══
                 # 协议: "Do not exit before resolution unless EV flips negative"
@@ -986,9 +1024,13 @@ def monitor():
                 # ═══ 市场已关闭 ═══
                 elif remaining <= 0:
                     if check_market_closed(slug):
-                        # 市场结算：用当前token价格（接近0或1）反映真实结果
-                        settle_price = current_price if current_price else entry_price
-                        print(f"  ⏳ {slug} 已关闭 结算价=${settle_price:.2f}")
+                        # 用加密货币价格判断真实结算结果
+                        if direction_correct is not None:
+                            settle_price = 1.00 if direction_correct else 0.00
+                        else:
+                            settle_price = current_price if current_price else entry_price
+                        result_emoji = "🟢" if settle_price > 0.5 else "🔴"
+                        print(f"  {result_emoji} {slug} 已关闭 结算价=${settle_price:.2f}")
                         close_position(pos, settle_price)
                         close_attempts.pop(slug, None)
                         continue
