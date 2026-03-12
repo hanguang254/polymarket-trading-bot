@@ -640,8 +640,8 @@ class MarketTracker:
 
             # 发送通知
             send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
-        elif output in ("SKIP_NO_BALANCE", "SKIP_NO_PRICE"):
-            # 余额不足/价格获取失败不算失败，不影响统计
+        elif isinstance(output, str) and output.startswith("SKIP_"):
+            # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
             logger.warning(f"  ⚠️ {output}，跳过（不计入统计）")
         else:
             logger.error(f"  ❌ 下注失败: {output[:150]}")
