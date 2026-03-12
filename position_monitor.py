@@ -161,6 +161,8 @@ def buy_opposite_token(token_id, size, price, max_retries=2):
                     print(f"    📊 对冲成交: Status={info['status']} | 实际价=${actual_price:.4f}")
                     return True, result.stdout, actual_price
                 else:
+                    # 避免多次重试叠加挂单
+                    cancel_all_orders(token_id)
                     if attempt < max_retries - 1:
                         time.sleep(2)
                     continue
@@ -273,6 +275,8 @@ def sell_position(token_id, size, price, max_retries=3):
                 else:
                     # LIVE=挂单未成交，不算成功
                     print(f"    ⏳ 挂单未成交: Status={info['status']} | 尝试{attempt+1}/{max_retries}")
+                    # 避免多次重试叠加挂单
+                    cancel_all_orders(token_id)
                     if attempt < max_retries - 1:
                         time.sleep(2)
                     continue
@@ -326,6 +330,37 @@ def close_position(position, exit_price):
         )
     except Exception:
         pass
+
+def update_position(position, new_size=None, partial_exit=None):
+    """更新持仓（如分批卖出后的剩余仓位）"""
+    updated = False
+    all_positions = []
+    if os.path.exists(POSITIONS_FILE):
+        with open(POSITIONS_FILE, "r") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        pos = json.loads(line)
+                        if isinstance(pos, dict):
+                            if pos.get("token_id") == position["token_id"] and pos.get("entry_time") == position["entry_time"]:
+                                if new_size is not None:
+                                    pos["size"] = new_size
+                                if partial_exit:
+                                    history = pos.get("partial_exits", [])
+                                    history.append(partial_exit)
+                                    pos["partial_exits"] = history
+                                    pos["last_partial_exit"] = partial_exit
+                                pos["updated_time"] = datetime.now(timezone.utc).isoformat()
+                                updated = True
+                            all_positions.append(pos)
+                    except:
+                        pass
+
+    if updated:
+        with open(POSITIONS_FILE, "w") as f:
+            for pos in all_positions:
+                f.write(json.dumps(pos) + "\n")
+    return updated
 
 def get_market_end_time(slug):
     """从slug提取市场结束时间（Unix时间戳）"""
@@ -704,13 +739,36 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
     """挂单并确认成交，未成交则取消
     返回: (success, msg_or_actual_price)
     """
-    success, output, actual_price = sell_position(token_id, size, price, max_retries=1)
-    if not success:
-        # sell_position现在只有MATCHED才返回True，所以失败=未成交
+    price = round(price, 2)
+    cmd = [
+        "polymarket", "clob", "create-order",
+        "--signature-type", "eoa",
+        "--token", token_id,
+        "--side", "sell",
+        "--price", str(price),
+        "--size", str(size)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return False, result.stderr.strip() or "下单失败"
+
+        info = parse_order_output(result.stdout)
+        if info["matched"]:
+            actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
+            return True, actual_price
+
+        # LIVE挂单：等待一小段时间确认成交
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            if check_balance_changed(token_id, size):
+                return True, price
+            time.sleep(1)
+
         cancel_all_orders(token_id)
         return False, "未成交已取消"
-    
-    return True, actual_price or price
+    except Exception as e:
+        return False, str(e)
 
 def sell_in_batches(token_id, total_size, base_price):
     """分批出货 - 确保全部卖完"""
@@ -765,7 +823,7 @@ def monitor():
     print("   实时盯盘: 止盈15%/8% | 止损10% | 趋势反转3%")
     print("   阶段1: 180s | 阶段2: 120s | 阶段3: 60s | 阶段4: 30s")
     
-    close_attempts = {}  # slug -> attempts count
+    close_attempts = {}  # (slug, entry_time) -> attempts count
     
     while True:
         try:
@@ -780,6 +838,8 @@ def monitor():
                 entry_price = pos["entry_price"]
                 size = pos["size"]
                 slug = pos.get("slug", "unknown")
+                entry_time = pos.get("entry_time", "")
+                attempt_key = (slug, entry_time)
                 coin = "BTC" if "btc" in slug else "ETH"
                 direction = pos.get("direction", "UP")
                 
@@ -799,25 +859,40 @@ def monitor():
                 end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
                 remaining = (end_time - now).total_seconds()
                 
-                # 市场已关闭（remaining < 0）→ 跳过所有卖出逻辑，只等清理
-                if remaining < 0 and remaining >= -30:
-                    if int(-remaining) % 10 == 0:  # 每10秒打一次
-                        print(f"  ⏳ {slug} 已关闭，等待结算 | 过期{-remaining:.0f}s")
-                    continue
+                # 市场已关闭（remaining <= 0）→ 只做结算/清理
+                if remaining <= 0:
+                    if remaining < -30:
+                        # 自动清理：市场结束超过30秒的持仓标记关闭
+                        ptb = pos.get("ptb") or pos.get("price_to_beat")
+                        crypto = get_current_crypto_price(coin)
+                        if ptb and crypto:
+                            won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
+                            settle_price = 1.00 if won else 0.00
+                        else:
+                            settle_price = current_price if current_price else entry_price
+                        close_position(pos, settle_price)
+                        result_emoji = "🟢" if settle_price > 0.5 else "🔴"
+                        print(f"  {result_emoji} 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
+                        close_attempts.pop(attempt_key, None)
+                        continue
 
-                # 自动清理：市场结束超过30秒的持仓标记关闭
-                if remaining < -30:
-                    # 用加密货币价格判断真实结算结果（不依赖可能失真的 token 价格）
-                    ptb = pos.get("ptb") or pos.get("price_to_beat")
-                    crypto = get_current_crypto_price(coin)
-                    if ptb and crypto:
-                        won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
-                        settle_price = 1.00 if won else 0.00
-                    else:
-                        settle_price = current_price if current_price else entry_price
-                    close_position(pos, settle_price)
-                    result_emoji = "🟢" if settle_price > 0.5 else "🔴"
-                    print(f"  {result_emoji} 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
+                    # -30s ~ 0s：等待结算并检查市场关闭
+                    if int(-remaining) % 10 == 0:
+                        print(f"  ⏳ {slug} 已关闭，等待结算 | 过期{-remaining:.0f}s")
+
+                    if check_market_closed(slug):
+                        # 用加密货币价格判断真实结算结果
+                        ptb = pos.get("ptb") or pos.get("price_to_beat")
+                        crypto = get_current_crypto_price(coin)
+                        if ptb and crypto:
+                            won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
+                            settle_price = 1.00 if won else 0.00
+                        else:
+                            settle_price = current_price if current_price else entry_price
+                        result_emoji = "🟢" if settle_price > 0.5 else "🔴"
+                        print(f"  {result_emoji} {slug} 已关闭 结算价=${settle_price:.2f}")
+                        close_position(pos, settle_price)
+                        close_attempts.pop(attempt_key, None)
                     continue
                 
                 # PTB 在下注时已记录，直接从持仓数据读取
@@ -846,6 +921,7 @@ def monitor():
 
                 sold = False
                 sold_price = 0
+                attempted_close = False
 
                 # ═══ 安全检查：token 价格与方向判断矛盾时，信任市场 ═══
                 # 场景：direction_correct=True（Binance价格 vs PTB），但 token 价格暴跌
@@ -862,31 +938,48 @@ def monitor():
                     best_bid = get_best_bid(token_id)
                     if best_bid and best_bid > entry_price:
                         print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
+                        attempted_close = True
                         success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
                         if success:
                             sold = True
                             sold_price = actual_price or best_bid
                             self_notify(pos, sold_price, coin, direction, size, "P0早期止盈")
                             close_position(pos, sold_price)
+                            close_attempts.pop(attempt_key, None)
                             continue
 
-                # ═══ 必赢持有：方向正确 + 剩余<120s → 不卖，等结算拿 $1.00 ═══
+                # ═══ 必赢持有：方向正确 + 剩余<120s → EV 驱动决策 ═══
                 if direction_correct and remaining <= 120:
-                    print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
-                    continue
+                    # 计算 EV 判断持有价值
+                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
+                    stage_ev, p_hat, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
 
-                # ═══ 实时盯盘：EV 驱动退出（替代固定%阈值）═══
-                # 方向正确 → 持有；方向错误 → 渐进降价止损
-                if remaining > 60:
-                    # 方向正确 → 不卖，等结算
-                    if direction_correct:
-                        if remaining <= 180:
-                            print(f"  💎 方向正确，持有等结算 | 剩余{remaining:.0f}s")
+                    # EV 充足或 ATR 偏离大 → 持有等结算
+                    if stage_ev is None or stage_ev > 0.03 or (diff_atr and diff_atr >= 1.0):
+                        ev_str = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
+                        atr_str = f"{diff_atr:.1f}ATR" if diff_atr else ""
+                        print(f"  💎 方向正确，持有等结算 | {ev_str} {atr_str} | 剩余{remaining:.0f}s")
                         continue
 
+                    # EV 微弱（0~0.03）→ 不再强制持有，放行到阶段3/4 的精细 EV 策略
+                    print(f"  ⚠️ 方向正确但EV微弱({stage_ev:+.3f})，放行到阶段策略 | 剩余{remaining:.0f}s")
+                    # 不 continue，让它落到阶段3/4
+
+                # ═══ 方向正确 → 持有（>60s 全覆盖，不区分阶段）═══
+                if remaining > 60 and direction_correct:
+                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
+                    stage_ev, p_hat, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
+                    ev_str = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
+                    atr_str = f"{diff_atr:.1f}ATR" if diff_atr else ""
+                    if remaining <= 180:
+                        print(f"  💎 方向正确，持有等结算 | {ev_str} {atr_str} | 剩余{remaining:.0f}s")
+                    continue
+
+                # ═══ 方向错误预阶段止损（>180s，阶段1-2各自处理自己的区间）═══
+                if remaining > 180:
                     # 方向错误或未知 → 止损
                     # 用 close_attempts 递增来逐步降价，避免同一价格反复失败
-                    attempts = close_attempts.get(slug, 0)
+                    attempts = close_attempts.get(attempt_key, 0)
                     best_bid = get_best_bid(token_id)
 
                     # 输的 token best_bid 极低（<$0.05）→ 没有买方，尝试P1对冲
@@ -904,6 +997,7 @@ def monitor():
                                     print(f"  ✅ 对冲成功！结算$1.00 - 入场${entry_price:.3f} - 对冲${hedge_price:.3f} = 净利${net_settle:.3f}")
                                     self_notify(pos, entry_price + net_settle, coin, direction, size, "P1对冲止损")
                                     close_position(pos, entry_price + net_settle)
+                                    close_attempts.pop(attempt_key, None)
                                     sold = True
                                     continue
                                 else:
@@ -921,6 +1015,7 @@ def monitor():
                         discount = 1.0 - min(attempts // 5 * 0.02, 0.10)  # 最多降10%
                         sell_price = round(best_bid * discount, 2)
                         print(f"  🛑 方向错误止损: bid=${best_bid:.3f} 折扣{discount:.0%} → ${sell_price:.3f} | 尝试#{attempts+1}")
+                        attempted_close = True
                         success, output, actual_price = sell_position(token_id, size, sell_price, max_retries=2)
                         if success:
                             sold = True
@@ -933,19 +1028,41 @@ def monitor():
 
                     if sold:
                         close_position(pos, sold_price)
+                        close_attempts.pop(attempt_key, None)
                         continue
                 
                 # ═══ 阶段1：结束前180-120秒（流动性健康期）═══
                 if 120 < remaining <= 180:
-                    # EV 检查：EV > 0.05 时推迟卖出，让正 EV 继续运行
-                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
-                    stage_ev, _, _ = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
-
                     # 方向正确的已被前面 continue 跳过，这里只处理方向错误/未知
-                    if direction_correct == False:
+                    if not direction_correct:  # 处理 False 和 None（无 PTB 数据时）
                         print(f"  🔴 阶段1：方向错误，止损")
                         best_bid = get_best_bid(token_id)
-                        if best_bid and best_bid > 0.05:
+
+                        # bid 极低 → 尝试 P1 对冲（与预阶段同逻辑）
+                        if best_bid is not None and best_bid < 0.05:
+                            opposite_token = pos.get("opposite_token_id")
+                            if opposite_token:
+                                opposite_ask = get_best_ask(opposite_token)
+                                if opposite_ask and opposite_ask < (1.00 - entry_price - 0.02):
+                                    print(f"  🔄 阶段1-P1对冲: bid=${best_bid:.3f}<$0.05 | 买反向 @ ${opposite_ask:.3f}")
+                                    h_success, h_output, h_actual = buy_opposite_token(opposite_token, size, opposite_ask)
+                                    if h_success:
+                                        hedge_price = h_actual or opposite_ask
+                                        net_settle = 1.00 - entry_price - hedge_price
+                                        print(f"  ✅ 对冲成功！净利${net_settle:.3f}")
+                                        self_notify(pos, entry_price + net_settle, coin, direction, size, "阶段1-P1对冲")
+                                        close_position(pos, entry_price + net_settle)
+                                        close_attempts.pop(attempt_key, None)
+                                        sold = True
+                                        continue
+                                    else:
+                                        print(f"  ❌ 阶段1对冲失败，等下轮重试")
+                                else:
+                                    ask_str = f"${opposite_ask:.3f}" if opposite_ask else "N/A"
+                                    print(f"  🔴 阶段1对冲不划算: ask={ask_str}，等过期结算 | 剩余{remaining:.0f}s")
+
+                        elif best_bid and best_bid > 0.05:
+                            attempted_close = True
                             success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
                             if success:
                                 sold = True
@@ -963,6 +1080,7 @@ def monitor():
 
                     if size <= 5:
                         price = round(best_bid * 0.97, 2)
+                        attempted_close = True
                         success, actual = sell_and_confirm(token_id, size, price, timeout_sec=4)
                         if success:
                             sold = True
@@ -970,17 +1088,34 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "阶段2平仓")
                         else:
                             price2 = round(best_bid * 0.90, 2)
+                            attempted_close = True
                             success2, actual2 = sell_and_confirm(token_id, size, price2, timeout_sec=4)
                             if success2:
                                 sold = True
                                 sold_price = actual2
                                 self_notify(pos, sold_price, coin, direction, size, "阶段2降价平仓")
                     else:
+                        attempted_close = True
                         ok, sold_count, avg_price = sell_in_batches(token_id, size, best_bid)
-                        if ok and sold_count >= size * 0.5:
-                            sold = True
+                        if ok and sold_count > 0:
                             sold_price = avg_price or best_bid * 0.97
-                            self_notify(pos, sold_price, coin, direction, sold_count, f"阶段2分批({sold_count}/{size})")
+                            if sold_count >= size:
+                                sold = True
+                                self_notify(pos, sold_price, coin, direction, sold_count, f"阶段2分批({sold_count}/{size})")
+                            else:
+                                # 部分成交：更新剩余仓位，继续监控
+                                remaining_size = size - sold_count
+                                partial_exit = {
+                                    "time": datetime.now(timezone.utc).isoformat(),
+                                    "price": sold_price,
+                                    "size": sold_count,
+                                    "label": "阶段2分批"
+                                }
+                                update_position(pos, new_size=remaining_size, partial_exit=partial_exit)
+                                pos["size"] = remaining_size
+                                self_notify(pos, sold_price, coin, direction, sold_count, f"阶段2分批({sold_count}/{size})")
+                                close_attempts.pop(attempt_key, None)
+                                continue
                 
                 # ═══ 阶段3：结束前60-30秒（流动性枯竭期）═══
                 elif 30 < remaining <= 60:
@@ -996,6 +1131,7 @@ def monitor():
                         min_price = max(entry_price * 0.85, 0.15)
                         print(f"  🛡️ EV正，最低价保护: ${min_price:.2f}")
 
+                    attempted_close = True
                     result = smart_sell_position(token_id, size, is_losing)
                     if result:
                         success, sell_price, output = result
@@ -1016,6 +1152,7 @@ def monitor():
                         if min_price and best_bid and best_bid < min_price:
                             print(f"  🛡️ 最佳买价${best_bid:.3f}<最低价${min_price:.2f}，跳过地板价策略")
                         else:
+                            attempted_close = True
                             success, sell_price, output = try_sell_with_multiple_prices(
                                 token_id, size, best_bid, current_price, entry_price, True
                             )
@@ -1040,6 +1177,7 @@ def monitor():
                         moderate_prices = [max(entry_price * 0.80, 0.15), 0.10, 0.05]
                         for price in moderate_prices:
                             price = round(price, 2)
+                            attempted_close = True
                             success, output, actual_price = sell_position(token_id, size, price, max_retries=1)
                             if success:
                                 sold = True
@@ -1050,6 +1188,7 @@ def monitor():
                         # EV < 0 或无法计算 → 保留原有地板价策略
                         print(f"  💀 阶段4：最后机会 ({ev_label})")
                         for price in [0.10, 0.05, 0.02, 0.01]:
+                            attempted_close = True
                             success, output, actual_price = sell_position(token_id, size, price, max_retries=1)
                             if success:
                                 sold = True
@@ -1057,29 +1196,15 @@ def monitor():
                                 self_notify(pos, sold_price, coin, direction, size, "阶段4兜底")
                                 break
                 
-                # ═══ 市场已关闭 ═══
-                elif remaining <= 0:
-                    if check_market_closed(slug):
-                        # 用加密货币价格判断真实结算结果
-                        if direction_correct is not None:
-                            settle_price = 1.00 if direction_correct else 0.00
-                        else:
-                            settle_price = current_price if current_price else entry_price
-                        result_emoji = "🟢" if settle_price > 0.5 else "🔴"
-                        print(f"  {result_emoji} {slug} 已关闭 结算价=${settle_price:.2f}")
-                        close_position(pos, settle_price)
-                        close_attempts.pop(slug, None)
-                        continue
-                
                 if sold:
                     close_position(pos, sold_price)
-                    close_attempts.pop(slug, None)
+                    close_attempts.pop(attempt_key, None)
                     continue
                 
-                if remaining <= 180:
-                    close_attempts[slug] = close_attempts.get(slug, 0) + 1
-                    if close_attempts[slug] % 5 == 0:
-                        print(f"  ⚠️ {slug} 已尝试{close_attempts[slug]}次未成功")
+                if attempted_close and not sold:
+                    close_attempts[attempt_key] = close_attempts.get(attempt_key, 0) + 1
+                    if close_attempts[attempt_key] % 5 == 0:
+                        print(f"  ⚠️ {slug} 已尝试{close_attempts[attempt_key]}次未成功")
         
         except Exception as e:
             print(f"❌ 监控错误: {e}")
