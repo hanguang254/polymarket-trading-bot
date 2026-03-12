@@ -795,7 +795,7 @@ def monitor():
                 # ═══ 安全检查：token 价格与方向判断矛盾时，信任市场 ═══
                 # 场景：direction_correct=True（Binance价格 vs PTB），但 token 价格暴跌
                 # 说明 PTB 数据可能有误，或价格在边界反转，市场已 price-in 亏损
-                if direction_correct and profit_rate < -0.15:
+                if direction_correct and profit_rate < -0.10:
                     print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%，市场信号矛盾，不再盲目持有")
                     direction_correct = False  # 降级为方向未知，走正常止损流程
 
