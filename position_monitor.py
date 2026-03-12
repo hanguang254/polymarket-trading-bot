@@ -792,11 +792,18 @@ def monitor():
                 sold = False
                 sold_price = 0
 
+                # ═══ 安全检查：token 价格与方向判断矛盾时，信任市场 ═══
+                # 场景：direction_correct=True（Binance价格 vs PTB），但 token 价格暴跌
+                # 说明 PTB 数据可能有误，或价格在边界反转，市场已 price-in 亏损
+                if direction_correct and profit_rate < -0.15:
+                    print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%，市场信号矛盾，不再盲目持有")
+                    direction_correct = False  # 降级为方向未知，走正常止损流程
+
                 # ═══ 必赢持有：方向正确 + 剩余<120s → 不卖，等结算拿 $1.00 ═══
                 if direction_correct and remaining <= 120:
                     print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
                     continue
-                
+
                 # ═══ 实时盯盘：EV 驱动退出（替代固定%阈值）═══
                 # 方向正确 → 持有；方向错误 → 渐进降价止损
                 if remaining > 60:
