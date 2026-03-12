@@ -794,8 +794,7 @@ def monitor():
 
                 # ═══ 必赢持有：方向正确 + 剩余<120s → 不卖，等结算拿 $1.00 ═══
                 if direction_correct and remaining <= 120:
-                    if int(remaining) % 30 < 3:  # 约每30秒打一次
-                        print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
+                    print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
                     continue
                 
                 # ═══ 实时盯盘：EV 驱动退出（替代固定%阈值）═══
