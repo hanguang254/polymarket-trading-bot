@@ -37,7 +37,7 @@ SIGNATURE_TYPE = os.environ.get("SIGNATURE_TYPE", "eoa").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-REDEEM_INTERVAL = 1800  # 30 分钟轮询一次
+REDEEM_INTERVAL = int(os.environ.get("REDEEM_INTERVAL", 600))  # 默认10分钟
 
 # ==============================================================================
 # 日志
