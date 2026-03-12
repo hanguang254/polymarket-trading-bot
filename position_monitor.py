@@ -792,92 +792,39 @@ def monitor():
                     continue
                 
                 # ═══ 实时盯盘：EV 驱动退出（替代固定%阈值）═══
-                # 协议: "Do not exit before resolution unless EV flips negative"
-                # 但：方向正确时 EV 可能因高入场价而恒负（如 p̂=0.72, entry=0.95），
-                #     此时不应止损，应持有等结算拿 $1.00
+                # 方向正确 → 持有；方向错误 → 渐进降价止损
                 if remaining > 60:
-                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
-                    realtime_ev, p_hat_now, _ = calc_realtime_ev(
-                        direction, crypto_price, ptb_price, atr_val, entry_price
-                    )
+                    # 方向正确 → 不卖，等结算
+                    if direction_correct:
+                        if remaining <= 180:
+                            print(f"  💎 方向正确，持有等结算 | 剩余{remaining:.0f}s")
+                        continue
 
-                    if realtime_ev is not None:
-                        ev_str = f"EV={realtime_ev:+.3f} p̂={p_hat_now:.3f}"
+                    # 方向错误或未知 → 止损
+                    # 用 close_attempts 递增来逐步降价，避免同一价格反复失败
+                    attempts = close_attempts.get(slug, 0)
+                    best_bid = get_best_bid(token_id)
 
-                        # 方向正确 → 跳过 EV 止损（高入场价导致 EV 恒负是正常的）
-                        if direction_correct:
-                            if remaining <= 180:
-                                print(f"  💎 方向正确，EV止损跳过 ({ev_str}) | 剩余{remaining:.0f}s")
-                            continue
+                    # 输的 token best_bid 极低（<$0.05）→ 没有买方，放弃卖出等过期
+                    if best_bid and best_bid < 0.05:
+                        if attempts == 0:
+                            print(f"  🔴 方向错误但无买方(bid=${best_bid:.3f})，等过期结算 | 剩余{remaining:.0f}s")
+                        continue
 
-                        # EV 显著负 → 止损（仅方向错误时）
-                        if realtime_ev < -0.05:
-                            print(f"  🛑 EV止损: {ev_str} | 利润{profit_rate*100:+.1f}%")
-                            best_bid = get_best_bid(token_id)
-                            if best_bid and best_bid > 0.01:
-                                success, output, actual_price = sell_position(token_id, size, best_bid - 0.01, max_retries=2)
-                                if success:
-                                    sold = True
-                                    sold_price = actual_price or best_bid
-                                    self_notify(pos, sold_price, coin, direction, size, f"EV止损({ev_str})")
-
-                        # EV 翻负 → 卖出
-                        elif realtime_ev < 0:
-                            print(f"  ⚠️ EV翻负: {ev_str} | 利润{profit_rate*100:+.1f}%")
-                            best_bid = get_best_bid(token_id)
-                            if best_bid and best_bid > 0.01:
-                                success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
-                                if success:
-                                    sold = True
-                                    sold_price = actual_price or best_bid
-                                    self_notify(pos, sold_price, coin, direction, size, f"EV翻负({ev_str})")
-
-                        # EV 接近零但有利润 → 保护性挂单锁利
-                        elif realtime_ev < 0.02 and profit_rate > 0.05:
-                            print(f"  📈 EV保护: {ev_str} | 利润{profit_rate*100:.1f}%")
-                            sell_price = round(current_price + 0.01, 2)
-                            success, output, actual_price = sell_position(token_id, size, sell_price, max_retries=1)
-                            if success:
-                                sold = True
-                                sold_price = actual_price or sell_price
-                                self_notify(pos, sold_price, coin, direction, size, f"EV保护({ev_str})")
-
-                        # 趋势反转 + 亏损（辅助信号）
-                        elif is_losing and profit_rate < -0.03:
-                            print(f"  ⚠️ 趋势反转: {ev_str} | 亏损{profit_rate*100:.1f}%")
-                            best_bid = get_best_bid(token_id)
-                            if best_bid and best_bid > 0.01:
-                                success, output, actual_price = sell_position(token_id, size, best_bid - 0.01, max_retries=2)
-                                if success:
-                                    sold = True
-                                    sold_price = actual_price or best_bid
-                                    self_notify(pos, sold_price, coin, direction, size, "趋势反转止损")
-
-                        # EV 正 → 持有（协议核心：EV 正不退出）
-                        else:
-                            if profit_rate >= 0.10:
-                                print(f"  💰 利润{profit_rate*100:.1f}%但EV正({ev_str})，继续持有")
-
+                    if best_bid and best_bid > 0.01:
+                        # 渐进降价：每5次尝试降一档
+                        discount = 1.0 - min(attempts // 5 * 0.02, 0.10)  # 最多降10%
+                        sell_price = round(best_bid * discount, 2)
+                        print(f"  🛑 方向错误止损: bid=${best_bid:.3f} 折扣{discount:.0%} → ${sell_price:.3f} | 尝试#{attempts+1}")
+                        success, output, actual_price = sell_position(token_id, size, sell_price, max_retries=2)
+                        if success:
+                            sold = True
+                            sold_price = actual_price or sell_price
+                            self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
                     else:
-                        # EV 无法计算，回退到旧逻辑（方向正确时不卖）
-                        if direction_correct:
-                            continue
-                        if profit_rate >= 0.15:
-                            best_bid = get_best_bid(token_id)
-                            if best_bid:
-                                success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
-                                if success:
-                                    sold = True
-                                    sold_price = actual_price or best_bid
-                                    self_notify(pos, sold_price, coin, direction, size, "止盈(15%,fallback)")
-                        elif profit_rate <= -0.10:
-                            best_bid = get_best_bid(token_id)
-                            if best_bid and best_bid > 0.01:
-                                success, output, actual_price = sell_position(token_id, size, best_bid - 0.01, max_retries=2)
-                                if success:
-                                    sold = True
-                                    sold_price = actual_price or best_bid
-                                    self_notify(pos, sold_price, coin, direction, size, "止损(-10%,fallback)")
+                        # 无有效 bid
+                        if attempts == 0:
+                            print(f"  🔴 方向错误但无有效bid，等过期结算 | 剩余{remaining:.0f}s")
 
                     if sold:
                         close_position(pos, sold_price)
@@ -889,72 +836,46 @@ def monitor():
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     stage_ev, _, _ = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
 
-                    if stage_ev is not None and stage_ev > 0.05:
-                        print(f"  📈 阶段1: EV={stage_ev:+.3f}>0.05，继续持有")
-                    elif is_losing:
-                        # 必输 → 立即止损（不受 EV 保护）
-                        print(f"  🔴 阶段1：必输，立即止损！")
+                    # 方向正确的已被前面 continue 跳过，这里只处理方向错误/未知
+                    if direction_correct == False:
+                        print(f"  🔴 阶段1：方向错误，止损")
                         best_bid = get_best_bid(token_id)
-                        sell_price = best_bid if best_bid and best_bid > 0.05 else round(current_price * 0.95, 2)
-                        success, output, actual_price = sell_position(token_id, size, sell_price, max_retries=2)
-                        if success:
-                            sold = True
-                            sold_price = actual_price or sell_price
-                            self_notify(pos, sold_price, coin, direction, size, "阶段1必输止损")
-                    elif profit_rate >= 0.10:
-                        print(f"  🎯 阶段1止盈（{profit_rate*100:.1f}%）")
-                        best_bid = get_best_bid(token_id)
-                        if best_bid:
+                        if best_bid and best_bid > 0.05:
                             success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
                             if success:
                                 sold = True
                                 sold_price = actual_price or best_bid
-                                self_notify(pos, sold_price, coin, direction, size, "阶段1止盈")
-                    elif is_winning:
-                        print(f"  🟢 阶段1：必赢，高价卖出")
-                        best_bid = get_best_bid(token_id)
-                        if best_bid and best_bid > entry_price:
-                            success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
-                            if success:
-                                sold = True
-                                sold_price = actual_price or best_bid
-                                self_notify(pos, sold_price, coin, direction, size, "阶段1必赢平仓")
+                                self_notify(pos, sold_price, coin, direction, size, "阶段1止损")
                 
                 # ═══ 阶段2：结束前120-60秒（流动性下降期）═══
+                # 方向正确已被 continue 跳过，这里只处理方向错误/未知
                 elif 60 < remaining <= 120:
-                    # EV 检查：EV > 0.05 时推迟卖出
-                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
-                    stage_ev, _, _ = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
+                    print(f"  ⚠️ 阶段2：{'分批挂单' if size > 5 else '挂单确认'}")
 
-                    if stage_ev is not None and stage_ev > 0.05 and not is_losing:
-                        print(f"  📈 阶段2: EV={stage_ev:+.3f}>0.05，继续持有")
-                    else:
-                        print(f"  ⚠️ 阶段2：{'分批挂单' if size > 5 else '挂单确认'} (EV={stage_ev:+.3f})" if stage_ev is not None else f"  ⚠️ 阶段2：{'分批挂单' if size > 5 else '挂单确认'}")
+                    best_bid = get_best_bid(token_id)
+                    if not best_bid or best_bid < 0.02:
+                        best_bid = current_price * 0.95 if current_price else 0.10
 
-                        best_bid = get_best_bid(token_id)
-                        if not best_bid or best_bid < 0.02:
-                            best_bid = current_price * 0.95 if current_price else 0.10
-
-                        if size <= 5:
-                            price = round(best_bid * (0.97 if is_losing else 0.99), 2)
-                            success, actual = sell_and_confirm(token_id, size, price, timeout_sec=4)
-                            if success:
-                                sold = True
-                                sold_price = actual
-                                self_notify(pos, sold_price, coin, direction, size, "阶段2平仓")
-                            else:
-                                price2 = round(best_bid * 0.95, 2)
-                                success2, actual2 = sell_and_confirm(token_id, size, price2, timeout_sec=4)
-                                if success2:
-                                    sold = True
-                                    sold_price = actual2
-                                    self_notify(pos, sold_price, coin, direction, size, "阶段2降价平仓")
+                    if size <= 5:
+                        price = round(best_bid * 0.97, 2)
+                        success, actual = sell_and_confirm(token_id, size, price, timeout_sec=4)
+                        if success:
+                            sold = True
+                            sold_price = actual
+                            self_notify(pos, sold_price, coin, direction, size, "阶段2平仓")
                         else:
-                            ok, sold_count, avg_price = sell_in_batches(token_id, size, best_bid)
-                            if ok and sold_count >= size * 0.5:
+                            price2 = round(best_bid * 0.90, 2)
+                            success2, actual2 = sell_and_confirm(token_id, size, price2, timeout_sec=4)
+                            if success2:
                                 sold = True
-                                sold_price = avg_price or best_bid * 0.97
-                                self_notify(pos, sold_price, coin, direction, sold_count, f"阶段2分批({sold_count}/{size})")
+                                sold_price = actual2
+                                self_notify(pos, sold_price, coin, direction, size, "阶段2降价平仓")
+                    else:
+                        ok, sold_count, avg_price = sell_in_batches(token_id, size, best_bid)
+                        if ok and sold_count >= size * 0.5:
+                            sold = True
+                            sold_price = avg_price or best_bid * 0.97
+                            self_notify(pos, sold_price, coin, direction, sold_count, f"阶段2分批({sold_count}/{size})")
                 
                 # ═══ 阶段3：结束前60-30秒（流动性枯竭期）═══
                 elif 30 < remaining <= 60:
