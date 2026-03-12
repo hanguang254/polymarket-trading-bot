@@ -147,10 +147,11 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["p_win_final"] = round(p_win, 4)
     details["ev_positive"] = ev > 0
 
+    MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
     should_bet = (
         discount >= discount_threshold  # 动态折价阈值
         and ev > 0.03                  # 严格EV: 至少3%边际（新公式产出较小）
-        and target_odds < 0.85          # 不买太贵
+        and target_odds < MAX_PRICE     # 不买太贵（env可配置）
         and confidence >= 0.65          # 动量确认
     )
 
@@ -162,7 +163,7 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         f"折价={discount:.3f}({'✅' if discount>=discount_threshold else '❌'}≥{discount_threshold:.3f}) "
         f"ev={ev:+.4f}({'✅' if ev>0.03 else '❌'}>0.03) "
         f"p_win={p_win:.3f} base_rate={base_rate:.3f} "
-        f"odds={target_odds:.3f}({'✅' if target_odds<0.85 else '❌'}) "
+        f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=0.65 else '❌'}≥65%) "
         f"流动性:{liq_label}"
     )
@@ -335,9 +336,10 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 无法获取真实价格（订单簿+midpoint均失败），跳过下注")
         return False, 0, 0, "SKIP_NO_PRICE"
 
-    # 安全检查：实际买入价不能超过 0.85（与决策条件 target_odds < 0.85 对齐）
-    if price >= 0.85:
-        print(f"  ⚠️ 实际买入价${price:.2f}≥$0.85，上行空间不足，跳过下注")
+    # 安全检查：实际买入价不能超过上限（env可配置，默认0.92）
+    MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
+    if price >= MAX_PRICE:
+        print(f"  ⚠️ 实际买入价${price:.2f}≥${MAX_PRICE}，上行空间不足，跳过下注")
         return False, 0, 0, "SKIP_PRICE_TOO_HIGH"
 
     # P2: 退出流动性检查 — 下注前检查能否卖出

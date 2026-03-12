@@ -175,6 +175,24 @@ def get_token_ids(slug):
     return None, None
 
 
+def get_realtime_odds(up_token, down_token):
+    """从 CLOB 订单簿获取实时 midpoint 赔率（比 Gamma API 更及时）"""
+    up_mid, down_mid = None, None
+    for token_id, label in [(up_token, "UP"), (down_token, "DOWN")]:
+        try:
+            resp = requests.get(f"https://clob.polymarket.com/midpoint?token_id={token_id}", timeout=3)
+            if resp.status_code == 200:
+                mid = float(resp.json().get("mid", 0))
+                if mid > 0:
+                    if label == "UP":
+                        up_mid = round(mid, 4)
+                    else:
+                        down_mid = round(mid, 4)
+        except Exception:
+            pass
+    return up_mid, down_mid
+
+
 def send_notification(coin, direction, confidence, ev, price, size):
     """发送下注通知（直接发送Telegram）"""
     notify_text = (
@@ -551,6 +569,14 @@ class MarketTracker:
             extra_info["down_token"] = down_token
             # 先用 up_token 做 LMSR 评估（方向确定后会用正确的）
             extra_info["token_id"] = up_token
+
+            # 用 CLOB 订单簿实时赔率替换 Gamma API 赔率（更准确）
+            rt_up, rt_down = get_realtime_odds(up_token, down_token)
+            if rt_up and rt_down:
+                logger.info(f"  📡 实时赔率: UP={rt_up:.3f} DOWN={rt_down:.3f} (Gamma: UP={up_odds:.3f} DOWN={down_odds:.3f})")
+                up_odds, down_odds = rt_up, rt_down
+            else:
+                logger.warning(f"  ⚠️ CLOB赔率获取失败，使用Gamma赔率: UP={up_odds:.3f} DOWN={down_odds:.3f}")
 
         # AI 分析
         should_bet, direction, confidence, details = analyze_and_decide(
