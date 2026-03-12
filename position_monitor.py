@@ -744,6 +744,12 @@ def monitor():
                 end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
                 remaining = (end_time - now).total_seconds()
                 
+                # 市场已关闭（remaining < 0）→ 跳过所有卖出逻辑，只等清理
+                if remaining < 0 and remaining >= -30:
+                    if int(-remaining) % 10 == 0:  # 每10秒打一次
+                        print(f"  ⏳ {slug} 已关闭，等待结算 | 过期{-remaining:.0f}s")
+                    continue
+
                 # 自动清理：市场结束超过30秒的持仓标记关闭
                 if remaining < -30:
                     # 用加密货币价格判断真实结算结果（不依赖可能失真的 token 价格）
@@ -788,7 +794,8 @@ def monitor():
 
                 # ═══ 必赢持有：方向正确 + 剩余<120s → 不卖，等结算拿 $1.00 ═══
                 if direction_correct and remaining <= 120:
-                    print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
+                    if int(remaining) % 30 < 3:  # 约每30秒打一次
+                        print(f"  💎 方向正确，持有等结算（不卖）| 剩余{remaining:.0f}s")
                     continue
                 
                 # ═══ 实时盯盘：EV 驱动退出（替代固定%阈值）═══
