@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v3.7
+# Polymarket Trading Bot v3.8
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses discount arbitrage with EV-driven position management, Base Rate calibration, Bayesian sequential updating, and correlated exposure control.
 
@@ -15,7 +15,7 @@ The bot does **not** predict market direction. Instead, it detects underpriced t
 ```
 0s    Market starts
 2s    PTB acquisition (Playwright → HTML → Gamma API fallback)
-20s   Bayesian warmup (price sampling every 5s)
+20s   Bayesian warmup (5s intervals, 3s after 80s)
 40s   PTB deadline
 100s  Bet window opens (80s observation data available)
 160s  Bet window closes → Real-time EV monitoring starts
@@ -44,6 +44,7 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Strict Binary EV**: `EV = p_win - price` (replaces discount/odds ratio). Minimum 3% edge required.
 - **Bayesian Fusion**: Base rate (40%) + Bayesian posterior (60%) when direction-aligned with confidence > 30%.
 - **Cross-Validation**: Flags overestimation when `estimated_value > p_win + 0.15` (reduces confidence 15%).
+- **LMSR Inefficiency Signal**: When realtime `best_ask` diverges >10% from `p_win`, lowers discount threshold by 2% (min 6%) for easier entry on mispriced markets.
 - **LMSR Liquidity Assessment**: Orderbook spread/depth/slippage scoring → dynamic discount threshold (8%-20%).
 - **Exit Liquidity Gate (P2)**: Before entering, checks bid-side depth of the chosen token. `bid_depth < 5` → skip entry entirely. Prevents entering positions that can't be exited.
 - **Correlated Exposure Control**: BTC/ETH correlation ~0.85. Same-direction position halves Kelly sizing.
@@ -51,7 +52,7 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Liquidity-Capped Sizing (P3)**: Kelly size capped at 50% of exit bid depth. Works with P2 — P2 gates entry, P3 adjusts size.
 
 ### Exit (P0-P1 + P4)
-- **Early Profit-Taking (P0)**: When profit ≥ 20%, remaining > 90s, and `best_bid > entry_price`, sell immediately to lock profit instead of waiting for $1.00 settlement. Prevents boundary reversals from turning winners into losers.
+- **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.15) and `P0_HYPERBOLIC_K` (default 0.15). Example: 240s → 26%, 100s → 20%.
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
 - **Direction-Based Exit**: Uses crypto price vs PTB to determine win/loss (not token orderbook price, which can be misleading due to wide bid-ask spreads near settlement).
   - Direction correct → **Hold to settlement** (collect $1.00)
@@ -63,7 +64,7 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Accurate Settlement**: Expiry cleanup uses crypto price vs PTB to determine $1.00/$0.00, not unreliable token price.
 
 ### Infrastructure
-- **Warmup Observation**: 80s Bayesian sampling (20-100s window) with gap trend analysis
+- **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
 - **Playwright Smart Degradation**: Skip browser PTB after 3 consecutive failures
@@ -80,6 +81,7 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 | `ai_analyze_v2.py` | Decision engine: strict EV, Kelly sizing, Bayesian fusion, bet execution |
 | `ai_trader/ai_model_v2.py` | Scoring model: ATR deviation → token value estimation → discount |
 | `ai_trader/base_rate.py` | Base Rate calibration: conservative priors + empirical learning |
+| `scripts/validate_base_rate.py` | Base Rate calibration validator: ATR-band win rates vs priors |
 | `ai_trader/bayesian_engine.py` | Bayesian sequential updater: sigmoid likelihood, log-space, anti-saturation |
 | `ai_trader/lmsr_liquidity.py` | Orderbook liquidity: spread + depth + slippage → dynamic threshold |
 | `position_monitor.py` | EV-driven exit + 4-stage closing + outcome recording |
@@ -122,7 +124,7 @@ Layer 2 — Position Sizing
   └─ Balance constraints (10-20% of balance)
 
 Layer 3 — Position Management
-  ├─ P0: Early profit-taking (≥20% profit + >90s → sell immediately)
+  ├─ P0: Hyperbolic discounting profit-take (dynamic threshold, configurable)
   ├─ P1: Opposite token hedge (bid < $0.05 → buy opposite for $1 pair)
   ├─ Direction-based exit (correct → hold, wrong → stop-loss)
   ├─ Wide spread detection (prevents false loss signals)
@@ -198,6 +200,8 @@ See `.env.example` for all configurable parameters:
 | `MAX_DAILY_LOSS` | No | Daily loss limit in USD (default: 10) |
 | `MAX_OPEN_POSITIONS` | No | Max concurrent positions (default: 2) |
 | `MIN_BALANCE` | No | Min balance to place bets (default: 5) |
+| `P0_BASE_PROFIT` | No | P0 take-profit base threshold (default: 0.15) |
+| `P0_HYPERBOLIC_K` | No | Hyperbolic discounting coefficient (default: 0.15) |
 
 ### Running
 
@@ -250,6 +254,7 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 
 ## Version History
 
+- **v3.8**: Document-inspired enhancements — #7: LMSR inefficiency signal (realtime best_ask vs p_win mispricing → lower entry threshold). #1: Hyperbolic discounting profit-take (dynamic threshold scales with time to settlement, configurable via env). #6: Adaptive Bayesian sampling (3s near bet window). #4: Base Rate validation script (`scripts/validate_base_rate.py`).
 - **v3.7**: 4-layer quantitative defense — P0: early profit-taking (≥20% profit + >90s → sell immediately, don't risk boundary reversal). P1: opposite token hedge (bid < $0.05 → buy opposite token to form $1.00 pair at settlement). P2: exit liquidity gate (bid_depth < 5 → skip entry). P3: liquidity-capped sizing (Kelly ≤ 50% of exit bid depth). Opposite token_id recorded at entry for hedge execution.
 - **v3.6**: Direction-based exit — uses crypto price vs PTB (not token orderbook) to determine win/loss. Winning positions hold to settlement ($1.00) instead of being sold at misleading prices. Wide bid-ask spread detection prevents false losses. Post-close safety prevents trades after market ends. Auto redeem now shows USDC balance.
 - **v3.5**: Fill price fix — parse CLI output (Taking/Size) for actual fill price instead of limit price. MATCHED status check prevents recording unfilled LIVE orders. Fixes inflated entry_price in notifications, logs, and PnL calculations.

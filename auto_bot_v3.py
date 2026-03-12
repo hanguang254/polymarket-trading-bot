@@ -397,7 +397,9 @@ class MarketTracker:
                 # 每5秒采集一次，有PTB时才做贝叶斯更新
                 ptb_now = self.ptb_cache.get(slug)
                 samples = self.warmup_data.get(slug, [])
-                if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= 5:
+                # 采样间隔: 前60秒每5秒，临近下注窗口(80s+)每3秒
+                sample_interval = 3 if elapsed >= 80 else 5
+                if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
                     try:
                         from ai_trader.binance_api import get_current_price
                         symbol = f"{market['coin']}USDT"

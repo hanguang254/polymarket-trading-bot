@@ -129,6 +129,19 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         details["overestimated"] = True
         confidence *= 0.85
 
+    # #7: 无效率信号 — 实时 best_ask vs p_win 偏离
+    if liquidity_info and liquidity_info.get("best_ask"):
+        realtime_ask = liquidity_info["best_ask"]
+        inefficiency = p_win - realtime_ask
+        details["inefficiency"] = round(inefficiency, 4)
+        details["realtime_ask"] = realtime_ask
+        # 强无效率: 市场明显错价，降低入场门槛
+        if inefficiency > 0.10:
+            old_threshold = discount_threshold
+            discount_threshold = max(discount_threshold - 0.02, 0.06)
+            details["inefficiency_boost"] = True
+            print(f"  📊 #7无效率信号: p_win={p_win:.3f} vs ask={realtime_ask:.3f} 偏离={inefficiency:.3f} → 阈值{old_threshold:.3f}→{discount_threshold:.3f}")
+
     # 严格二元 EV: p_win - price
     ev = p_win - target_odds
     details["expected_value"] = round(ev, 4)

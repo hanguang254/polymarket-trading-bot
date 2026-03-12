@@ -13,6 +13,10 @@ import requests
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
 PROFIT_THRESHOLD = 0.15  # 15% 止盈
 
+# P0 双曲贴现止盈参数（可通过 .env 覆盖）
+P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", "0.15"))      # 基础止盈阈值
+P0_HYPERBOLIC_K = float(os.environ.get("P0_HYPERBOLIC_K", "0.15"))    # 双曲贴现系数
+
 # Telegram 通知配置
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -850,11 +854,14 @@ def monitor():
                     print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%，市场信号矛盾，不再盲目持有")
                     direction_correct = False  # 降级为方向未知，走正常止损流程
 
-                # ═══ P0: 早期止盈 — 利润≥20% + 剩余>90s → 锁利，不等结算 ═══
-                if profit_rate >= 0.20 and remaining > 90:
+                # ═══ P0: 双曲贴现止盈 — 离结算越远，paper profit 越不可靠，要求越高 ═══
+                time_factor = remaining / 60.0
+                profit_threshold = P0_BASE_PROFIT * (1.0 + P0_HYPERBOLIC_K * time_factor)
+
+                if profit_rate >= profit_threshold and remaining > 90:
                     best_bid = get_best_bid(token_id)
                     if best_bid and best_bid > entry_price:
-                        print(f"  💰 P0早期止盈: 利润{profit_rate*100:.1f}%≥20% | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
+                        print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
                         success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
                         if success:
                             sold = True
