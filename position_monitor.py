@@ -793,6 +793,8 @@ def monitor():
                 
                 # ═══ 实时盯盘：EV 驱动退出（替代固定%阈值）═══
                 # 协议: "Do not exit before resolution unless EV flips negative"
+                # 但：方向正确时 EV 可能因高入场价而恒负（如 p̂=0.72, entry=0.95），
+                #     此时不应止损，应持有等结算拿 $1.00
                 if remaining > 60:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     realtime_ev, p_hat_now, _ = calc_realtime_ev(
@@ -802,7 +804,13 @@ def monitor():
                     if realtime_ev is not None:
                         ev_str = f"EV={realtime_ev:+.3f} p̂={p_hat_now:.3f}"
 
-                        # EV 显著负 → 止损
+                        # 方向正确 → 跳过 EV 止损（高入场价导致 EV 恒负是正常的）
+                        if direction_correct:
+                            if remaining <= 180:
+                                print(f"  💎 方向正确，EV止损跳过 ({ev_str}) | 剩余{remaining:.0f}s")
+                            continue
+
+                        # EV 显著负 → 止损（仅方向错误时）
                         if realtime_ev < -0.05:
                             print(f"  🛑 EV止损: {ev_str} | 利润{profit_rate*100:+.1f}%")
                             best_bid = get_best_bid(token_id)
@@ -851,7 +859,9 @@ def monitor():
                                 print(f"  💰 利润{profit_rate*100:.1f}%但EV正({ev_str})，继续持有")
 
                     else:
-                        # EV 无法计算，回退到旧逻辑
+                        # EV 无法计算，回退到旧逻辑（方向正确时不卖）
+                        if direction_correct:
+                            continue
                         if profit_rate >= 0.15:
                             best_bid = get_best_bid(token_id)
                             if best_bid:
