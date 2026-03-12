@@ -243,6 +243,23 @@ def redeem_condition(condition_id: str, neg_risk: bool = False, size: float = 0)
 # 核心逻辑
 # ==============================================================================
 
+def get_usdc_balance() -> float:
+    """查询当前 USDC 余额"""
+    success, stdout, _ = run_cli([
+        "clob", "balance",
+        "--asset-type", "collateral",
+        "--signature-type", SIGNATURE_TYPE,
+        "-o", "json",
+    ], timeout=15)
+    if success:
+        try:
+            data = json.loads(stdout)
+            return float(data.get("balance", 0))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return -1  # -1 表示查询失败
+
+
 def do_redeem() -> float:
     """执行一轮领取，返回本轮预估领取的 USDC 总额"""
     positions = fetch_positions()
@@ -282,12 +299,19 @@ def do_redeem() -> float:
         f"约 ${total_value:.2f} USDC"
     )
 
+    # 查询当前余额
+    balance = get_usdc_balance()
+    if balance >= 0:
+        log.info(f"💰 当前余额: ${balance:.2f} USDC")
+
     if success_count > 0 and total_value > 0:
+        balance_line = f"💰 余额: ${balance:.2f} USDC\n" if balance >= 0 else ""
         send_telegram(
             f"💰 <b>Polymarket 自动结算领取</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"✅ 成功: {success_count}/{len(resolved)} 笔\n"
             f"💵 领取: ${total_value:.2f} USDC\n"
+            f"{balance_line}"
             f"📅 时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         )
 
