@@ -6,10 +6,52 @@
 import json
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 import requests
 from ai_trader.polymarket_api import normalize_orderbook
+
+# ═══ 日志：print 同时写入 logs/monitor.log ═══
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+class _TeeWriter:
+    """同时写入终端和日志文件，日志按天自动轮转"""
+    def __init__(self, stream):
+        self._stream = stream
+        self._date = None
+        self._file = None
+
+    def _ensure_file(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._date != today:
+            if self._file:
+                self._file.close()
+            self._date = today
+            path = os.path.join(LOG_DIR, f"monitor_{today}.log")
+            self._file = open(path, "a", encoding="utf-8")
+        return self._file
+
+    def write(self, msg):
+        self._stream.write(msg)
+        try:
+            f = self._ensure_file()
+            f.write(msg)
+            f.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self._stream.flush()
+        if self._file:
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+sys.stdout = _TeeWriter(sys.stdout)
+sys.stderr = _TeeWriter(sys.stderr)
 
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
 PROFIT_THRESHOLD = 0.15  # 15% 止盈
@@ -306,6 +348,38 @@ def parse_order_output(output):
             except: pass
     return info
 
+def market_sell_immediate(token_id, size):
+    """市价立即卖出（止损专用）— 以$0.01挂卖单，CLOB按最高bid优先撮合
+    返回: (success, actual_price)
+    """
+    cmd = [
+        "polymarket", "clob", "create-order",
+        "--signature-type", "eoa",
+        "--token", token_id,
+        "--side", "sell",
+        "--price", "0.01",
+        "--size", str(size)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            info = parse_order_output(result.stdout)
+            if info["matched"]:
+                actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else 0.01
+                print(f"    ⚡ 市价成交: Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f}")
+                return True, actual_price
+            else:
+                # LIVE = 无买方，订单簿空，取消挂单
+                print(f"    ❌ 市价卖出无买方(Status={info['status']})，取消挂单")
+                cancel_all_orders(token_id)
+                return False, None
+        else:
+            print(f"    ❌ 市价卖出命令失败: {result.stderr.strip()[:80]}")
+            return False, None
+    except Exception as e:
+        print(f"    ❌ 市价卖出异常: {str(e)[:80]}")
+        return False, None
+
 def sell_position(token_id, size, price, max_retries=3):
     """卖出持仓（带重试+成交确认）
     返回: (success, output, actual_price)
@@ -313,7 +387,7 @@ def sell_position(token_id, size, price, max_retries=3):
       - actual_price: 实际成交价（Taking/Size），None表示未知
     """
     price = round(price, 2)
-    
+
     for attempt in range(max_retries):
         cmd = [
             "polymarket", "clob", "create-order",
@@ -346,7 +420,7 @@ def sell_position(token_id, size, price, max_retries=3):
                 time.sleep(2)
             else:
                 return False, str(e), None
-    
+
     return False, result.stderr if 'result' in locals() else "All retries failed", None
 
 def close_position(position, exit_price):
@@ -1081,33 +1155,19 @@ def monitor():
                         close_attempts[attempt_key] = attempts + 1
                         continue
 
-                    # 市价止损：先用 sell_and_confirm 等待匹配，失败再降价cascade
-                    if best_bid and best_bid > 0.01:
-                        print(f"  🛑 方向错误止损(市价): bid=${best_bid:.3f} | 剩余{remaining:.0f}s")
-                        attempted_close = True
-                        # 第一次：用 sell_and_confirm 带轮询确认
-                        ok, result = sell_and_confirm(token_id, size, best_bid, timeout_sec=5)
-                        if ok:
-                            sold = True
-                            sold_price = result if isinstance(result, (int, float)) else best_bid
-                            self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
-                        else:
-                            print(f"    ❌ 市价${best_bid:.2f}未成交: {str(result)[:80]}，降价重试")
-                            # 降价cascade
-                            for sp in [best_bid * 0.95, best_bid * 0.90, best_bid * 0.80, 0.05, 0.01]:
-                                sp = max(round(sp, 2), 0.01)
-                                success, output, actual_price = sell_position(token_id, size, sp, max_retries=1)
-                                if success:
-                                    sold = True
-                                    sold_price = actual_price or sp
-                                    self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
-                                    break
-                                else:
-                                    print(f"    ❌ 止损价${sp:.2f}未成交: {str(output)[:80]}")
-                                time.sleep(1)
-                    else:
-                        if attempts == 0:
-                            print(f"  🔴 方向错误但无有效bid，等过期结算 | 剩余{remaining:.0f}s")
+                    # 市价止损：以$0.01挂卖单，CLOB自动匹配最高bid，一次搞定
+                    print(f"  🛑 方向错误止损(市价): bid=${best_bid:.3f} | 剩余{remaining:.0f}s")
+                    attempted_close = True
+                    ok, actual_price = market_sell_immediate(token_id, size)
+                    if ok:
+                        sold = True
+                        sold_price = actual_price
+                        self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
+                    elif attempts >= 3:
+                        # 连续3次市价都无买方，放弃止损等结算
+                        print(f"  🔴 市价止损{attempts+1}次无买方，放弃等结算 | 剩余{remaining:.0f}s")
+                        close_attempts[attempt_key] = attempts + 1
+                        continue
 
                     if sold:
                         close_position(pos, sold_price)
@@ -1193,19 +1253,32 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "阶段3低价成交")
 
                     if not sold:
-                        best_bid = get_best_bid(token_id)
-                        # EV > 0 时不用地板价策略
-                        if min_price and best_bid and best_bid < min_price:
-                            print(f"  🛡️ 最佳买价${best_bid:.3f}<最低价${min_price:.2f}，跳过地板价策略")
+                        # EV > 0 时保护最低价
+                        if min_price:
+                            best_bid = get_best_bid(token_id)
+                            if best_bid and best_bid < min_price:
+                                print(f"  🛡️ 最佳买价${best_bid:.3f}<最低价${min_price:.2f}，跳过市价卖出")
+                            else:
+                                attempted_close = True
+                                ok, actual_price = market_sell_immediate(token_id, size)
+                                if ok:
+                                    if actual_price >= min_price:
+                                        sold = True
+                                        sold_price = actual_price
+                                        self_notify(pos, sold_price, coin, direction, size, "阶段3市价平仓")
+                                    else:
+                                        sold = True
+                                        sold_price = actual_price
+                                        print(f"  🛡️ 市价成交${actual_price:.2f}<最低价${min_price:.2f}，已成交标记关闭")
+                                        self_notify(pos, sold_price, coin, direction, size, "阶段3低价成交")
                         else:
+                            # 无最低价保护，直接市价
                             attempted_close = True
-                            success, sell_price, output = try_sell_with_multiple_prices(
-                                token_id, size, best_bid, current_price, entry_price, True
-                            )
-                            if success:
+                            ok, actual_price = market_sell_immediate(token_id, size)
+                            if ok:
                                 sold = True
-                                sold_price = sell_price
-                                self_notify(pos, sold_price, coin, direction, size, "阶段3激进平仓")
+                                sold_price = actual_price
+                                self_notify(pos, sold_price, coin, direction, size, "阶段3市价平仓")
                 
                 # ═══ 阶段4：结束前30秒（最后机会）═══
                 if not sold and 0 < remaining <= 30:
@@ -1220,14 +1293,12 @@ def monitor():
                     else:
                         # EV < 0 或无法计算 → 保留原有地板价策略
                         print(f"  💀 阶段4：最后机会 ({ev_label})")
-                        for price in [0.10, 0.05, 0.02, 0.01]:
-                            attempted_close = True
-                            success, output, actual_price = sell_position(token_id, size, price, max_retries=1)
-                            if success:
-                                sold = True
-                                sold_price = actual_price or price
-                                self_notify(pos, sold_price, coin, direction, size, "阶段4兜底")
-                                break
+                        attempted_close = True
+                        ok, actual_price = market_sell_immediate(token_id, size)
+                        if ok:
+                            sold = True
+                            sold_price = actual_price
+                            self_notify(pos, sold_price, coin, direction, size, "阶段4兜底")
                 
                 if sold:
                     close_position(pos, sold_price)
