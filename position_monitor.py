@@ -576,7 +576,7 @@ def calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price):
         raw_p = get_base_rate(diff_in_atr)
     except Exception:
         # fallback: 简单线性映射
-        raw_p = min(0.50 + diff_in_atr * 0.08, 0.85)
+        raw_p = min(0.50 + diff_in_atr * 0.08, 0.97)
 
     # 方向是否正确
     price_above_ptb = (diff > 0)
@@ -864,8 +864,8 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    print("🔍 持仓监控 v3 启动（实时盯盘 + 4阶段平仓）...")
-    print("   实时盯盘: 止盈15%/8% | 止损10% | 趋势反转3%")
+    print("🔍 持仓监控 v4 启动（EV驱动 + 时间衰减ATR + 4阶段平仓）...")
+    print("   P0双曲止盈 | EV+ATR联合持有 | 方向错误止损/P1对冲")
     print("   阶段1: 180s | 阶段2: 120s | 阶段3: 60s | 阶段4: 30s")
     
     close_attempts = {}  # (slug, entry_time) -> attempts count
@@ -993,32 +993,28 @@ def monitor():
                             close_attempts.pop(attempt_key, None)
                             continue
 
-                # ═══ 必赢持有：方向正确 + 剩余<120s → EV 驱动决策 ═══
-                if direction_correct and remaining <= 120:
-                    # 计算 EV 判断持有价值
-                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
-                    stage_ev, p_hat, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
-
-                    # EV 充足或 ATR 偏离大 → 持有等结算
-                    if stage_ev is None or stage_ev > 0.03 or (diff_atr and diff_atr >= 1.0):
-                        ev_str = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
-                        atr_str = f"{diff_atr:.1f}ATR" if diff_atr else ""
-                        print(f"  💎 方向正确，持有等结算 | {ev_str} {atr_str} | 剩余{remaining:.0f}s")
-                        continue
-
-                    # EV 微弱（0~0.03）→ 不再强制持有，放行到阶段3/4 的精细 EV 策略
-                    print(f"  ⚠️ 方向正确但EV微弱({stage_ev:+.3f})，放行到阶段策略 | 剩余{remaining:.0f}s")
-                    # 不 continue，让它落到阶段3/4
-
-                # ═══ 方向正确 → 持有（>60s 全覆盖，不区分阶段）═══
-                if remaining > 60 and direction_correct:
+                # ═══ 方向正确 → EV + 时间衰减ATR 联合决策 ═══
+                if direction_correct and remaining > 0:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     stage_ev, p_hat, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
                     ev_str = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
                     atr_str = f"{diff_atr:.1f}ATR" if diff_atr else ""
-                    if remaining <= 180:
+
+                    # 时间衰减ATR阈值：越接近结算，需要越弱的信号即可持有
+                    # 120s→4.0, 90s→3.0, 60s→2.0, 30s→1.0
+                    atr_hold_threshold = 1.0 + max(0, remaining - 30) / 30
+
+                    if stage_ev is not None and stage_ev > 0.03:
+                        # EV 明确正 → 持有
                         print(f"  💎 方向正确，持有等结算 | {ev_str} {atr_str} | 剩余{remaining:.0f}s")
-                    continue
+                        continue
+                    elif diff_atr and diff_atr >= atr_hold_threshold:
+                        # EV 不够但 ATR 信号强 → 持有
+                        print(f"  💎 方向正确，ATR强信号持有 | {ev_str} {atr_str}≥{atr_hold_threshold:.1f} | 剩余{remaining:.0f}s")
+                        continue
+
+                    # EV 不足 + ATR 不够强 → 放行到阶段策略
+                    print(f"  ⚠️ 方向正确但信号不足({ev_str} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
 
                 # ═══ 方向错误预阶段止损（>180s，阶段1-2各自处理自己的区间）═══
                 if remaining > 180:

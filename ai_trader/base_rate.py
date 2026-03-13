@@ -24,7 +24,10 @@ BASE_RATE_PRIORS = {
     "1.5-2.0": 0.65,
     "2.0-3.0": 0.72,
     "3.0-4.0": 0.78,
-    "4.0+":    0.85,
+    "4.0-5.0": 0.88,
+    "5.0-6.0": 0.92,
+    "6.0-8.0": 0.95,
+    "8.0+":    0.97,
 }
 
 # 实证数据最少样本数
@@ -37,8 +40,14 @@ _CACHE_TTL = 60  # 60秒刷新
 
 def _atr_band(diff_in_atr: float) -> str:
     """将 diff_in_atr 映射到离散带 key"""
-    if diff_in_atr >= 4.0:
-        return "4.0+"
+    if diff_in_atr >= 8.0:
+        return "8.0+"
+    elif diff_in_atr >= 6.0:
+        return "6.0-8.0"
+    elif diff_in_atr >= 5.0:
+        return "5.0-6.0"
+    elif diff_in_atr >= 4.0:
+        return "4.0-5.0"
     elif diff_in_atr >= 3.0:
         return "3.0-4.0"
     elif diff_in_atr >= 2.0:
@@ -84,7 +93,7 @@ def get_base_rate(diff_in_atr: float) -> float:
     Args:
         diff_in_atr: 价格偏离 PTB 的 ATR 倍数（绝对值）
     Returns:
-        float in [0.50, 0.85]
+        float in [0.50, 0.97]
     """
     band = _atr_band(abs(diff_in_atr))
 
