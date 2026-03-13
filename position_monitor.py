@@ -1208,22 +1208,11 @@ def monitor():
                     stage_ev = market_ev
                     ev_label = ev_label_global
 
-                    if stage_ev is not None and stage_ev > 0.05:
-                        # EV 显著正 → 持有到结算，不卖
-                        print(f"  💎 阶段4: {ev_label}>0.05，持有到结算")
-                    elif stage_ev is not None and stage_ev >= 0:
-                        # EV 0~0.05 → 温和底价（不恐慌）
-                        print(f"  💀 阶段4：温和清仓 ({ev_label})")
-                        moderate_prices = [max(entry_price * 0.80, 0.15), 0.10, 0.05]
-                        for price in moderate_prices:
-                            price = round(price, 2)
-                            attempted_close = True
-                            success, output, actual_price = sell_position(token_id, size, price, max_retries=1)
-                            if success:
-                                sold = True
-                                sold_price = actual_price or price
-                                self_notify(pos, sold_price, coin, direction, size, "阶段4温和清仓")
-                                break
+                    if stage_ev is not None and stage_ev >= 0:
+                        # EV >= 0（token >= entry）→ 持有到结算
+                        # 二元市场: 持有期望值=token_price, 卖出期望值≈token_price
+                        # 最后30秒卖出还有滑点，不如持有等结算$1/$0
+                        print(f"  💎 阶段4: {ev_label}>=0，持有到结算")
                     else:
                         # EV < 0 或无法计算 → 保留原有地板价策略
                         print(f"  💀 阶段4：最后机会 ({ev_label})")
