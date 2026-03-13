@@ -456,8 +456,8 @@ class MarketTracker:
                     except Exception as e:
                         logger.warning(f"  ⚠️ 预热采样失败: {e}")
             
-            # === 早期下注窗口：40-95s（CLOB尚未完全定价，抢先入场） ===
-            EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "40"))
+            # === 早期下注窗口：90-95s（API 在前60-80s返回425 Too Early） ===
+            EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "90"))
             EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "95"))
             if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed:
                 updater = self.bayesian_updaters.get(slug)
@@ -723,6 +723,9 @@ class MarketTracker:
         elif isinstance(output, str) and output.startswith("SKIP_"):
             # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
             logger.warning(f"  ⚠️ {output}，跳过（不计入统计）")
+        elif isinstance(output, str) and ("Too Early" in output or "not ready" in output or "425" in output):
+            # API时序错误（市场未开始接单），不计为交易失败
+            logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
         else:
             logger.error(f"  ❌ 下注失败: {output[:150]}")
             record_bet_result(False, slug)
