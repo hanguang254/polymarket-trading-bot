@@ -665,12 +665,13 @@ class MarketTracker:
         except Exception as _e:
             logger.warning(f"  ⚠️ 检查持仓数失败: {_e}")
 
-        # 检查冷却期
+        # 检查冷却期：满足下注条件时跳过冷却（EV模型已确认有edge）
         if not should_trade():
-            cooldown = decrease_cooldown()
-            print(f"  ⏸️ 冷却期中，观望剩余 {cooldown} 期")
-            logger.info(f"{'='*60}\n")
-            return
+            logger.info(f"  ⚠️ 冷却期中，但满足下注条件，跳过冷却直接交易")
+            from trading_state import load_state, save_state
+            state = load_state()
+            state["cooldown_remaining"] = 0
+            save_state(state)
         
         # 使用前面已获取的 token_id
         up_token = extra_info.get("up_token")
