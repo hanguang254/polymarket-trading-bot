@@ -129,7 +129,8 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         details["bayesian_confidence"] = round(bayesian_conf, 4)
         details["bayesian_direction"] = bayesian_dir
 
-    p_win = min(p_win, 0.82)  # P1: 防止贝叶斯累积推高 p_win
+    P_WIN_CAP = float(os.environ.get("P_WIN_CAP", "0.92"))
+    p_win = min(p_win, P_WIN_CAP)  # P1: 防止贝叶斯累积推高 p_win (env可配置)
 
     # 交叉验证：estimated_value 比 p_win 高 0.15+ → 高估警告
     estimated_value = details.get("estimated_value", 0.5)

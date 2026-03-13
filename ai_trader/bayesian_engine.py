@@ -108,8 +108,8 @@ class BayesianUpdater:
         p_up = math.exp(self.log_posterior_up - log_sum)
         p_down = math.exp(self.log_posterior_down - log_sum)
 
-        # 后验上限 0.90: 12个5秒采样不足以支撑>90%置信度
-        p_up = max(0.10, min(0.90, p_up))
+        # 后验上限 0.93: 衰减因子+Δprice已防跑飞，留出融合空间
+        p_up = max(0.07, min(0.93, p_up))
         p_down = 1.0 - p_up
 
         return round(p_up, 6), round(p_down, 6)

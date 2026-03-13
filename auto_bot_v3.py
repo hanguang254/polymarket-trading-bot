@@ -7,9 +7,10 @@ Polymarket 全自动交易机器人 v3.3
   0s    市场开始
   2s    PTB获取开始（尽早拿到基准价）
   20s   预热扫描开始（贝叶斯序贯更新）
-  40s   PTB获取截止
-  100s  下注窗口开启（已有80秒观察数据）
-  160s  下注窗口关闭
+  40s   PTB获取截止 + 早期下注窗口开启（CLOB未充分定价）
+  70s   早期下注窗口关闭
+  100s  晚期下注窗口开启（已有80秒观察数据，早期未触发时兜底）
+  160s  晚期下注窗口关闭
   下注后 立即进入实时监控（止盈/止损/趋势反转）
   120s  时间止盈（盈利中挂单锁利）
   60s   强制平仓开始
@@ -397,8 +398,9 @@ class MarketTracker:
                 else:
                     logger.warning(f"   ⚠️ PTB 获取失败")
             
-            # === 预热期：20s-100s（PTB获取后立即开始贝叶斯采样） ===
-            if 20 <= elapsed <= 100 and slug not in self.analyzed:
+            # === 预热期：20s-160s（PTB获取后立即开始贝叶斯采样，延续到晚期窗口） ===
+            LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
+            if 20 <= elapsed <= LATE_BET_END and slug not in self.analyzed:
                 if slug not in self.warmup_started:
                     self.warmup_started.add(slug)
                     self.warmup_data[slug] = []
@@ -454,8 +456,38 @@ class MarketTracker:
                     except Exception as e:
                         logger.warning(f"  ⚠️ 预热采样失败: {e}")
             
-            # === 下注窗口：100s-160s（贝叶斯后验 + gap 趋势双重确认） ===
-            if 100 <= elapsed <= 160 and slug not in self.analyzed:
+            # === 早期下注窗口：40-70s（CLOB尚未完全定价，抢先入场） ===
+            EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "40"))
+            EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "70"))
+            if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed:
+                updater = self.bayesian_updaters.get(slug)
+                samples = self.warmup_data.get(slug, [])
+
+                # 早期门槛更严格: n_updates>=4, conf>=0.4, samples>=4
+                if updater and updater.n_updates >= 4 and len(samples) >= 4:
+                    b_dir, b_phat, b_conf = updater.get_direction_and_confidence()
+
+                    if b_conf >= 0.4:
+                        gap_trend, gap_info = self._calc_gap_trend(samples)
+
+                        if gap_trend == "穿越":
+                            logger.info(f"  ⏳ 早期窗口: gap穿越，等待晚期窗口")
+                        else:
+                            self.analyzed.add(slug)
+                            extra_info = {
+                                "gap_trend": gap_trend,
+                                "gap_info": gap_info,
+                                "warmup_samples": len(samples),
+                                "early_window": True,
+                            }
+                            if updater.n_updates >= 3:
+                                extra_info["bayesian"] = updater.get_summary()
+                            logger.info(f"\n⚡ 早期下注窗口: {market['coin']} elapsed={elapsed:.0f}s | 贝叶斯: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f}")
+                            self.analyze_and_trade(slug, market, extra_info)
+
+            # === 晚期下注窗口：100s-160s（贝叶斯后验 + gap 趋势双重确认） ===
+            LATE_BET_START = int(os.environ.get("LATE_BET_START", "100"))
+            if LATE_BET_START <= elapsed <= LATE_BET_END and slug not in self.analyzed:
                 self.analyzed.add(slug)
 
                 samples = self.warmup_data.get(slug, [])
