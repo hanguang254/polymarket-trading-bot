@@ -201,19 +201,28 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
             discount = estimated_value - exec_price
             details["exec_discount"] = round(discount, 4)
 
-    # 严格二元 EV: p_win - price（此处 target_odds 已校准为执行价）
-    ev = p_win - target_odds
+    # ── EV 计算：扣除双向 spread 成本 ──
+    # 裸 EV = p_win - price，但实际需要买入(ask) + 卖出(bid) 双向滑点
+    spread_cost = liquidity_info["spread"] if liquidity_info and liquidity_info.get("spread") else 0.02
+    ev_gross = p_win - target_odds
+    ev = ev_gross - spread_cost  # 扣除做市商spread后的净EV
     details["expected_value"] = round(ev, 4)
+    details["ev_gross"] = round(ev_gross, 4)
+    details["spread_cost"] = round(spread_cost, 4)
     details["p_win_final"] = round(p_win, 4)
     details["ev_positive"] = ev > 0
 
+    # ── ATR 最低偏离门槛：过滤噪音信号 ──
+    MIN_ATR_DEVIATION = float(os.environ.get("MIN_ATR_DEVIATION", "1.5"))
+
     MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
-    MIN_EV = float(os.environ.get("MIN_EV", "0.03"))
+    MIN_EV = float(os.environ.get("MIN_EV", "0.05"))
     MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.60"))
     should_bet = (
-        ev > MIN_EV                    # EV: p_win - exec_price > 3%
-        and target_odds < MAX_PRICE     # 不买太贵（env可配置）
-        and confidence >= MIN_CONFIDENCE # 置信度（env可配置，默认60%）
+        diff_in_atr >= MIN_ATR_DEVIATION  # ATR偏离：过滤无信号区间
+        and ev > MIN_EV                    # 净EV：扣除spread后仍有边际
+        and target_odds < MAX_PRICE        # 不买太贵（env可配置）
+        and confidence >= MIN_CONFIDENCE   # 置信度（env可配置）
     )
 
     details["should_bet"] = should_bet
@@ -221,11 +230,12 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["liquidity"] = liq_label
     details["discount_threshold"] = discount_threshold
     details["bet_reason"] = (
-        f"ev={ev:+.4f}({'✅' if ev>MIN_EV else '❌'}>{MIN_EV}) "
+        f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
+        f"ev={ev:+.4f}({'✅' if ev>MIN_EV else '❌'}>{MIN_EV},扣spread{spread_cost:.3f}) "
         f"p_win={p_win:.3f} base_rate={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "
-        f"折价={discount:.3f}(参考) 流动性:{liq_label}"
+        f"流动性:{liq_label}"
     )
 
     # 空簿二次机会：C1校准拉负了折价，但Gamma指标本身OK → 放行，用校准价下单

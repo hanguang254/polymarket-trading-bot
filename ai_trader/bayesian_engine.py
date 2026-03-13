@@ -1,74 +1,55 @@
 """
-贝叶斯序贯更新引擎 v1.0
+贝叶斯序贯更新引擎 v2.0
 
 基于论文: Real-Time Bayesian Signal Processing Agent Decision Architecture
 
-核心公式:
-  log P(H|D) = log P(H) + Σ log P(D_k|H) - log Z
+v2.0 修复:
+  - 使用价格变化增量(Δprice)而非价格水平，解决自相关问题
+  - 加入信息衰减因子，后续重复信号权重递减
+  - 后验上限 0.90，防止12个高自相关样本推出 p̂=0.97
 
-用途: 替代 auto_bot_v3.py 中简单的 gap 趋势分析，
-     在预热期对每个价格采样点做后验概率更新，
-     输出更准确的 p̂（真实概率估计）
+核心公式:
+  log P(H|D) = log P(H) + Σ w_k · log P(D_k|H) - log Z
+  其中 w_k = decay^k 为衰减权重
 """
 import math
 
 
 class BayesianUpdater:
     """
-    二元市场贝叶斯序贯更新器
+    二元市场贝叶斯序贯更新器（v2: 抗自相关）
 
-    在 log-space 中累积更新，数值稳定:
-        log P(UP|D1..Dt) = log P(UP) + Σ log P(Dk|UP)
-        log P(DOWN|D1..Dt) = log P(DOWN) + Σ log P(Dk|DOWN)
-        归一化后得到后验概率
+    改进:
+      1. 首次更新用 price vs PTB（水平信号）
+      2. 后续更新用 Δprice（变化量信号），消除自相关
+      3. 每次更新权重衰减 decay^n，避免重复信号累积
+      4. 后验概率上限 0.90（单边）
     """
 
     def __init__(self, prior_up=0.5, atr_val=None):
-        """
-        Args:
-            prior_up: UP 的先验概率（通常用市场赔率 up_odds）
-            atr_val: ATR 值，用于将价格偏离标准化
-        """
         self.prior_up = max(0.01, min(0.99, prior_up))
         self.atr_val = atr_val or 1.0
         self.log_posterior_up = math.log(self.prior_up)
         self.log_posterior_down = math.log(1 - self.prior_up)
         self.n_updates = 0
-        self.samples = []  # 记录所有采样点
+        self.last_price = None
+        self.samples = []
+        self.decay = 0.85  # 每次更新权重衰减15%
 
-    def _likelihood(self, price, ptb):
+    def _likelihood(self, deviation):
         """
-        计算似然 P(D|H)
+        计算似然 P(D|H)，输入为标准化偏离量
 
-        模型假设:
-          - 如果 H=UP 为真，价格应倾向于 > PTB
-          - 如果 H=DOWN 为真，价格应倾向于 < PTB
-          - 偏离程度（ATR 倍数）决定似然强度
-
-        使用 sigmoid 函数将偏离映射到似然:
-          P(D|UP)  = sigmoid(k * (price - ptb) / atr)
-          P(D|DOWN) = 1 - P(D|UP)
-
-        k 控制似然的敏感度，k 越大对偏离越敏感
+        使用 sigmoid: P(D|UP) = sigmoid(k * deviation)
         """
         if self.atr_val <= 0:
             return 0.5, 0.5
 
-        deviation = (price - ptb) / self.atr_val
-
-        # Clamp: 限制单次偏离最大 ±3 ATR
-        # 避免 BTC gap=-431 (12x ATR) 一步推到 sigmoid 饱和
-        # 需要多次一致信号才能累积高置信度
         deviation = max(-3.0, min(3.0, deviation))
 
-        # k=0.8: 降低敏感度
-        # 3 ATR 偏离 → sigmoid(2.4) ≈ 0.92，留有余量
-        # 1 ATR 偏离 → sigmoid(0.8) ≈ 0.69，温和信号
         k = 0.8
         z = k * deviation
         p_up = 1.0 / (1.0 + math.exp(-z))
-
-        # 限制极端值，单次观测最多推到 0.85
         p_up = max(0.15, min(0.85, p_up))
         p_down = 1.0 - p_up
 
@@ -78,24 +59,33 @@ class BayesianUpdater:
         """
         用一个新的价格观测更新后验概率
 
-        Args:
-            price: 当前加密货币价格（来自 Binance）
-            ptb: Price To Beat（来自 Polymarket）
-
-        Returns:
-            (posterior_up, posterior_down): 更新后的后验概率
+        第1次: 用 (price - ptb) / ATR（水平偏离，初始方向信号）
+        第2次+: 用 (price - last_price) / ATR（变化量，独立增量信息）
         """
-        likelihood_up, likelihood_down = self._likelihood(price, ptb)
+        if self.last_price is None:
+            # 首次：水平偏离信号
+            deviation = (price - ptb) / self.atr_val
+        else:
+            # 后续：价格变化量（与PTB方向一致=正信号）
+            delta = price - self.last_price
+            deviation = delta / self.atr_val
 
-        # log-space 累积（公式3: log P(H|D) = log P(H) + Σ log P(Dk|H)）
-        self.log_posterior_up += math.log(likelihood_up)
-        self.log_posterior_down += math.log(likelihood_down)
+        self.last_price = price
+
+        likelihood_up, likelihood_down = self._likelihood(deviation)
+
+        # 衰减权重：第n次更新权重 = decay^n
+        weight = self.decay ** self.n_updates
+        self.log_posterior_up += weight * math.log(likelihood_up)
+        self.log_posterior_down += weight * math.log(likelihood_down)
 
         self.n_updates += 1
         self.samples.append({
             "price": price,
             "ptb": ptb,
             "gap": round(price - ptb, 2),
+            "deviation": round(deviation, 4),
+            "weight": round(weight, 3),
             "likelihood_up": round(likelihood_up, 4),
         })
 
@@ -103,7 +93,7 @@ class BayesianUpdater:
 
     def get_posterior(self):
         """
-        归一化并返回后验概率
+        归一化并返回后验概率（上限 0.90，防止自相关累积过高）
 
         Returns:
             (p_up, p_down)
@@ -117,6 +107,10 @@ class BayesianUpdater:
 
         p_up = math.exp(self.log_posterior_up - log_sum)
         p_down = math.exp(self.log_posterior_down - log_sum)
+
+        # 后验上限 0.90: 12个5秒采样不足以支撑>90%置信度
+        p_up = max(0.10, min(0.90, p_up))
+        p_down = 1.0 - p_up
 
         return round(p_up, 6), round(p_down, 6)
 
