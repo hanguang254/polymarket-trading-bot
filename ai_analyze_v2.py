@@ -219,6 +219,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
     MIN_EV = float(os.environ.get("MIN_EV", "0.05"))
     MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.60"))
+
+    # 早期窗口放宽门槛：优势是CLOB价格好，不需要那么高的置信度/EV
+    is_early = extra_info.get("early_window", False) if extra_info else False
+    if is_early:
+        MIN_EV = float(os.environ.get("EARLY_MIN_EV", "0.03"))
+        MIN_CONFIDENCE = float(os.environ.get("EARLY_MIN_CONFIDENCE", "0.40"))
+
     should_bet = (
         diff_in_atr >= MIN_ATR_DEVIATION  # ATR偏离：过滤无信号区间
         and ev > MIN_EV                    # 净EV：扣除spread后仍有边际
@@ -230,13 +237,14 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     liq_label = f"LMSR:{liquidity_info['liquidity_score']:.2f}" if liquidity_info else "fallback"
     details["liquidity"] = liq_label
     details["discount_threshold"] = discount_threshold
+    early_label = " [早期窗口]" if is_early else ""
     details["bet_reason"] = (
         f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
         f"ev={ev:+.4f}({'✅' if ev>MIN_EV else '❌'}>{MIN_EV},扣spread{spread_cost:.3f}) "
         f"p_win={p_win:.3f} base_rate={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "
-        f"流动性:{liq_label}"
+        f"流动性:{liq_label}{early_label}"
     )
 
     # 空簿二次机会：C1校准拉负了折价，但Gamma指标本身OK → 放行，用校准价下单

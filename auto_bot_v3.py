@@ -456,18 +456,18 @@ class MarketTracker:
                     except Exception as e:
                         logger.warning(f"  ⚠️ 预热采样失败: {e}")
             
-            # === 早期下注窗口：40-70s（CLOB尚未完全定价，抢先入场） ===
+            # === 早期下注窗口：40-95s（CLOB尚未完全定价，抢先入场） ===
             EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "40"))
-            EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "70"))
+            EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "95"))
             if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed:
                 updater = self.bayesian_updaters.get(slug)
                 samples = self.warmup_data.get(slug, [])
 
-                # 早期门槛更严格: n_updates>=4, conf>=0.4, samples>=4
+                # 早期门槛: n_updates>=4, conf>=0.25, samples>=4
                 if updater and updater.n_updates >= 4 and len(samples) >= 4:
                     b_dir, b_phat, b_conf = updater.get_direction_and_confidence()
 
-                    if b_conf >= 0.4:
+                    if b_conf >= 0.25:
                         gap_trend, gap_info = self._calc_gap_trend(samples)
 
                         if gap_trend == "穿越":
