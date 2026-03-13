@@ -479,6 +479,7 @@ class MarketTracker:
                                 "gap_info": gap_info,
                                 "warmup_samples": len(samples),
                                 "early_window": True,
+                                "remaining_seconds": remaining,
                             }
                             if updater.n_updates >= 3:
                                 extra_info["bayesian"] = updater.get_summary()
@@ -494,7 +495,7 @@ class MarketTracker:
                 # 保留 gap 趋势作为辅助信号
                 gap_trend, gap_info = self._calc_gap_trend(samples)
 
-                extra_info = {"gap_trend": gap_trend, "gap_info": gap_info, "warmup_samples": len(samples)}
+                extra_info = {"gap_trend": gap_trend, "gap_info": gap_info, "warmup_samples": len(samples), "remaining_seconds": remaining}
 
                 # 贝叶斯后验结果
                 updater = self.bayesian_updaters.get(slug)

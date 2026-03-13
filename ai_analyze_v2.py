@@ -7,12 +7,36 @@ AI 分析和下注决策 v2
 import sys
 import os
 import json
+import math
 from datetime import datetime, timezone
 
 
 from ai_trader.ai_model_v2 import analyze_market
 from ai_trader.base_rate import get_base_rate
 import subprocess
+
+
+def _random_walk_p_win(gap, atr_val, remaining_seconds):
+    """
+    Random walk model: P(price stays on current side of PTB at expiry).
+
+    Uses Φ(|gap| / σ_total) where σ_total = (ATR/1.5) × √(remaining_min).
+    More accurate than static ATR-band lookup because it accounts for
+    actual gap magnitude AND time remaining.
+    """
+    if atr_val <= 0 or remaining_seconds <= 0:
+        return 0.50
+
+    sigma_per_min = atr_val / 1.5          # ATR ≈ 1.5σ (normal approx)
+    sigma_total = sigma_per_min * math.sqrt(remaining_seconds / 60)
+
+    if sigma_total <= 0:
+        return 0.50
+
+    z = abs(gap) / sigma_total
+    p_win = 0.5 * (1 + math.erf(z / math.sqrt(2)))   # Φ(z)
+
+    return min(p_win, 0.92)                # hard cap
 
 
 def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, details, action="SKIP"):
@@ -104,8 +128,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         discount_threshold = max(discount_threshold, extra_info["min_discount"])
 
     # ── 严格概率 EV 公式 (P2) ──
-    # p_win = base_rate（保守先验），贝叶斯可用时加权融合
-    p_win = details.get("p_win", base_rate)
+    # p_win = random walk model（用 gap + ATR + 剩余时间计算），比 base_rate 更准确
+    remaining_sec = extra_info.get("remaining_seconds", 200) if extra_info else 200
+    price_diff = details.get("price_diff", 0)
+    atr_val = details.get("atr", 0)
+    rw_p_win = _random_walk_p_win(price_diff, atr_val, remaining_sec)
+    p_win = max(rw_p_win, base_rate)       # 取 random walk 和 base_rate 中较高者
+    details["rw_p_win"] = round(rw_p_win, 4)
 
     # 贝叶斯后验融合
     bayesian_info = extra_info.get("bayesian") if extra_info else None
@@ -118,8 +147,9 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         is_early_window = extra_info.get("early_window", False) if extra_info else False
         fusion_threshold = 0.15 if is_early_window else 0.3
         if bayesian_dir == direction and bayesian_conf > fusion_threshold:
-            # 贝叶斯有实时数据，权重更高
-            p_win = p_win * 0.4 + b_p_hat * 0.6
+            # 贝叶斯融合：只能提升 p_win，不能降低（random walk 已是合理下界）
+            fused_p = p_win * 0.4 + b_p_hat * 0.6
+            p_win = max(p_win, fused_p)
             confidence = confidence * 0.4 + bayesian_conf * 0.6
             details["confidence_source"] = "bayesian_fused"
         elif bayesian_dir != direction:
@@ -244,7 +274,7 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["bet_reason"] = (
         f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
         f"ev={ev:+.4f}({'✅' if ev>MIN_EV else '❌'}>{MIN_EV},扣spread{spread_cost:.3f}) "
-        f"p_win={p_win:.3f} base_rate={base_rate:.3f} "
+        f"p_win={p_win:.3f} rw={rw_p_win:.3f} base={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "
         f"流动性:{liq_label}{early_label}"
