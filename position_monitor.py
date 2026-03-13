@@ -12,6 +12,7 @@ import requests
 
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
 PROFIT_THRESHOLD = 0.15  # 15% 止盈
+SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))  # 空簿回退滑点（env可配置）
 
 # P0 双曲贴现止盈参数（可通过 .env 覆盖）
 P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", "0.15"))      # 基础止盈阈值
@@ -93,9 +94,12 @@ def get_market_price(token_id):
                 return float(mid)
     except:
         pass
-    # 方案3：只有 bid 或 ask，返回有的那个
+    # 方案3：last-trade-price（空簿时的真实市场价）
+    ltp = get_last_trade_price(token_id)
+    if ltp:
+        return ltp
+    # 方案4：只有 bid 或 ask，返回有的那个
     if best_bid and best_ask:
-        # 价差大但至少有值，返回 midpoint API 失败时的保底
         return round((best_bid + best_ask) / 2, 4)
     if best_bid:
         return best_bid
@@ -104,7 +108,7 @@ def get_market_price(token_id):
     return None
 
 def get_best_bid(token_id):
-    """获取最佳买价（用于卖出）- 从订单簿获取"""
+    """获取最佳买价（用于卖出）- 从订单簿获取，空簿回退last-trade-price"""
     try:
         resp = requests.get(
             f"https://clob.polymarket.com/book?token_id={token_id}",
@@ -114,16 +118,22 @@ def get_best_bid(token_id):
             data = resp.json()
             bids = data.get('bids', [])
             if bids and len(bids) > 0:
-                # 最佳买价（买方愿意支付的最高价）
                 best_bid = float(bids[0]['price'])
-                # 使用略低于最佳买价的价格（99%），提高成交率
-                return best_bid * 0.99
+                if best_bid > 0.02:  # 正常市场
+                    return best_bid * 0.99
+                # 空簿: bid≤0.02，回退last-trade-price
     except:
         pass
+    # 回退：last-trade-price - SLIPPAGE
+    ltp = get_last_trade_price(token_id)
+    if ltp:
+        fallback = max(round(ltp - SLIPPAGE, 2), 0.01)
+        print(f"    📡 get_best_bid空簿回退: last_trade=${ltp:.3f} → bid=${fallback:.2f}")
+        return fallback
     return None
 
 def get_best_ask(token_id):
-    """获取最佳卖价（用于买入对冲）- 从订单簿获取"""
+    """获取最佳卖价（用于买入对冲）- 从订单簿获取，空簿回退last-trade-price"""
     try:
         resp = requests.get(
             f"https://clob.polymarket.com/book?token_id={token_id}",
@@ -133,7 +143,31 @@ def get_best_ask(token_id):
             data = resp.json()
             asks = data.get('asks', [])
             if asks and len(asks) > 0:
-                return float(asks[0]['price'])
+                ask = float(asks[0]['price'])
+                if ask < 0.95:  # 正常市场
+                    return ask
+                # 空簿: ask≥0.95，回退last-trade-price
+    except:
+        pass
+    # 回退：last-trade-price + SLIPPAGE
+    ltp = get_last_trade_price(token_id)
+    if ltp:
+        fallback = min(round(ltp + SLIPPAGE, 2), 0.99)
+        print(f"    📡 get_best_ask空簿回退: last_trade=${ltp:.3f} → ask=${fallback:.2f}")
+        return fallback
+    return None
+
+def get_last_trade_price(token_id):
+    """获取最近成交价（空簿时的真实市场价参考）"""
+    try:
+        resp = requests.get(
+            f"https://clob.polymarket.com/last-trade-price?token_id={token_id}",
+            timeout=5
+        )
+        if resp.status_code == 200:
+            price = float(resp.json().get('price', 0))
+            if 0.01 < price < 0.99:
+                return price
     except:
         pass
     return None
@@ -1136,6 +1170,14 @@ def monitor():
                     ev_label = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
                     print(f"  🚨 阶段3：激进平仓 ({ev_label})")
 
+                    # EV sanity check：token市场价远低于EV隐含价值 → 覆盖EV
+                    if stage_ev is not None and stage_ev > 0:
+                        token_ltp = get_last_trade_price(token_id)
+                        if token_ltp and token_ltp < entry_price * 0.5:
+                            print(f"  ⚠️ EV={stage_ev:+.3f}但市场价${token_ltp:.3f}已远低于入场${entry_price:.3f}，覆盖EV")
+                            stage_ev = token_ltp - entry_price
+                            ev_label = f"EV={stage_ev:+.3f}(市场校正)"
+
                     # EV > 0 → 设最低价保护，不用地板价
                     min_price = None
                     if stage_ev is not None and stage_ev > 0:
@@ -1178,6 +1220,14 @@ def monitor():
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     stage_ev, _, _ = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
                     ev_label = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
+
+                    # EV sanity check：token市场价远低于EV隐含价值 → 覆盖EV
+                    if stage_ev is not None and stage_ev > 0:
+                        token_ltp = get_last_trade_price(token_id)
+                        if token_ltp and token_ltp < entry_price * 0.5:
+                            print(f"  ⚠️ EV={stage_ev:+.3f}但市场价${token_ltp:.3f}已远低于入场${entry_price:.3f}，覆盖EV")
+                            stage_ev = token_ltp - entry_price
+                            ev_label = f"EV={stage_ev:+.3f}(市场校正)"
 
                     if stage_ev is not None and stage_ev > 0.05:
                         # EV 显著正 → 持有到结算，不卖

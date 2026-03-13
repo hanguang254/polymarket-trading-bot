@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v3.9
+# Polymarket Trading Bot v4.0
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses discount arbitrage with EV-driven position management, Base Rate calibration, Bayesian sequential updating, and correlated exposure control.
 
@@ -50,6 +50,8 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Correlated Exposure Control**: BTC/ETH correlation ~0.85. Same-direction position halves Kelly sizing.
 - **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds.
 - **Liquidity-Capped Sizing (P3)**: Kelly size capped at 50% of exit bid depth. Works with P2 — P2 gates entry, P3 adjusts size.
+- **CLOB C1 Calibration**: Replaces Gamma odds with CLOB `best_ask` for discount/EV/price checks — prevents buying at $0.85 while thinking price is $0.50. Empty book detection (ask ≥ 0.95) falls back to `last-trade-price`.
+- **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
 
 ### Exit (P0-P1 + P4)
 - **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.15) and `P0_HYPERBOLIC_K` (default 0.15). Example: 240s → 26%, 100s → 20%.
@@ -59,7 +61,9 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
   - Direction correct → **EV-driven hold** (high EV → collect $1.00, weak EV → fine-grained exit)
   - Direction wrong → Progressive stop-loss with price escalation
   - No buyers (bid < $0.05) → Attempt hedge (P1), fall back to wait for expiry
-- **Wide Spread Protection**: `get_market_price()` detects bid-ask spread > 50% and falls back to midpoint API, preventing false loss signals (e.g., $0.01/$0.99 → midpoint $0.50 for a token worth $0.99).
+- **Wide Spread Protection**: `get_market_price()` detects bid-ask spread > 50% and falls back to midpoint API → `last-trade-price` → single-side price, preventing false loss signals.
+- **Empty Book Fallback (Monitor)**: `get_best_bid()` / `get_best_ask()` fall back to `last-trade-price ± SLIPPAGE` when CLOB is empty (bid ≤ 0.02 or ask ≥ 0.95). Enables hedge and stop-loss decisions with real market prices instead of $0.01/$0.99.
+- **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
 - **4-Stage Graduated Exit**: For losing positions — Stage 1 (180-120s) with P1 hedge support, Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) floor prices.
 - **Accurate Settlement**: Expiry cleanup uses crypto price vs PTB to determine $1.00/$0.00, not unreliable token price.
@@ -101,7 +105,7 @@ All must be met:
 |-----------|-----------|--------|
 | Discount | ≥ dynamic (8-20%) | LMSR liquidity score |
 | EV | > 0.03 (3%) | `p_win - target_odds` |
-| Odds | < 0.85 | Don't buy overpriced tokens |
+| Odds | < MAX_BUY_PRICE (default 0.92) | Don't buy overpriced tokens |
 | Confidence | ≥ 65% | Bayesian-fused momentum |
 | Base Rate | Checked | < 0.55 → Kelly halved |
 | Correlation | Checked | Same-direction → Kelly halved |
@@ -112,9 +116,10 @@ All must be met:
 Layer 1 — Entry Filters
   ├─ Dynamic discount threshold (LMSR: 8%-20%)
   ├─ Strict binary EV > 3%
-  ├─ Odds < 0.85, Confidence ≥ 65%
+  ├─ Odds < MAX_BUY_PRICE (default 0.92), Confidence ≥ 65%
   ├─ Base Rate calibration (weak edge → Kelly halved)
-  └─ P2: Exit liquidity gate (bid_depth < 5 → skip entry)
+  ├─ P2: Exit liquidity gate (bid_depth < 5 → skip entry)
+  └─ Empty book override (Gamma EV pass → bet with calibrated price)
 
 Layer 2 — Position Sizing
   ├─ 1/4 Kelly (binary formula)
@@ -201,6 +206,8 @@ See `.env.example` for all configurable parameters:
 | `MAX_DAILY_LOSS` | No | Daily loss limit in USD (default: 10) |
 | `MAX_OPEN_POSITIONS` | No | Max concurrent positions (default: 2) |
 | `MIN_BALANCE` | No | Min balance to place bets (default: 5) |
+| `MAX_BUY_PRICE` | No | Max buy price for entry (default: 0.92) |
+| `SLIPPAGE` | No | Empty book fallback slippage for last-trade-price ± (default: 0.01) |
 | `P0_BASE_PROFIT` | No | P0 take-profit base threshold (default: 0.15) |
 | `P0_HYPERBOLIC_K` | No | Hyperbolic discounting coefficient (default: 0.15) |
 
@@ -255,6 +262,7 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 
 ## Version History
 
+- **v4.0**: Empty book resilience — Entry: CLOB C1 calibration (best_ask校准防虚假折价) + empty book override (Gamma EV二次放行, 校准价下单). Exit: `get_best_bid/ask/market_price` fall back to `last-trade-price ± SLIPPAGE` when orderbook empty. Stage 3/4 EV sanity check (market price halved → override fake positive EV). New env: `MAX_BUY_PRICE`, `SLIPPAGE`. Fixes BTC DOWN $0.21→$0.01→$0.00 全程无止损 case.
 - **v3.9**: EV-driven diamond hands — direction correct + ≤120s no longer blindly holds; calculates real-time EV (base_rate lookup) and releases weak signals (EV 0~0.03) to Stage 3/4 fine-grained exit. P1 hedge extended to Stage 1 (120-180s) — bid < $0.05 now triggers opposite token hedge instead of doing nothing. Direction-correct hold blocks (>60s) now log EV/ATR for signal quality observation. Removed dead EV computation in Stage 1 entry.
 - **v3.8**: Document-inspired enhancements — #7: LMSR inefficiency signal (realtime best_ask vs p_win mispricing → lower entry threshold). #1: Hyperbolic discounting profit-take (dynamic threshold scales with time to settlement, configurable via env). #6: Adaptive Bayesian sampling (3s near bet window). #4: Base Rate validation script (`scripts/validate_base_rate.py`).
 - **v3.7**: 4-layer quantitative defense — P0: early profit-taking (≥20% profit + >90s → sell immediately, don't risk boundary reversal). P1: opposite token hedge (bid < $0.05 → buy opposite token to form $1.00 pair at settlement). P2: exit liquidity gate (bid_depth < 5 → skip entry). P3: liquidity-capped sizing (Kelly ≤ 50% of exit bid depth). Opposite token_id recorded at entry for hedge execution.

@@ -176,23 +176,34 @@ def get_token_ids(slug):
 
 
 def get_realtime_odds(up_token, down_token):
-    """从 CLOB 订单簿获取 best_ask 赔率（与 execute_bet 同一价格源）"""
-    up_ask, down_ask = None, None
+    """从 CLOB 订单簿获取实时数据: midpoint, best_bid, best_ask"""
+    result = {
+        "up_mid": None, "down_mid": None,
+        "up_bid": None, "down_bid": None,
+        "up_ask": None, "down_ask": None,
+    }
     for token_id, label in [(up_token, "UP"), (down_token, "DOWN")]:
+        prefix = "up" if label == "UP" else "down"
         try:
             resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
             if resp.status_code == 200:
-                asks = resp.json().get("asks", [])
+                book = resp.json()
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+                if bids:
+                    result[f"{prefix}_bid"] = round(float(bids[0]["price"]), 4)
                 if asks:
-                    ask = float(asks[0]["price"])
-                    if ask > 0:
-                        if label == "UP":
-                            up_ask = round(ask, 4)
-                        else:
-                            down_ask = round(ask, 4)
+                    result[f"{prefix}_ask"] = round(float(asks[0]["price"]), 4)
+                if bids and asks:
+                    best_bid = float(bids[0]["price"])
+                    best_ask = float(asks[0]["price"])
+                    if best_bid > 0 and best_ask > 0:
+                        result[f"{prefix}_mid"] = round((best_bid + best_ask) / 2, 4)
+                elif asks:
+                    result[f"{prefix}_mid"] = result[f"{prefix}_ask"]
         except Exception:
             pass
-    return up_ask, down_ask
+    return result
 
 
 def send_notification(coin, direction, confidence, ev, price, size):
@@ -572,13 +583,17 @@ class MarketTracker:
             # 先用 up_token 做 LMSR 评估（方向确定后会用正确的）
             extra_info["token_id"] = up_token
 
-            # 用 CLOB 订单簿实时赔率替换 Gamma API 赔率（更准确）
-            rt_up, rt_down = get_realtime_odds(up_token, down_token)
-            if rt_up and rt_down:
-                logger.info(f"  📡 实时赔率: UP={rt_up:.3f} DOWN={rt_down:.3f} (Gamma: UP={up_odds:.3f} DOWN={down_odds:.3f})")
-                up_odds, down_odds = rt_up, rt_down
+            # CLOB 订单簿数据：mid 供参考，best_ask 在 analyze_and_decide 中用于执行价校准
+            # Gamma 赔率用于方向/概率判断，CLOB best_ask 用于 EV/折价的执行价校准(C1)
+            clob = get_realtime_odds(up_token, down_token)
+            if clob["up_mid"] and clob["down_mid"]:
+                logger.info(
+                    f"  📡 CLOB: UP bid={clob['up_bid']} ask={clob['up_ask']} mid={clob['up_mid']:.3f}"
+                    f" | DOWN bid={clob['down_bid']} ask={clob['down_ask']} mid={clob['down_mid']:.3f}"
+                )
             else:
-                logger.warning(f"  ⚠️ CLOB赔率获取失败，使用Gamma赔率: UP={up_odds:.3f} DOWN={down_odds:.3f}")
+                logger.info(f"  📡 CLOB赔率获取失败")
+            logger.info(f"  📊 Gamma赔率: UP={up_odds:.3f} DOWN={down_odds:.3f}")
 
         # AI 分析
         should_bet, direction, confidence, details = analyze_and_decide(
@@ -587,6 +602,8 @@ class MarketTracker:
         
         logger.info(f"  🤖 AI: {direction} | 置信度: {confidence*100:.0f}%")
         logger.info(f"  💵 折价: ${details.get('discount',0):.3f} | 估值: ${details.get('estimated_value',0):.2f} | ATR偏离: {details.get('diff_in_atr',0):.2f}")
+        if details.get("clob_empty_book"):
+            logger.info(f"  📡 C1校准后: 折价=${details.get('exec_discount',0):.3f} | 执行价=${details.get('exec_price',0):.3f} (原ask=${details.get('clob_raw_ask',0):.3f})")
         
         if not should_bet:
             logger.warning(f"  ❌ 不满足: {details.get('bet_reason','')}")

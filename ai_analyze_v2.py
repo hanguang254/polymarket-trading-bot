@@ -150,7 +150,35 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
             details["inefficiency_boost"] = True
             print(f"  📊 #7无效率信号: p_win={p_win:.3f} vs ask={realtime_ask:.3f} 偏离={inefficiency:.3f} → 阈值{old_threshold:.3f}→{discount_threshold:.3f}")
 
-    # 严格二元 EV: p_win - price
+    # ── C1 执行价校准: 用 CLOB best_ask 代替 Gamma 赔率做决策 ──
+    # Gamma 赔率 ≈ LMSR 概率（仅用于方向判断）
+    # CLOB best_ask = 实际买入价（必须用于 EV/折价/价格检查）
+    # 不校准 → 决策用0.50算EV=+0.30，实际买入价0.85，真实EV=-0.03，每单亏钱
+    if liquidity_info and liquidity_info.get("best_ask"):
+        exec_price = liquidity_info["best_ask"]
+        # 空簿检测：best_ask >= 0.95 说明CLOB无真实卖单，用 last-trade-price 替代
+        if exec_price >= 0.95 and token_id:
+            import requests
+            details["clob_empty_book"] = True
+            details["clob_raw_ask"] = round(exec_price, 4)
+            try:
+                resp = requests.get(f"https://clob.polymarket.com/last-trade-price?token_id={token_id}", timeout=5)
+                if resp.status_code == 200:
+                    last_price = float(resp.json().get('price', 0))
+                    if 0.01 < last_price < 0.99:
+                        exec_price = last_price
+                        liquidity_info["best_ask"] = last_price  # 更新供后续使用
+                        print(f"  📡 C1校准：CLOB空簿，使用last-trade-price=${last_price:.3f}替代best_ask")
+            except:
+                pass
+        if 0.01 < exec_price < 0.99:
+            details["gamma_odds"] = round(target_odds, 4)
+            details["exec_price"] = round(exec_price, 4)
+            target_odds = exec_price
+            discount = estimated_value - exec_price
+            details["exec_discount"] = round(discount, 4)
+
+    # 严格二元 EV: p_win - price（此处 target_odds 已校准为执行价）
     ev = p_win - target_odds
     details["expected_value"] = round(ev, 4)
     details["p_win_final"] = round(p_win, 4)
@@ -176,6 +204,22 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         f"conf={confidence:.0%}({'✅' if confidence>=0.65 else '❌'}≥65%) "
         f"流动性:{liq_label}"
     )
+
+    # 空簿二次机会：C1校准拉负了折价，但Gamma指标本身OK → 放行，用校准价下单
+    if not should_bet and details.get("clob_empty_book"):
+        gamma_odds = details.get("gamma_odds", target_odds)
+        gamma_discount = estimated_value - gamma_odds
+        gamma_ev = p_win - gamma_odds
+        if gamma_discount >= discount_threshold and gamma_ev > 0.05 and confidence >= 0.75:
+            should_bet = True
+            details["should_bet"] = True
+            details["empty_book_override"] = True
+            details["bet_reason"] = (
+                f"空簿放行: Gamma折价={gamma_discount:.3f}(✅≥{discount_threshold:.3f}) "
+                f"Gamma_EV={gamma_ev:+.4f}(✅>0.05) conf={confidence:.0%}(✅≥75%) "
+                f"执行价=${details.get('exec_price', 0):.3f}(校准) 流动性:{liq_label}"
+            )
+            print(f"  📡 空簿二次机会放行: Gamma折价={gamma_discount:.3f} Gamma_EV={gamma_ev:+.4f}")
 
     action = "BET" if should_bet else "SKIP"
     log_decision(slug, coin, price_to_beat, direction, confidence, up_odds, down_odds, details, action)
@@ -315,35 +359,60 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 余额不足: ${balance:.2f} < ${MIN_BALANCE:.2f}，跳过下注")
         return False, 0, 0, "SKIP_NO_BALANCE"
 
-    # 获取买入价：用订单簿 best_ask（确保吃单成交），失败回退 midpoint+0.01
+    # 获取买入价：优先级 CLOB best_ask → last-trade-price → midpoint
     import requests
-    price = 0.5
+    SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))
+    price = None
+    price_source = "unknown"
+
+    # 1. CLOB best_ask（正常有流动性的市场）
     try:
         resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
         if resp.status_code == 200:
             asks = resp.json().get('asks', [])
             if asks:
-                price = float(asks[0]['price'])  # 最优卖价即为买方成交价
+                clob_ask = float(asks[0]['price'])
+                if clob_ask < 0.95:  # 正常市场，直接使用
+                    price = clob_ask
+                    price_source = "clob_ask"
+                else:
+                    print(f"  📡 CLOB空簿 best_ask=${clob_ask:.2f}≥0.95，尝试last-trade-price")
     except:
         pass
 
-    if price == 0.5:
-        # 回退：midpoint + 0.01 滑点
+    # 2. last-trade-price（空簿时的真实市场价）
+    if price is None:
         try:
-            resp = requests.get(f"https://clob.polymarket.com/midpoint?token_id={token_id}", timeout=5)
+            resp = requests.get(f"https://clob.polymarket.com/last-trade-price?token_id={token_id}", timeout=5)
             if resp.status_code == 200:
-                mid = float(resp.json().get('mid', 0.5))
-                price = min(round(mid + 0.01, 2), 0.99)
+                last_price = float(resp.json().get('price', 0))
+                if 0.01 < last_price < 0.99:
+                    price = min(round(last_price + SLIPPAGE, 2), 0.99)
+                    price_source = "last_trade"
+                    print(f"  📡 CLOB空簿，使用last-trade-price: ${last_price:.2f} → 限价${price:.2f}")
         except:
             pass
 
+    # 3. midpoint 回退
+    if price is None:
+        try:
+            resp = requests.get(f"https://clob.polymarket.com/midpoint?token_id={token_id}", timeout=5)
+            if resp.status_code == 200:
+                mid = float(resp.json().get('mid', 0))
+                if 0.01 < mid < 0.99:
+                    price = min(round(mid + SLIPPAGE, 2), 0.99)
+                    price_source = "midpoint"
+                    print(f"  📡 使用midpoint: ${mid:.2f} → 限价${price:.2f}")
+        except:
+            pass
+
+    # 安全检查：全部失败
+    if price is None:
+        print(f"  ⚠️ 无法获取真实价格（订单簿+last-trade+midpoint均失败），跳过下注")
+        return False, 0, 0, "SKIP_NO_PRICE"
+
     # 价格四舍五入到2位小数（Polymarket要求）
     price = round(price, 2)
-
-    # 安全检查：price 仍为默认值说明订单簿和 midpoint 都获取失败
-    if price == 0.5:
-        print(f"  ⚠️ 无法获取真实价格（订单簿+midpoint均失败），跳过下注")
-        return False, 0, 0, "SKIP_NO_PRICE"
 
     # 安全检查：实际买入价不能超过上限（env可配置，默认0.92）
     MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
