@@ -193,7 +193,6 @@ def get_resolved_conditions(positions: list) -> list:
 def redeem_condition(condition_id: str, neg_risk: bool = False, size: float = 0) -> bool:
     """
     执行单个 condition 的 redeem
-    策略：先按 neg_risk 标志尝试，失败则自动切换另一种方式重试
 
     Args:
         condition_id: 0x 开头的 condition ID
@@ -207,53 +206,37 @@ def redeem_condition(condition_id: str, neg_risk: bool = False, size: float = 0)
     if not condition_id.startswith("0x"):
         condition_id = "0x" + condition_id
 
-    def _try_redeem(use_neg_risk: bool):
-        if use_neg_risk:
-            amt = str(int(size)) if size > 0 else "1"
-            return run_cli([
-                "ctf", "redeem-neg-risk",
-                "--condition", condition_id,
-                "--amounts", f"{amt},{amt}",
-                "--signature-type", SIGNATURE_TYPE,
-            ], timeout=60)
-        else:
-            return run_cli([
-                "ctf", "redeem",
-                "--condition", condition_id,
-                "--signature-type", SIGNATURE_TYPE,
-            ], timeout=60)
+    if neg_risk:
+        # neg-risk 市场: 两个 outcome 的 amount
+        # 赢的 outcome 有 size，输的是 0
+        amt = str(int(size)) if size > 0 else "1"
+        success, stdout, stderr = run_cli([
+            "ctf", "redeem-neg-risk",
+            "--condition", condition_id,
+            "--amounts", f"{amt},{amt}",
+            "--signature-type", SIGNATURE_TYPE,
+        ], timeout=60)
+    else:
+        # 普通市场: 直接 redeem，CLI 自动处理 index-sets
+        success, stdout, stderr = run_cli([
+            "ctf", "redeem",
+            "--condition", condition_id,
+            "--signature-type", SIGNATURE_TYPE,
+        ], timeout=60)
 
-    def _check_result(success, stdout, stderr, label):
-        output = stdout + stderr
-        if success:
-            log.info(f"  ✅ redeem 成功({label}): {condition_id[:18]}...")
-            return True
-        err = output[:200].lower()
-        if any(kw in err for kw in ["already", "nothing to redeem", "no payout",
-                                     "zero", "no balance", "no positions"]):
-            log.info(f"  ⏭️ 无需领取: {condition_id[:18]}...")
-            return True
-        return None  # None = 需要重试
+    output = stdout + stderr
+    if success:
+        log.info(f"  ✅ redeem 成功: {condition_id[:18]}...")
+        return True
 
-    # 第一次：按传入的 neg_risk 标志尝试
-    label1 = "neg-risk" if neg_risk else "normal"
-    s, out, err = _try_redeem(neg_risk)
-    result = _check_result(s, out, err, label1)
-    if result is not None:
-        return result
+    err = output[:200].lower()
+    # 常见非错误情况
+    if any(kw in err for kw in ["already", "nothing to redeem", "no payout",
+                                 "zero", "no balance", "no positions"]):
+        log.info(f"  ⏭️ 无需领取: {condition_id[:18]}...")
+        return True
 
-    # 第一次失败，自动切换另一种方式重试
-    label2 = "normal" if neg_risk else "neg-risk"
-    log.info(f"  🔄 {label1}方式失败，切换{label2}重试: {condition_id[:18]}...")
-    time.sleep(1)
-    s2, out2, err2 = _try_redeem(not neg_risk)
-    result2 = _check_result(s2, out2, err2, label2)
-    if result2 is not None:
-        return result2
-
-    # 两种方式都失败
-    output = out2 + err2
-    log.warning(f"  ❌ redeem 两种方式均失败: {condition_id[:18]}... | {output[:150]}")
+    log.warning(f"  ❌ redeem 失败: {condition_id[:18]}... | {output[:150]}")
     return False
 
 # ==============================================================================
@@ -302,11 +285,6 @@ def do_redeem() -> float:
     fail_count = 0
 
     for r in resolved:
-        # 跳过 value=0 的输的持仓（无需redeem，链上无收益）
-        if r.get("value", 0) <= 0 and r.get("size", 0) > 0:
-            log.info(f"  ⏭️ 跳过零值持仓: {r['slug']} (value=$0)")
-            success_count += 1
-            continue
         ok = redeem_condition(r["condition_id"], r.get("neg_risk", False), r.get("size", 0))
         if ok:
             success_count += 1
