@@ -208,11 +208,12 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["ev_positive"] = ev > 0
 
     MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
+    MIN_EV = float(os.environ.get("MIN_EV", "0.03"))
+    MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.60"))
     should_bet = (
-        discount >= discount_threshold  # 动态折价阈值
-        and ev > 0.03                  # 严格EV: 至少3%边际（新公式产出较小）
+        ev > MIN_EV                    # EV: p_win - exec_price > 3%
         and target_odds < MAX_PRICE     # 不买太贵（env可配置）
-        and confidence >= 0.65          # 动量确认
+        and confidence >= MIN_CONFIDENCE # 置信度（env可配置，默认60%）
     )
 
     details["should_bet"] = should_bet
@@ -220,12 +221,11 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["liquidity"] = liq_label
     details["discount_threshold"] = discount_threshold
     details["bet_reason"] = (
-        f"折价={discount:.3f}({'✅' if discount>=discount_threshold else '❌'}≥{discount_threshold:.3f}) "
-        f"ev={ev:+.4f}({'✅' if ev>0.03 else '❌'}>0.03) "
+        f"ev={ev:+.4f}({'✅' if ev>MIN_EV else '❌'}>{MIN_EV}) "
         f"p_win={p_win:.3f} base_rate={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
-        f"conf={confidence:.0%}({'✅' if confidence>=0.65 else '❌'}≥65%) "
-        f"流动性:{liq_label}"
+        f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "
+        f"折价={discount:.3f}(参考) 流动性:{liq_label}"
     )
 
     # 空簿二次机会：C1校准拉负了折价，但Gamma指标本身OK → 放行，用校准价下单
