@@ -993,8 +993,10 @@ def monitor():
                 # ═══ 安全检查：token 价格与方向判断矛盾时，信任市场 ═══
                 # 场景：direction_correct=True（Binance价格 vs PTB），但 token 价格暴跌
                 # 说明 PTB 数据可能有误，或价格在边界反转，市场已 price-in 亏损
-                if direction_correct and profit_rate < -0.10:
-                    print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%，市场信号矛盾，不再盲目持有")
+                # 早期波动大、CLOB流动性差，需要更宽容的阈值
+                drawdown_limit = -0.30 if remaining > 180 else -0.20 if remaining > 120 else -0.15 if remaining > 60 else -0.10
+                if direction_correct and profit_rate < drawdown_limit:
+                    print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%（阈值{drawdown_limit*100:.0f}%），市场信号矛盾，不再盲目持有")
                     direction_correct = False  # 降级为方向未知，走正常止损流程
 
                 # ═══ EV 持续监控（Exit Protocol）═══
@@ -1079,27 +1081,30 @@ def monitor():
                         close_attempts[attempt_key] = attempts + 1
                         continue
 
-                    # 市价止损：直接用best_bid，失败立即阶梯降价，不试探
+                    # 市价止损：先用 sell_and_confirm 等待匹配，失败再降价cascade
                     if best_bid and best_bid > 0.01:
-                        stop_prices = [
-                            best_bid,              # 第1次：市价
-                            best_bid * 0.95,       # 第2次：降5%
-                            best_bid * 0.90,       # 第3次：降10%
-                            best_bid * 0.80,       # 第4次：降20%
-                            0.05,                  # 第5次：地板价
-                            0.01,                  # 第6次：最低价
-                        ]
                         print(f"  🛑 方向错误止损(市价): bid=${best_bid:.3f} | 剩余{remaining:.0f}s")
                         attempted_close = True
-                        for sp in stop_prices:
-                            sp = max(round(sp, 2), 0.01)
-                            success, output, actual_price = sell_position(token_id, size, sp, max_retries=1)
-                            if success:
-                                sold = True
-                                sold_price = actual_price or sp
-                                self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
-                                break
-                            time.sleep(1)
+                        # 第一次：用 sell_and_confirm 带轮询确认
+                        ok, result = sell_and_confirm(token_id, size, best_bid, timeout_sec=5)
+                        if ok:
+                            sold = True
+                            sold_price = result if isinstance(result, (int, float)) else best_bid
+                            self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
+                        else:
+                            print(f"    ❌ 市价${best_bid:.2f}未成交: {str(result)[:80]}，降价重试")
+                            # 降价cascade
+                            for sp in [best_bid * 0.95, best_bid * 0.90, best_bid * 0.80, 0.05, 0.01]:
+                                sp = max(round(sp, 2), 0.01)
+                                success, output, actual_price = sell_position(token_id, size, sp, max_retries=1)
+                                if success:
+                                    sold = True
+                                    sold_price = actual_price or sp
+                                    self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
+                                    break
+                                else:
+                                    print(f"    ❌ 止损价${sp:.2f}未成交: {str(output)[:80]}")
+                                time.sleep(1)
                     else:
                         if attempts == 0:
                             print(f"  🔴 方向错误但无有效bid，等过期结算 | 剩余{remaining:.0f}s")
