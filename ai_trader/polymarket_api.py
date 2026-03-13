@@ -13,6 +13,18 @@ import re
 import requests
 from datetime import datetime, timezone
 
+def normalize_orderbook(bids, asks):
+    """规范化订单簿排序：bids降序(最优买价在前)，asks升序(最优卖价在前)
+
+    Polymarket CLOB API 返回的排序不固定，有时 bids 升序、asks 降序，
+    导致 bids[0]/asks[0] 取到最差价格而非最优价格。
+    所有使用订单簿的代码应先调用此函数。
+    """
+    sorted_bids = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
+    sorted_asks = sorted(asks, key=lambda x: float(x["price"]))
+    return sorted_bids, sorted_asks
+
+
 def get_price_to_beat_browser(slug):
     """从 HTML 提取 Price to Beat"""
     url = f"https://polymarket.com/event/{slug}"

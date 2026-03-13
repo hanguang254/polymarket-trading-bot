@@ -25,6 +25,7 @@ import os
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+from ai_trader.polymarket_api import normalize_orderbook
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -188,8 +189,7 @@ def get_realtime_odds(up_token, down_token):
             resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
             if resp.status_code == 200:
                 book = resp.json()
-                bids = book.get("bids", [])
-                asks = book.get("asks", [])
+                bids, asks = normalize_orderbook(book.get("bids", []), book.get("asks", []))
                 if bids:
                     result[f"{prefix}_bid"] = round(float(bids[0]["price"]), 4)
                 if asks:
@@ -281,7 +281,8 @@ def close_position(token_id, size=5, time_remaining=None):
         try:
             resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
             if resp.status_code == 200:
-                bids = resp.json().get('bids', [])
+                book = resp.json()
+                bids, _ = normalize_orderbook(book.get('bids', []), book.get('asks', []))
                 best_bid = float(bids[0]['price']) if bids else None
             else:
                 best_bid = None

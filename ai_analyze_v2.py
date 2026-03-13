@@ -137,7 +137,30 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         details["overestimated"] = True
         confidence *= 0.85
 
-    # #7: 无效率信号 — 实时 best_ask vs p_win 偏离
+    # #7: 无效率信号 — LMSR理论价 vs CLOB实际价 偏离
+    lmsr_info = None
+    if token_id:
+        try:
+            from ai_trader.lmsr_liquidity import lmsr_fair_price
+            lmsr_info = lmsr_fair_price(token_id)
+        except Exception:
+            pass
+
+    if lmsr_info:
+        lmsr_ineff = lmsr_info["inefficiency"]
+        details["lmsr_fair_price"] = lmsr_info["lmsr_price_up"]
+        details["lmsr_inefficiency"] = lmsr_ineff
+        details["lmsr_b_estimated"] = lmsr_info["lmsr_b"]
+        details["lmsr_theoretical_cost_5"] = lmsr_info["theoretical_cost_5"]
+
+        # LMSR无效率: 理论价 > CLOB价 → 市场低估，是买入机会
+        if lmsr_ineff > 0.05:
+            old_threshold = discount_threshold
+            discount_threshold = max(discount_threshold - 0.02, 0.06)
+            details["lmsr_inefficiency_boost"] = True
+            print(f"  📊 LMSR无效率: fair={lmsr_info['lmsr_price_up']:.3f} vs ask={lmsr_info['clob_best_ask']:.3f} gap={lmsr_ineff:.3f} → 阈值{old_threshold:.3f}→{discount_threshold:.3f}")
+
+    # 原有 p_win vs best_ask 无效率检测（保留兼容）
     if liquidity_info and liquidity_info.get("best_ask"):
         realtime_ask = liquidity_info["best_ask"]
         inefficiency = p_win - realtime_ask
@@ -367,9 +390,11 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
 
     # 1. CLOB best_ask（正常有流动性的市场）
     try:
+        from ai_trader.polymarket_api import normalize_orderbook
         resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
         if resp.status_code == 200:
-            asks = resp.json().get('asks', [])
+            book = resp.json()
+            _, asks = normalize_orderbook(book.get('bids', []), book.get('asks', []))
             if asks:
                 clob_ask = float(asks[0]['price'])
                 if clob_ask < 0.95:  # 正常市场，直接使用

@@ -9,6 +9,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 import requests
+from ai_trader.polymarket_api import normalize_orderbook
 
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
 PROFIT_THRESHOLD = 0.15  # 15% 止盈
@@ -68,8 +69,7 @@ def get_market_price(token_id):
         )
         if resp.status_code == 200:
             data = resp.json()
-            bids = data.get('bids', [])
-            asks = data.get('asks', [])
+            bids, asks = normalize_orderbook(data.get('bids', []), data.get('asks', []))
             best_bid = float(bids[0]['price']) if bids else None
             best_ask = float(asks[0]['price']) if asks else None
             if best_bid and best_ask:
@@ -116,7 +116,7 @@ def get_best_bid(token_id):
         )
         if resp.status_code == 200:
             data = resp.json()
-            bids = data.get('bids', [])
+            bids, _ = normalize_orderbook(data.get('bids', []), data.get('asks', []))
             if bids and len(bids) > 0:
                 best_bid = float(bids[0]['price'])
                 if best_bid > 0.02:  # 正常市场
@@ -141,7 +141,7 @@ def get_best_ask(token_id):
         )
         if resp.status_code == 200:
             data = resp.json()
-            asks = data.get('asks', [])
+            _, asks = normalize_orderbook(data.get('bids', []), data.get('asks', []))
             if asks and len(asks) > 0:
                 ask = float(asks[0]['price'])
                 if ask < 0.95:  # 正常市场
@@ -215,8 +215,9 @@ def analyze_liquidity(token_id, target_size):
         resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
         if resp.status_code != 200:
             return None
-        
-        bids = resp.json().get('bids', [])
+
+        book = resp.json()
+        bids, _ = normalize_orderbook(book.get('bids', []), book.get('asks', []))
         if not bids:
             return None
         
@@ -557,10 +558,10 @@ def should_stop_loss(direction, current_price, ptb_price, elapsed_seconds, initi
 
 def calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price):
     """
-    计算持仓的实时 EV（基于 Trading Desk Exit Protocol）
+    计算理论EV（基于 BTC/ETH vs PTB 的偏离度）
 
-    EV = p_hat_now - entry_price（二元市场简化）
-    p_hat_now 来自 base_rate 查表 + 方向校正
+    仅用于 ATR 信号判断（diff_in_atr），不再作为退出决策的EV。
+    退出决策的EV直接用 token_price - entry_price（市场共识）。
 
     Returns:
         (realtime_ev, p_hat_now, diff_in_atr) or (None, None, None)
@@ -575,10 +576,8 @@ def calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price):
         from ai_trader.base_rate import get_base_rate
         raw_p = get_base_rate(diff_in_atr)
     except Exception:
-        # fallback: 简单线性映射
         raw_p = min(0.50 + diff_in_atr * 0.08, 0.97)
 
-    # 方向是否正确
     price_above_ptb = (diff > 0)
     direction_correct = (
         (direction == "UP" and price_above_ptb) or
@@ -586,7 +585,6 @@ def calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price):
     )
     p_hat_now = raw_p if direction_correct else (1.0 - raw_p)
 
-    # 二元 EV = p_hat - entry_price
     realtime_ev = p_hat_now - entry_price
     return realtime_ev, p_hat_now, diff_in_atr
 
@@ -864,8 +862,8 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    print("🔍 持仓监控 v4 启动（EV驱动 + 时间衰减ATR + 4阶段平仓）...")
-    print("   P0双曲止盈 | EV+ATR联合持有 | 方向错误止损/P1对冲")
+    print("🔍 持仓监控 v5 启动（EV持续监控 + 双曲止盈 + 4阶段平仓）...")
+    print("   Exit Protocol: EV>0不退出 | P0双曲止盈(EV守卫) | 方向错误止损/P1对冲")
     print("   阶段1: 180s | 阶段2: 120s | 阶段3: 60s | 阶段4: 30s")
     
     close_attempts = {}  # (slug, entry_time) -> attempts count
@@ -975,14 +973,20 @@ def monitor():
                     print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%，市场信号矛盾，不再盲目持有")
                     direction_correct = False  # 降级为方向未知，走正常止损流程
 
-                # ═══ P0: 双曲贴现止盈 — 离结算越远，paper profit 越不可靠，要求越高 ═══
+                # ═══ EV 持续监控（Exit Protocol）═══
+                # 二元市场: token_price ≈ 市场隐含胜率 → EV = token_price - entry_price
+                # 这是最直接最准确的EV，不依赖理论模型
+                market_ev = current_price - entry_price if current_price else None
+                ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
+
+                # ═══ P0: 双曲贴现止盈（不被EV阻挡 — 有利润就能卖）═══
                 time_factor = remaining / 60.0
                 profit_threshold = P0_BASE_PROFIT * (1.0 + P0_HYPERBOLIC_K * time_factor)
 
                 if profit_rate >= profit_threshold and remaining > 90:
                     best_bid = get_best_bid(token_id)
                     if best_bid and best_bid > entry_price:
-                        print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
+                        print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | {ev_label_global} | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
                         attempted_close = True
                         success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
                         if success:
@@ -996,25 +1000,23 @@ def monitor():
                 # ═══ 方向正确 → EV + 时间衰减ATR 联合决策 ═══
                 if direction_correct and remaining > 0:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
-                    stage_ev, p_hat, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
-                    ev_str = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
+                    _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
                     atr_str = f"{diff_atr:.1f}ATR" if diff_atr else ""
 
                     # 时间衰减ATR阈值：越接近结算，需要越弱的信号即可持有
-                    # 120s→4.0, 90s→3.0, 60s→2.0, 30s→1.0
                     atr_hold_threshold = 1.0 + max(0, remaining - 30) / 30
 
-                    if stage_ev is not None and stage_ev > 0.03:
-                        # EV 明确正 → 持有
-                        print(f"  💎 方向正确，持有等结算 | {ev_str} {atr_str} | 剩余{remaining:.0f}s")
+                    # 市场EV正（token > entry）→ 持有
+                    if market_ev is not None and market_ev > 0.03:
+                        print(f"  💎 方向正确，持有等结算 | {ev_label_global} {atr_str} | 剩余{remaining:.0f}s")
                         continue
                     elif diff_atr and diff_atr >= atr_hold_threshold:
-                        # EV 不够但 ATR 信号强 → 持有
-                        print(f"  💎 方向正确，ATR强信号持有 | {ev_str} {atr_str}≥{atr_hold_threshold:.1f} | 剩余{remaining:.0f}s")
+                        # token略亏但ATR信号强 → 持有
+                        print(f"  💎 方向正确，ATR强信号持有 | {ev_label_global} {atr_str}≥{atr_hold_threshold:.1f} | 剩余{remaining:.0f}s")
                         continue
 
-                    # EV 不足 + ATR 不够强 → 放行到阶段策略
-                    print(f"  ⚠️ 方向正确但信号不足({ev_str} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
+                    # EV不足 + ATR不够强 → 放行到阶段策略
+                    print(f"  ⚠️ 方向正确但信号不足({ev_label_global} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
 
                 # ═══ 方向错误预阶段止损（>180s，阶段1-2各自处理自己的区间）═══
                 if remaining > 180:
@@ -1076,7 +1078,7 @@ def monitor():
                 if 120 < remaining <= 180:
                     # 方向正确的已被前面 continue 跳过，这里只处理方向错误/未知
                     if not direction_correct:  # 处理 False 和 None（无 PTB 数据时）
-                        print(f"  🔴 阶段1：方向错误，止损")
+                        print(f"  🔴 阶段1：方向错误({ev_label_global})，止损")
                         best_bid = get_best_bid(token_id)
 
                         # bid 极低 → 尝试 P1 对冲（与预阶段同逻辑）
@@ -1113,7 +1115,7 @@ def monitor():
                 # ═══ 阶段2：结束前120-60秒（流动性下降期）═══
                 # 方向正确已被 continue 跳过，这里只处理方向错误/未知
                 elif 60 < remaining <= 120:
-                    print(f"  ⚠️ 阶段2：{'分批挂单' if size > 5 else '挂单确认'}")
+                    print(f"  ⚠️ 阶段2：{ev_label_global} | {'分批挂单' if size > 5 else '挂单确认'}")
 
                     best_bid = get_best_bid(token_id)
                     if not best_bid or best_bid < 0.02:
@@ -1160,21 +1162,12 @@ def monitor():
                 
                 # ═══ 阶段3：结束前60-30秒（流动性枯竭期）═══
                 elif 30 < remaining <= 60:
-                    # EV 定价保护 (P4)：EV > 0 时设最低价，避免恐慌抛售
-                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
-                    stage_ev, _, _ = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
-                    ev_label = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
-                    print(f"  🚨 阶段3：激进平仓 ({ev_label})")
+                    stage_ev = market_ev
+                    ev_label = ev_label_global
 
-                    # EV sanity check：token市场价远低于EV隐含价值 → 覆盖EV
-                    if stage_ev is not None and stage_ev > 0:
-                        token_ltp = get_last_trade_price(token_id)
-                        if token_ltp and token_ltp < entry_price * 0.5:
-                            print(f"  ⚠️ EV={stage_ev:+.3f}但市场价${token_ltp:.3f}已远低于入场${entry_price:.3f}，覆盖EV")
-                            stage_ev = token_ltp - entry_price
-                            ev_label = f"EV={stage_ev:+.3f}(市场校正)"
+                    print(f"  🚨 阶段3：平仓 ({ev_label})")
 
-                    # EV > 0 → 设最低价保护，不用地板价
+                    # EV > 0（token > entry）→ 设最低价保护，不用地板价
                     min_price = None
                     if stage_ev is not None and stage_ev > 0:
                         min_price = max(entry_price * 0.85, 0.15)
@@ -1212,18 +1205,8 @@ def monitor():
                 
                 # ═══ 阶段4：结束前30秒（最后机会）═══
                 elif 0 < remaining <= 30:
-                    # EV 分层策略 (P4)
-                    atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
-                    stage_ev, _, _ = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
-                    ev_label = f"EV={stage_ev:+.3f}" if stage_ev is not None else "EV=N/A"
-
-                    # EV sanity check：token市场价远低于EV隐含价值 → 覆盖EV
-                    if stage_ev is not None and stage_ev > 0:
-                        token_ltp = get_last_trade_price(token_id)
-                        if token_ltp and token_ltp < entry_price * 0.5:
-                            print(f"  ⚠️ EV={stage_ev:+.3f}但市场价${token_ltp:.3f}已远低于入场${entry_price:.3f}，覆盖EV")
-                            stage_ev = token_ltp - entry_price
-                            ev_label = f"EV={stage_ev:+.3f}(市场校正)"
+                    stage_ev = market_ev
+                    ev_label = ev_label_global
 
                     if stage_ev is not None and stage_ev > 0.05:
                         # EV 显著正 → 持有到结算，不卖
