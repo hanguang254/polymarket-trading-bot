@@ -1,14 +1,12 @@
-# Polymarket Trading Bot v4.0
+# Polymarket Trading Bot v6.0
 
-Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses discount arbitrage with EV-driven position management, Base Rate calibration, Bayesian sequential updating, and correlated exposure control.
+Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, LMSR theoretical pricing, market-price stop-loss, and correlated exposure control.
 
 ## Strategy
 
-**Discount Arbitrage + EV-Driven Exit Protocol**
+**EV-Driven Entry + Market-Price Stop-Loss**
 
-The bot does **not** predict market direction. Instead, it detects underpriced tokens via ATR-normalized deviation from PTB (Price-To-Beat), buys at a discount, and exits before settlement to lock arbitrage profit.
-
-**Core insight**: Analysis of 889 trades shows price converges to PTB at close (deviation shrinks 91.7%, 74.5% within 0.01%). Real profit comes from temporary deviation, not direction calls.
+The bot uses Bayesian sequential updating to detect directional signals, enters when EV (p_win - execution_price) is positive with sufficient confidence, and manages positions with full-duration market-price stop-loss.
 
 ### Execution Timeline (300s market)
 
@@ -19,11 +17,13 @@ The bot does **not** predict market direction. Instead, it detects underpriced t
 40s   PTB deadline
 100s  Bet window opens (80s observation data available)
 160s  Bet window closes → Real-time EV monitoring starts
-      ── Stages by time remaining ──
-180s  Stage 1: Healthy liquidity (EV > 0.05 → hold)
-120s  Stage 2: Declining liquidity (batch sell if EV ≤ 0.05)
-60s   Stage 3: Aggressive exit (EV pricing floor protection)
-30s   Stage 4: Last chance (EV > 0.05 → hold to settlement)
+      ── Exit Protocol ──
+>30s  Universal stop-loss: direction wrong → market-price ladder sell
+>30s  P1 hedge: bid < $0.05 → buy opposite token for $1 pair
+>90s  P0 take-profit: hyperbolic discounting threshold
+120s  Stage 2: Weak signal exit (batch sell)
+60s   Stage 3: Aggressive exit (EV floor protection)
+30s   Stage 4: EV ≥ 0 → hold to settlement, EV < 0 → floor prices
 0s    Market ends → Settlement
 ```
 
@@ -58,14 +58,16 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
 - **EV-Driven Diamond Hands**: Direction correct + ≤120s remaining → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥1.0) → hold to settlement. Weak EV (0~0.03) → releases to Stage 3/4 fine-grained EV strategy instead of blindly holding.
 - **Direction-Based Exit**: Uses crypto price vs PTB to determine win/loss (not token orderbook price, which can be misleading due to wide bid-ask spreads near settlement).
-  - Direction correct → **EV-driven hold** (high EV → collect $1.00, weak EV → fine-grained exit)
-  - Direction wrong → Progressive stop-loss with price escalation
+  - Direction correct + EV > 0.03 or strong ATR → **hold to settlement** ($1.00)
+  - Direction correct but weak signal → releases to stage exit strategy
+  - Direction wrong → **Universal market-price stop-loss** (bid→95%→90%→80%→$0.05→$0.01, ~6s to clear)
   - No buyers (bid < $0.05) → Attempt hedge (P1), fall back to wait for expiry
+  - Safety: direction correct but token drops >10% → downgrade to "unknown", trigger stop-loss
 - **Wide Spread Protection**: `get_market_price()` detects bid-ask spread > 50% and falls back to midpoint API → `last-trade-price` → single-side price, preventing false loss signals.
 - **Empty Book Fallback (Monitor)**: `get_best_bid()` / `get_best_ask()` fall back to `last-trade-price ± SLIPPAGE` when CLOB is empty (bid ≤ 0.02 or ask ≥ 0.95). Enables hedge and stop-loss decisions with real market prices instead of $0.01/$0.99.
 - **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
-- **4-Stage Graduated Exit**: For losing positions — Stage 1 (180-120s) with P1 hedge support, Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) floor prices.
+- **3-Stage Graduated Exit**: For remaining edge cases — Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) EV≥0 hold / EV<0 floor prices.
 - **Accurate Settlement**: Expiry cleanup uses crypto price vs PTB to determine $1.00/$0.00, not unreliable token price.
 
 ### Infrastructure
@@ -99,24 +101,23 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 
 ## Betting Conditions
 
-All must be met:
+All must be met (all configurable via `.env`):
 
-| Condition | Threshold | Source |
-|-----------|-----------|--------|
-| Discount | ≥ dynamic (8-20%) | LMSR liquidity score |
-| EV | > 0.03 (3%) | `p_win - target_odds` |
-| Odds | < MAX_BUY_PRICE (default 0.92) | Don't buy overpriced tokens |
-| Confidence | ≥ 65% | Bayesian-fused momentum |
-| Base Rate | Checked | < 0.55 → Kelly halved |
-| Correlation | Checked | Same-direction → Kelly halved |
+| Condition | Threshold | Env Key | Source |
+|-----------|-----------|---------|--------|
+| EV | > 0.03 (3%) | `MIN_EV` | `p_win - exec_price` |
+| Confidence | ≥ 60% | `MIN_CONFIDENCE` | Bayesian-fused momentum |
+| Odds | < 0.92 | `MAX_BUY_PRICE` | Don't buy overpriced tokens |
+| Base Rate | Checked | — | < 0.55 → Kelly halved |
+| Correlation | Checked | — | Same-direction → Kelly halved |
 
 ## Risk Controls
 
 ```
 Layer 1 — Entry Filters
-  ├─ Dynamic discount threshold (LMSR: 8%-20%)
-  ├─ Strict binary EV > 3%
-  ├─ Odds < MAX_BUY_PRICE (default 0.92), Confidence ≥ 65%
+  ├─ EV > MIN_EV (default 3%, env configurable)
+  ├─ Confidence ≥ MIN_CONFIDENCE (default 60%, env configurable)
+  ├─ Odds < MAX_BUY_PRICE (default 0.92, env configurable)
   ├─ Base Rate calibration (weak edge → Kelly halved)
   ├─ P2: Exit liquidity gate (bid_depth < 5 → skip entry)
   └─ Empty book override (Gamma EV pass → bet with calibrated price)
@@ -132,10 +133,10 @@ Layer 2 — Position Sizing
 Layer 3 — Position Management
   ├─ P0: Hyperbolic discounting profit-take (dynamic threshold, configurable)
   ├─ P1: Opposite token hedge (bid < $0.05 → buy opposite for $1 pair)
-  ├─ Direction-based exit (correct → hold, wrong → stop-loss)
+  ├─ Universal stop-loss (direction wrong → market-price ladder, full duration >30s)
   ├─ Wide spread detection (prevents false loss signals)
   ├─ Post-close safety (no trades after market ends)
-  ├─ 4-stage graduated closing (losing positions only)
+  ├─ 3-stage graduated closing (Stage 2/3/4 for remaining edge cases)
   └─ Accurate settlement ($1/$0 from crypto price vs PTB)
 
 Layer 4 — System Protection
@@ -207,6 +208,8 @@ See `.env.example` for all configurable parameters:
 | `MAX_OPEN_POSITIONS` | No | Max concurrent positions (default: 2) |
 | `MIN_BALANCE` | No | Min balance to place bets (default: 5) |
 | `MAX_BUY_PRICE` | No | Max buy price for entry (default: 0.92) |
+| `MIN_EV` | No | Min EV to place bet (default: 0.03) |
+| `MIN_CONFIDENCE` | No | Min confidence to place bet (default: 0.60) |
 | `SLIPPAGE` | No | Empty book fallback slippage for last-trade-price ± (default: 0.01) |
 | `P0_BASE_PROFIT` | No | P0 take-profit base threshold (default: 0.15) |
 | `P0_HYPERBOLIC_K` | No | Hyperbolic discounting coefficient (default: 0.15) |
@@ -262,6 +265,7 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 
 ## Version History
 
+- **v6.0**: Full-duration stop-loss + EV-only entry — Stop-loss covers entire market duration (>30s) instead of stage-limited windows. Market-price ladder sell (bid→95%→90%→80%→$0.05→$0.01, ~6s). Removed discount condition from entry (was blocking almost all bets due to conservative estimated_value ≈ 0.51). Entry now uses 3 conditions: EV > MIN_EV, confidence ≥ MIN_CONFIDENCE, odds < MAX_BUY_PRICE (all env configurable). Consolidated duplicated P1 hedge code into single universal block. New `get_best_bid_raw()` for stop-loss (no discount, no slippage deduction).
 - **v4.0**: Empty book resilience — Entry: CLOB C1 calibration (best_ask校准防虚假折价) + empty book override (Gamma EV二次放行, 校准价下单). Exit: `get_best_bid/ask/market_price` fall back to `last-trade-price ± SLIPPAGE` when orderbook empty. Stage 3/4 EV sanity check (market price halved → override fake positive EV). New env: `MAX_BUY_PRICE`, `SLIPPAGE`. Fixes BTC DOWN $0.21→$0.01→$0.00 全程无止损 case.
 - **v3.9**: EV-driven diamond hands — direction correct + ≤120s no longer blindly holds; calculates real-time EV (base_rate lookup) and releases weak signals (EV 0~0.03) to Stage 3/4 fine-grained exit. P1 hedge extended to Stage 1 (120-180s) — bid < $0.05 now triggers opposite token hedge instead of doing nothing. Direction-correct hold blocks (>60s) now log EV/ATR for signal quality observation. Removed dead EV computation in Stage 1 entry.
 - **v3.8**: Document-inspired enhancements — #7: LMSR inefficiency signal (realtime best_ask vs p_win mispricing → lower entry threshold). #1: Hyperbolic discounting profit-take (dynamic threshold scales with time to settlement, configurable via env). #6: Adaptive Bayesian sampling (3s near bet window). #4: Base Rate validation script (`scripts/validate_base_rate.py`).
