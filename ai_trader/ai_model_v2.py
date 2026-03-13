@@ -199,8 +199,8 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
     # EV = 折价空间 / 买入价（预期收益率）
     if leading_odds > 0:
         ev = discount / leading_odds
-        details["expected_value"] = round(ev, 3)
-        details["ev_positive"] = ev > 0
+        details["discount_ratio"] = round(ev, 3)
+        details["discount_ratio_positive"] = ev > 0
         details["target_odds"] = leading_odds
     else:
         details["expected_value"] = 0

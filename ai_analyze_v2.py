@@ -54,6 +54,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     if not direction:
         return False, None, 0, details
 
+    # Bug 7 fix: 方向确定后选择正确的 token_id 做 LMSR 评估
+    if extra_info and direction:
+        if direction == "UP" and extra_info.get("up_token"):
+            extra_info["token_id"] = extra_info["up_token"]
+        elif direction == "DOWN" and extra_info.get("down_token"):
+            extra_info["token_id"] = extra_info["down_token"]
+
     # ── 下注条件（v2.1 折价套利策略） ──
     # 核心：折价空间足够大，提前平仓能锁利
     # 1. 折价 >= 12%（保守阈值，回测验证27.3%下注率）
@@ -121,6 +128,8 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         details["bayesian_p_hat"] = round(b_p_hat, 4)
         details["bayesian_confidence"] = round(bayesian_conf, 4)
         details["bayesian_direction"] = bayesian_dir
+
+    p_win = min(p_win, 0.82)  # P1: 防止贝叶斯累积推高 p_win
 
     # 交叉验证：estimated_value 比 p_win 高 0.15+ → 高估警告
     estimated_value = details.get("estimated_value", 0.5)

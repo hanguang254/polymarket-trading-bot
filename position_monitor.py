@@ -331,6 +331,17 @@ def close_position(position, exit_price):
     except Exception:
         pass
 
+    # Bug 5 fix: 用真实 PnL 更新 trading_state
+    try:
+        from trading_state import record_bet_result
+        entry = position.get("entry_price", 0)
+        size = position.get("size", 0)
+        pnl = (exit_price - entry) * size if entry > 0 else 0.0
+        won = exit_price > entry if entry > 0 else False
+        record_bet_result(won, position.get("slug", "unknown"), pnl=pnl)
+    except Exception:
+        pass
+
 def update_position(position, new_size=None, partial_exit=None):
     """更新持仓（如分批卖出后的剩余仓位）"""
     updated = False

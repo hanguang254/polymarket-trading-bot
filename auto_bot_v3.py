@@ -176,21 +176,23 @@ def get_token_ids(slug):
 
 
 def get_realtime_odds(up_token, down_token):
-    """从 CLOB 订单簿获取实时 midpoint 赔率（比 Gamma API 更及时）"""
-    up_mid, down_mid = None, None
+    """从 CLOB 订单簿获取 best_ask 赔率（与 execute_bet 同一价格源）"""
+    up_ask, down_ask = None, None
     for token_id, label in [(up_token, "UP"), (down_token, "DOWN")]:
         try:
-            resp = requests.get(f"https://clob.polymarket.com/midpoint?token_id={token_id}", timeout=3)
+            resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
             if resp.status_code == 200:
-                mid = float(resp.json().get("mid", 0))
-                if mid > 0:
-                    if label == "UP":
-                        up_mid = round(mid, 4)
-                    else:
-                        down_mid = round(mid, 4)
+                asks = resp.json().get("asks", [])
+                if asks:
+                    ask = float(asks[0]["price"])
+                    if ask > 0:
+                        if label == "UP":
+                            up_ask = round(ask, 4)
+                        else:
+                            down_ask = round(ask, 4)
         except Exception:
             pass
-    return up_mid, down_mid
+    return up_ask, down_ask
 
 
 def send_notification(coin, direction, confidence, ev, price, size):
@@ -662,7 +664,7 @@ class MarketTracker:
             )
             self.positions[slug] = position
 
-            record_bet_result(True, slug)
+            # 真实盈亏在 position_monitor close_position 时记录
 
             # 发送通知
             send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
