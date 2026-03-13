@@ -434,43 +434,26 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 余额不足: ${balance:.2f} < ${MIN_BALANCE:.2f}，跳过下注")
         return False, 0, 0, "SKIP_NO_BALANCE"
 
-    # 获取买入价：优先级 CLOB best_ask → last-trade-price → midpoint
+    # 获取买入价：优先级 last-trade-price+滑点 → midpoint+滑点
+    # 用最近成交价+滑点作为限价上限，确保立即吃单成交（实际按卖方最低价撮合）
     import requests
     SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))
     price = None
     price_source = "unknown"
 
-    # 1. CLOB best_ask（正常有流动性的市场）
+    # 1. last-trade-price + 滑点（最可靠的市场价信号）
     try:
-        from ai_trader.polymarket_api import normalize_orderbook
-        resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
+        resp = requests.get(f"https://clob.polymarket.com/last-trade-price?token_id={token_id}", timeout=5)
         if resp.status_code == 200:
-            book = resp.json()
-            _, asks = normalize_orderbook(book.get('bids', []), book.get('asks', []))
-            if asks:
-                clob_ask = float(asks[0]['price'])
-                if clob_ask < 0.95:  # 正常市场，直接使用
-                    price = clob_ask
-                    price_source = "clob_ask"
-                else:
-                    print(f"  📡 CLOB空簿 best_ask=${clob_ask:.2f}≥0.95，尝试last-trade-price")
+            last_price = float(resp.json().get('price', 0))
+            if 0.01 < last_price < 0.99:
+                price = min(round(last_price + SLIPPAGE, 2), 0.99)
+                price_source = "last_trade"
+                print(f"  📡 last-trade: ${last_price:.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
     except:
         pass
 
-    # 2. last-trade-price（空簿时的真实市场价）
-    if price is None:
-        try:
-            resp = requests.get(f"https://clob.polymarket.com/last-trade-price?token_id={token_id}", timeout=5)
-            if resp.status_code == 200:
-                last_price = float(resp.json().get('price', 0))
-                if 0.01 < last_price < 0.99:
-                    price = min(round(last_price + SLIPPAGE, 2), 0.99)
-                    price_source = "last_trade"
-                    print(f"  📡 CLOB空簿，使用last-trade-price: ${last_price:.2f} → 限价${price:.2f}")
-        except:
-            pass
-
-    # 3. midpoint 回退
+    # 2. midpoint 回退
     if price is None:
         try:
             resp = requests.get(f"https://clob.polymarket.com/midpoint?token_id={token_id}", timeout=5)
@@ -479,13 +462,13 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                 if 0.01 < mid < 0.99:
                     price = min(round(mid + SLIPPAGE, 2), 0.99)
                     price_source = "midpoint"
-                    print(f"  📡 使用midpoint: ${mid:.2f} → 限价${price:.2f}")
+                    print(f"  📡 midpoint回退: ${mid:.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
         except:
             pass
 
     # 安全检查：全部失败
     if price is None:
-        print(f"  ⚠️ 无法获取真实价格（订单簿+last-trade+midpoint均失败），跳过下注")
+        print(f"  ⚠️ 无法获取真实价格（last-trade+midpoint均失败），跳过下注")
         return False, 0, 0, "SKIP_NO_PRICE"
 
     # 价格四舍五入到2位小数（Polymarket要求）
