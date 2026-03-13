@@ -107,6 +107,30 @@ def get_market_price(token_id):
         return best_ask
     return None
 
+def get_best_bid_raw(token_id):
+    """获取原始最佳买价（止损专用，不打折扣，追求最快成交）"""
+    try:
+        resp = requests.get(
+            f"https://clob.polymarket.com/book?token_id={token_id}",
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            bids, _ = normalize_orderbook(data.get('bids', []), data.get('asks', []))
+            if bids and len(bids) > 0:
+                best_bid = float(bids[0]['price'])
+                if best_bid > 0.02:
+                    return best_bid
+    except:
+        pass
+    # 回退：last-trade-price（不减SLIPPAGE，止损不留余地）
+    ltp = get_last_trade_price(token_id)
+    if ltp:
+        print(f"    📡 get_best_bid_raw空簿回退: last_trade=${ltp:.3f}")
+        return ltp
+    return None
+
+
 def get_best_bid(token_id):
     """获取最佳买价（用于卖出）- 从订单簿获取，空簿回退last-trade-price"""
     try:
@@ -862,9 +886,9 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    print("🔍 持仓监控 v5 启动（EV持续监控 + 双曲止盈 + 4阶段平仓）...")
-    print("   Exit Protocol: EV>0不退出 | P0双曲止盈(EV守卫) | 方向错误止损/P1对冲")
-    print("   阶段1: 180s | 阶段2: 120s | 阶段3: 60s | 阶段4: 30s")
+    print("🔍 持仓监控 v6 启动（全程止损 + EV持续监控 + 双曲止盈 + 3阶段平仓）...")
+    print("   Exit Protocol: 全程方向错误止损/P1对冲 | P0双曲止盈 | EV+ATR持有")
+    print("   全程止损: >30s | 阶段2: 120-60s | 阶段3: 60-30s | 阶段4: 30-0s")
     
     close_attempts = {}  # (slug, entry_time) -> attempts count
     
@@ -1018,21 +1042,21 @@ def monitor():
                     # EV不足 + ATR不够强 → 放行到阶段策略
                     print(f"  ⚠️ 方向正确但信号不足({ev_label_global} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
 
-                # ═══ 方向错误预阶段止损（>180s，阶段1-2各自处理自己的区间）═══
-                if remaining > 180:
-                    # 方向错误或未知 → 止损
-                    # 用 close_attempts 递增来逐步降价，避免同一价格反复失败
+                # ═══ 全程方向错误止损（remaining > 0，不限阶段）═══
+                # 方向正确的已被前面 direction_correct + EV/ATR continue 跳过
+                # 到这里说明：方向错误 / 方向未知 / 方向正确但信号不足
+                if not direction_correct and remaining > 30:
                     attempts = close_attempts.get(attempt_key, 0)
-                    best_bid = get_best_bid(token_id)
+                    # 止损用原始best_bid，不打折扣，追求最快成交
+                    best_bid = get_best_bid_raw(token_id)
 
-                    # 输的 token best_bid 极低（<$0.05）→ 没有买方，尝试P1对冲
+                    # bid 极低（<$0.05）→ 没有买方，尝试P1对冲
                     if best_bid and best_bid < 0.05:
                         opposite_token = pos.get("opposite_token_id")
                         if opposite_token:
                             opposite_ask = get_best_ask(opposite_token)
-                            # 对冲条件：opposite_ask < (1.00 - entry_price - 0.02)，即净利润>$0.02
                             if opposite_ask and opposite_ask < (1.00 - entry_price - 0.02):
-                                print(f"  🔄 P1对冲: bid=${best_bid:.3f}<$0.05 | 买反向token @ ${opposite_ask:.3f} | 净成本=${entry_price+opposite_ask:.3f}")
+                                print(f"  🔄 P1对冲: bid=${best_bid:.3f}<$0.05 | 买反向token @ ${opposite_ask:.3f} | 净成本=${entry_price+opposite_ask:.3f} | 剩余{remaining:.0f}s")
                                 h_success, h_output, h_actual = buy_opposite_token(opposite_token, size, opposite_ask)
                                 if h_success:
                                     hedge_price = h_actual or opposite_ask
@@ -1044,28 +1068,39 @@ def monitor():
                                     sold = True
                                     continue
                                 else:
-                                    print(f"  ❌ 对冲下单失败，等过期结算")
+                                    print(f"  ❌ 对冲下单失败，等下轮重试")
                             else:
                                 ask_str = f"${opposite_ask:.3f}" if opposite_ask else "N/A"
-                                print(f"  🔴 对冲不划算: ask={ask_str} ≥ ${1.00 - entry_price - 0.02:.3f}，等过期结算 | 剩余{remaining:.0f}s")
+                                if attempts == 0:
+                                    print(f"  🔴 对冲不划算: ask={ask_str} ≥ ${1.00 - entry_price - 0.02:.3f}，等过期结算 | 剩余{remaining:.0f}s")
                         else:
                             if attempts == 0:
                                 print(f"  🔴 方向错误但无买方(bid=${best_bid:.3f})且无对冲token，等过期结算 | 剩余{remaining:.0f}s")
+                        close_attempts[attempt_key] = attempts + 1
                         continue
 
+                    # 市价止损：直接用best_bid，失败立即阶梯降价，不试探
                     if best_bid and best_bid > 0.01:
-                        # 渐进降价：每5次尝试降一档
-                        discount = 1.0 - min(attempts // 5 * 0.02, 0.10)  # 最多降10%
-                        sell_price = round(best_bid * discount, 2)
-                        print(f"  🛑 方向错误止损: bid=${best_bid:.3f} 折扣{discount:.0%} → ${sell_price:.3f} | 尝试#{attempts+1}")
+                        stop_prices = [
+                            best_bid,              # 第1次：市价
+                            best_bid * 0.95,       # 第2次：降5%
+                            best_bid * 0.90,       # 第3次：降10%
+                            best_bid * 0.80,       # 第4次：降20%
+                            0.05,                  # 第5次：地板价
+                            0.01,                  # 第6次：最低价
+                        ]
+                        print(f"  🛑 方向错误止损(市价): bid=${best_bid:.3f} | 剩余{remaining:.0f}s")
                         attempted_close = True
-                        success, output, actual_price = sell_position(token_id, size, sell_price, max_retries=2)
-                        if success:
-                            sold = True
-                            sold_price = actual_price or sell_price
-                            self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
+                        for sp in stop_prices:
+                            sp = max(round(sp, 2), 0.01)
+                            success, output, actual_price = sell_position(token_id, size, sp, max_retries=1)
+                            if success:
+                                sold = True
+                                sold_price = actual_price or sp
+                                self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
+                                break
+                            time.sleep(1)
                     else:
-                        # 无有效 bid
                         if attempts == 0:
                             print(f"  🔴 方向错误但无有效bid，等过期结算 | 剩余{remaining:.0f}s")
 
@@ -1073,48 +1108,12 @@ def monitor():
                         close_position(pos, sold_price)
                         close_attempts.pop(attempt_key, None)
                         continue
-                
-                # ═══ 阶段1：结束前180-120秒（流动性健康期）═══
-                if 120 < remaining <= 180:
-                    # 方向正确的已被前面 continue 跳过，这里只处理方向错误/未知
-                    if not direction_correct:  # 处理 False 和 None（无 PTB 数据时）
-                        print(f"  🔴 阶段1：方向错误({ev_label_global})，止损")
-                        best_bid = get_best_bid(token_id)
-
-                        # bid 极低 → 尝试 P1 对冲（与预阶段同逻辑）
-                        if best_bid is not None and best_bid < 0.05:
-                            opposite_token = pos.get("opposite_token_id")
-                            if opposite_token:
-                                opposite_ask = get_best_ask(opposite_token)
-                                if opposite_ask and opposite_ask < (1.00 - entry_price - 0.02):
-                                    print(f"  🔄 阶段1-P1对冲: bid=${best_bid:.3f}<$0.05 | 买反向 @ ${opposite_ask:.3f}")
-                                    h_success, h_output, h_actual = buy_opposite_token(opposite_token, size, opposite_ask)
-                                    if h_success:
-                                        hedge_price = h_actual or opposite_ask
-                                        net_settle = 1.00 - entry_price - hedge_price
-                                        print(f"  ✅ 对冲成功！净利${net_settle:.3f}")
-                                        self_notify(pos, entry_price + net_settle, coin, direction, size, "阶段1-P1对冲")
-                                        close_position(pos, entry_price + net_settle)
-                                        close_attempts.pop(attempt_key, None)
-                                        sold = True
-                                        continue
-                                    else:
-                                        print(f"  ❌ 阶段1对冲失败，等下轮重试")
-                                else:
-                                    ask_str = f"${opposite_ask:.3f}" if opposite_ask else "N/A"
-                                    print(f"  🔴 阶段1对冲不划算: ask={ask_str}，等过期结算 | 剩余{remaining:.0f}s")
-
-                        elif best_bid and best_bid > 0.05:
-                            attempted_close = True
-                            success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
-                            if success:
-                                sold = True
-                                sold_price = actual_price or best_bid
-                                self_notify(pos, sold_price, coin, direction, size, "阶段1止损")
+                    else:
+                        close_attempts[attempt_key] = attempts + 1
                 
                 # ═══ 阶段2：结束前120-60秒（流动性下降期）═══
-                # 方向正确已被 continue 跳过，这里只处理方向错误/未知
-                elif 60 < remaining <= 120:
+                # 方向错误已被全程止损处理，这里处理信号不足的情况
+                if 60 < remaining <= 120:
                     print(f"  ⚠️ 阶段2：{ev_label_global} | {'分批挂单' if size > 5 else '挂单确认'}")
 
                     best_bid = get_best_bid(token_id)
@@ -1161,7 +1160,7 @@ def monitor():
                                 continue
                 
                 # ═══ 阶段3：结束前60-30秒（流动性枯竭期）═══
-                elif 30 < remaining <= 60:
+                if not sold and 30 < remaining <= 60:
                     stage_ev = market_ev
                     ev_label = ev_label_global
 
@@ -1204,7 +1203,7 @@ def monitor():
                                 self_notify(pos, sold_price, coin, direction, size, "阶段3激进平仓")
                 
                 # ═══ 阶段4：结束前30秒（最后机会）═══
-                elif 0 < remaining <= 30:
+                if not sold and 0 < remaining <= 30:
                     stage_ev = market_ev
                     ev_label = ev_label_global
 
