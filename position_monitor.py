@@ -581,6 +581,47 @@ def check_market_closed(slug):
         pass
     return False
 
+def get_market_outcome(slug, direction):
+    """从Gamma API获取真实结算结果（不依赖延迟后的Binance价格）
+    返回: settle_price (1.00=赢, 0.00=输, None=未结算/查询失败)
+    """
+    try:
+        resp = requests.get(
+            f"https://gamma-api.polymarket.com/events?slug={slug}",
+            timeout=5
+        )
+        if resp.status_code == 200:
+            events = resp.json()
+            if isinstance(events, list) and len(events) > 0:
+                event = events[0]
+                if isinstance(event, dict):
+                    markets = event.get("markets")
+                    if isinstance(markets, list) and len(markets) > 0:
+                        market = markets[0]
+                        if isinstance(market, dict) and market.get("closed"):
+                            # 方法1: outcome 字段 ("Up" / "Down")
+                            outcome = market.get("outcome", "")
+                            if outcome:
+                                won = (direction == "UP" and outcome.lower() == "up") or \
+                                      (direction == "DOWN" and outcome.lower() == "down")
+                                return 1.00 if won else 0.00
+                            # 方法2: outcome_prices "[1, 0]" 或 "[0, 1]"
+                            op = market.get("outcome_prices", "")
+                            if op:
+                                try:
+                                    prices = json.loads(op) if isinstance(op, str) else op
+                                    if isinstance(prices, list) and len(prices) >= 2:
+                                        up_price = float(prices[0])
+                                        if up_price > 0.5:
+                                            return 1.00 if direction == "UP" else 0.00
+                                        else:
+                                            return 1.00 if direction == "DOWN" else 0.00
+                                except (ValueError, TypeError):
+                                    pass
+    except:
+        pass
+    return None
+
 def get_current_crypto_price(coin):
     """获取BTC/ETH当前实时价格"""
     try:
@@ -1044,14 +1085,18 @@ def monitor():
                 # 市场已关闭（remaining <= 0）→ 只做结算/清理
                 if remaining <= 0:
                     if remaining < -30:
-                        # 自动清理：市场结束超过30秒的持仓标记关闭
-                        ptb = pos.get("ptb") or pos.get("price_to_beat")
-                        crypto = get_current_crypto_price(coin)
-                        if ptb and crypto:
-                            won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
-                            settle_price = 1.00 if won else 0.00
-                        else:
-                            settle_price = current_price if current_price else entry_price
+                        # 自动清理：优先用API查真实结算结果
+                        settle_price = get_market_outcome(slug, direction)
+                        if settle_price is None:
+                            # API无结果，回退Binance价格（可能不准）
+                            ptb = pos.get("ptb") or pos.get("price_to_beat")
+                            crypto = get_current_crypto_price(coin)
+                            if ptb and crypto:
+                                won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
+                                settle_price = 1.00 if won else 0.00
+                                print(f"  ⚠️ API无outcome，用Binance回退判断(可能不准)")
+                            else:
+                                settle_price = current_price if current_price else entry_price
                         close_position(pos, settle_price)
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
                         print(f"  {result_emoji} 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
@@ -1063,14 +1108,17 @@ def monitor():
                         print(f"  ⏳ {slug} 已关闭，等待结算 | 过期{-remaining:.0f}s")
 
                     if check_market_closed(slug):
-                        # 用加密货币价格判断真实结算结果
-                        ptb = pos.get("ptb") or pos.get("price_to_beat")
-                        crypto = get_current_crypto_price(coin)
-                        if ptb and crypto:
-                            won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
-                            settle_price = 1.00 if won else 0.00
-                        else:
-                            settle_price = current_price if current_price else entry_price
+                        # 优先用API查真实结算结果
+                        settle_price = get_market_outcome(slug, direction)
+                        if settle_price is None:
+                            ptb = pos.get("ptb") or pos.get("price_to_beat")
+                            crypto = get_current_crypto_price(coin)
+                            if ptb and crypto:
+                                won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
+                                settle_price = 1.00 if won else 0.00
+                                print(f"  ⚠️ API无outcome，用Binance回退判断(可能不准)")
+                            else:
+                                settle_price = current_price if current_price else entry_price
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
                         print(f"  {result_emoji} {slug} 已关闭 结算价=${settle_price:.2f}")
                         close_position(pos, settle_price)
