@@ -5,6 +5,7 @@
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -62,6 +63,10 @@ P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", "0.15"))      # 基础�
 P0_HYPERBOLIC_K = float(os.environ.get("P0_HYPERBOLIC_K", "0.15"))    # 双曲贴现系数
 
 # Telegram 通知配置
+# Normalize thresholds to keep P0 base consistent with PROFIT_THRESHOLD.
+PROFIT_THRESHOLD = float(os.environ.get("PROFIT_THRESHOLD", str(PROFIT_THRESHOLD)))
+P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", str(PROFIT_THRESHOLD)))
+
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -596,6 +601,38 @@ def get_market_end_time(slug):
         pass
     return None
 
+def _coerce_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else None
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return None
+        if v.isdigit():
+            return int(v)
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except Exception:
+            return None
+    return None
+
+def resolve_market_end_time(slug, entry_time=None, position=None, market_seconds=300):
+    end_timestamp = get_market_end_time(slug)
+    if end_timestamp:
+        return end_timestamp
+    if isinstance(position, dict):
+        for key in ("end_timestamp", "end_time", "market_end", "settle_time"):
+            ts = _coerce_timestamp(position.get(key))
+            if ts:
+                return ts
+    ts = _coerce_timestamp(entry_time)
+    if ts:
+        return ts + market_seconds
+    return None
+
 def check_market_closed(slug):
     """检查市场是否已关闭"""
     try:
@@ -744,6 +781,13 @@ def update_realtime_confidence(initial_confidence, direction, crypto_price, ptb_
             # 价格在PTB之上，方向错误 → 降低置信度
             penalty = min(diff_in_atr * 0.12, 0.5)
             return max(initial_confidence - penalty, 0.1)
+
+def compute_p0_profit_threshold(remaining_seconds, base_profit, hyperbolic_k):
+    time_factor = remaining_seconds / 60.0
+    return base_profit * (1.0 + hyperbolic_k * time_factor)
+
+def should_attempt_stop_loss(direction_correct):
+    return direction_correct is False
 
 def should_stop_loss(direction, current_price, ptb_price, elapsed_seconds, initial_confidence=0.85, atr_val=None):
     """判断是否应该提前止损（升级版：基于实时置信度）"""
@@ -982,6 +1026,63 @@ def cancel_all_orders(token_id):
     except:
         return False
 
+def _looks_like_token_balance_listing(output):
+    if not output:
+        return False
+    lower = output.lower()
+    return "balance" in lower and ("token" in lower or "token_id" in lower or "tokenid" in lower)
+
+def _parse_token_balance_from_output(output, token_id):
+    if not output:
+        return None
+
+    def _coerce(value):
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _extract_from_obj(obj):
+        if isinstance(obj, dict):
+            for key in ("token_id", "tokenId", "id"):
+                if obj.get(key) == token_id:
+                    for bal_key in ("balance", "amount", "size", "quantity", "qty"):
+                        if bal_key in obj:
+                            return _coerce(obj[bal_key])
+            if token_id in obj:
+                return _coerce(obj[token_id])
+            for container_key in ("balances", "tokens", "data", "results"):
+                if container_key in obj:
+                    found = _extract_from_obj(obj[container_key])
+                    if found is not None:
+                        return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _extract_from_obj(item)
+                if found is not None:
+                    return found
+        return None
+
+    try:
+        data = json.loads(output)
+        found = _extract_from_obj(data)
+        if found is not None:
+            return found
+    except Exception:
+        pass
+
+    for line in output.splitlines():
+        if token_id not in line:
+            continue
+        m = re.search(r"(balance|amount|size|qty)\s*[:=]\s*([0-9]*\.?[0-9]+)", line, re.IGNORECASE)
+        if m:
+            return _coerce(m.group(2))
+        after = line.split(token_id, 1)[1]
+        m = re.search(r"([0-9]*\.?[0-9]+)", after)
+        if m:
+            return _coerce(m.group(1))
+    return None
+
 def check_balance_changed(token_id, expected_size):
     """通过查询token余额判断是否成交（余额减少=卖出成功）"""
     try:
@@ -989,7 +1090,13 @@ def check_balance_changed(token_id, expected_size):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             # 解析余额输出，检查token是否还在
-            return token_id not in result.stdout
+            output = result.stdout or ""
+            balance = _parse_token_balance_from_output(output, token_id)
+            if balance is not None:
+                threshold = max(0.01, expected_size * 0.01)
+                return balance <= threshold
+            if _looks_like_token_balance_listing(output) and token_id not in output:
+                return True
     except:
         pass
     return False
@@ -1083,6 +1190,7 @@ def monitor():
     print("   容忍窗口: <30s/1ATR, <60s/0.7ATR, <90s/0.5ATR | 阶段2: 120-60s | 阶段3: 60-30s | 阶段4: 30-0s")
     
     close_attempts = {}  # (slug, entry_time) -> attempts count
+    stop_loss_attempts = {}  # (slug, entry_time) -> stop loss attempts
     
     while True:
         try:
@@ -1091,6 +1199,10 @@ def monitor():
             if not positions:
                 time.sleep(3)
                 continue
+
+            open_keys = {(p.get("slug", "unknown"), p.get("entry_time", "")) for p in positions}
+            close_attempts = {k: v for k, v in close_attempts.items() if k in open_keys}
+            stop_loss_attempts = {k: v for k, v in stop_loss_attempts.items() if k in open_keys}
             
             for pos in positions:
                 token_id = pos["token_id"]
@@ -1110,7 +1222,7 @@ def monitor():
                 profit_rate = (current_price - entry_price) / entry_price if entry_price > 0 else 0
                 
                 # 获取市场剩余时间
-                end_timestamp = get_market_end_time(slug)
+                end_timestamp = resolve_market_end_time(slug, entry_time, pos)
                 if not end_timestamp:
                     continue
                 
@@ -1137,6 +1249,7 @@ def monitor():
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
                         print(f"  {result_emoji} 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
                         close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
                         continue
 
                     # -30s ~ 0s：等待结算并检查市场关闭
@@ -1159,6 +1272,7 @@ def monitor():
                         print(f"  {result_emoji} {slug} 已关闭 结算价=${settle_price:.2f}")
                         close_position(pos, settle_price)
                         close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
                     continue
                 
                 # PTB 在下注时已记录，直接从持仓数据读取
@@ -1188,6 +1302,8 @@ def monitor():
                 sold = False
                 sold_price = 0
                 attempted_close = False
+                attempted_stop_loss = False
+                stop_loss_attempt_recorded = False
 
                 # ═══ 安全检查：token 价格与方向判断矛盾时，信任市场 ═══
                 # 场景：direction_correct=True（Binance价格 vs PTB），但 token 价格暴跌
@@ -1207,15 +1323,14 @@ def monitor():
                 ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
 
                 # ═══ P0: 双曲贴现止盈（不被EV阻挡 — 有利润就能卖）═══
-                time_factor = remaining / 60.0
-                profit_threshold = P0_BASE_PROFIT * (1.0 + P0_HYPERBOLIC_K * time_factor)
+                profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K)
 
                 if profit_rate >= profit_threshold and remaining > 30:
                     # 以入场价挂卖单：CLOB按最高bid撮合，天然保护利润
                     # price=entry_price → 任何 bid > entry 都能成交，bid < entry 不成交
                     sell_price_p0 = round(entry_price, 2)
                     print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | {ev_label_global} | 挂卖${sell_price_p0:.2f}(入场价) | 剩余{remaining:.0f}s")
-                    attempted_close = True
+                    attempted_stop_loss = True
                     cancel_all_orders(token_id)
                     success, output, actual_price = sell_position(token_id, size, sell_price_p0, max_retries=2)
                     if success:
@@ -1224,6 +1339,7 @@ def monitor():
                         self_notify(pos, sold_price, coin, direction, size, "P0早期止盈")
                         close_position(pos, sold_price)
                         close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
                         continue
 
                 # ═══ 方向正确 → EV + 时间衰减ATR 联合决策 ═══
@@ -1264,13 +1380,14 @@ def monitor():
                                 self_notify(pos, sold_price, coin, direction, size, "信号不足早期退出")
                                 close_position(pos, sold_price)
                                 close_attempts.pop(attempt_key, None)
+                                stop_loss_attempts.pop(attempt_key, None)
                                 continue
                         # bid太低不值得卖，继续观望等下轮
 
                 # ═══ 全程方向错误止损（remaining > 0，不限阶段）═══
                 # 方向正确的已被前面 direction_correct + EV/ATR continue 跳过
                 # 到这里说明：方向错误 / 方向未知 / 方向正确但信号不足
-                if not direction_correct and remaining > 30:
+                if should_attempt_stop_loss(direction_correct) and remaining > 30:
                     elapsed = 300 - remaining  # 已持仓时间（秒）
 
                     # ═══ 早期容忍窗口：偏离小于阈值时不急于止损 ═══
@@ -1295,7 +1412,7 @@ def monitor():
                                 print(f"  ⏸️ 方向反了但偏离小({deviation_atr:.2f}ATR<{tolerance})，观望 | 持仓{elapsed:.0f}s | 剩余{remaining:.0f}s")
                             continue
 
-                    attempts = close_attempts.get(attempt_key, 0)
+                    attempts = stop_loss_attempts.get(attempt_key, 0)
                     # 止损用原始best_bid，不打折扣，追求最快成交
                     best_bid = get_best_bid_raw(token_id)
 
@@ -1314,6 +1431,7 @@ def monitor():
                                     self_notify(pos, entry_price + net_settle, coin, direction, size, "P1对冲止损")
                                     close_position(pos, entry_price + net_settle)
                                     close_attempts.pop(attempt_key, None)
+                                    stop_loss_attempts.pop(attempt_key, None)
                                     sold = True
                                     continue
                                 else:
@@ -1325,12 +1443,14 @@ def monitor():
                         else:
                             if attempts == 0:
                                 print(f"  🔴 方向错误但无买方(bid=${best_bid:.3f})且无对冲token，等过期结算 | 剩余{remaining:.0f}s")
-                        close_attempts[attempt_key] = attempts + 1
+                        attempted_stop_loss = True
+                        stop_loss_attempt_recorded = True
+                        stop_loss_attempts[attempt_key] = attempts + 1
                         continue
 
                     # 市价止损：传入已有的best_bid避免重复查询
                     print(f"  🛑 方向错误止损(市价): bid=${best_bid:.3f} | 剩余{remaining:.0f}s")
-                    attempted_close = True
+                    attempted_stop_loss = True
                     ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
                     if ok:
                         sold = True
@@ -1341,11 +1461,13 @@ def monitor():
                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
                         close_position(pos, current_price or 0)
                         close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
                         continue
                     elif attempts >= 3:
                         # 连续3次市价都无买方，放弃止损等结算
                         print(f"  🔴 市价止损{attempts+1}次无买方，放弃等结算 | 剩余{remaining:.0f}s")
-                        close_attempts[attempt_key] = attempts + 1
+                        stop_loss_attempt_recorded = True
+                        stop_loss_attempts[attempt_key] = attempts + 1
                         continue
 
                     if sold:
@@ -1353,7 +1475,8 @@ def monitor():
                         close_attempts.pop(attempt_key, None)
                         continue
                     else:
-                        close_attempts[attempt_key] = attempts + 1
+                        stop_loss_attempt_recorded = True
+                        stop_loss_attempts[attempt_key] = attempts + 1
                 
                 # ═══ 阶段2：结束前120-60秒（流动性下降期）═══
                 # 方向错误已被全程止损处理，这里处理信号不足的情况
@@ -1504,7 +1627,11 @@ def monitor():
                     close_attempts.pop(attempt_key, None)
                     continue
                 
-                if attempted_close and not sold:
+                if attempted_stop_loss and not sold and not stop_loss_attempt_recorded:
+                    stop_loss_attempts[attempt_key] = stop_loss_attempts.get(attempt_key, 0) + 1
+                    if stop_loss_attempts[attempt_key] % 5 == 0:
+                        print(f"  WARN {slug} stop-loss attempts={stop_loss_attempts[attempt_key]}")
+                elif attempted_close and not sold:
                     close_attempts[attempt_key] = close_attempts.get(attempt_key, 0) + 1
                     if close_attempts[attempt_key] % 5 == 0:
                         print(f"  ⚠️ {slug} 已尝试{close_attempts[attempt_key]}次未成功")
