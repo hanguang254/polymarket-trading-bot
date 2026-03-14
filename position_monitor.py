@@ -4,6 +4,7 @@
 在市场关闭前的80-100秒窗口内监控价格，达到+15%即止盈
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -1325,24 +1326,31 @@ def monitor():
                 # ═══ P0: 双曲贴现止盈（不被EV阻挡 — 有利润就能卖）═══
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K)
 
-                if profit_rate >= profit_threshold and remaining > 30:
-                    # 以入场价挂卖单：CLOB按最高bid撮合，天然保护利润
-                    # price=entry_price → 任何 bid > entry 都能成交，bid < entry 不成交
-                    sell_price_p0 = round(entry_price, 2)
-                    print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | {ev_label_global} | 挂卖${sell_price_p0:.2f}(入场价) | 剩余{remaining:.0f}s")
-                    attempted_stop_loss = True
-                    cancel_all_orders(token_id)
-                    success, output, actual_price = sell_position(token_id, size, sell_price_p0, max_retries=2)
-                    if success:
-                        sold = True
-                        sold_price = actual_price or sell_price_p0
-                        self_notify(pos, sold_price, coin, direction, size, "P0早期止盈")
-                        close_position(pos, sold_price)
-                        close_attempts.pop(attempt_key, None)
-                        stop_loss_attempts.pop(attempt_key, None)
-                        continue
 
-                # ═══ 方向正确 → EV + 时间衰减ATR 联合决策 ═══
+                if profit_rate >= profit_threshold and remaining > 30:
+                    # Use executable bid to avoid paper profit that cannot fill.
+                    best_bid_raw = get_best_bid_raw(token_id)
+                    if not best_bid_raw or best_bid_raw < entry_price:
+                        if best_bid_raw:
+                            bid_profit = (best_bid_raw - entry_price) / entry_price * 100
+                            print(f"  [P0] Triggered but bid below entry: best_bid=${best_bid_raw:.3f} (< entry ${entry_price:.2f}) | realizable {bid_profit:+.1f}% | remaining {remaining:.0f}s")
+                        else:
+                            print(f"  [P0] Triggered but no bid available | remaining {remaining:.0f}s")
+                    else:
+                        # Floor to 2 decimals to avoid rounding above best bid.
+                        sell_price_p0 = max(entry_price, math.floor(best_bid_raw * 100) / 100.0)
+                        print(f"  [P0] TP: profit {profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% | {ev_label_global} | place sell ${sell_price_p0:.2f} | remaining {remaining:.0f}s")
+                        attempted_stop_loss = True
+                        cancel_all_orders(token_id)
+                        success, actual = sell_and_confirm(token_id, size, sell_price_p0, timeout_sec=4)
+                        if success:
+                            sold = True
+                            sold_price = actual or sell_price_p0
+                            self_notify(pos, sold_price, coin, direction, size, "P0 take-profit")
+                            close_position(pos, sold_price)
+                            close_attempts.pop(attempt_key, None)
+                            stop_loss_attempts.pop(attempt_key, None)
+                            continue
                 if direction_correct and remaining > 0:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
