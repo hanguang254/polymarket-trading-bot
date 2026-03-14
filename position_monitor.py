@@ -348,39 +348,48 @@ def parse_order_output(output):
             except: pass
     return info
 
-def market_sell_immediate(token_id, size):
-    """市价立即卖出（止损专用）— 用 last-trade-price 减滑点作为卖价
-    比$0.01更合理，CLOB不会因价格异常拒绝；CLOB仍按最高bid优先撮合。
-    如果 last-trade-price 获取失败，回退到 best_bid。
+def market_sell_immediate(token_id, size, price=None):
+    """市价立即卖出（止损专用）
+    价格策略：
+      1. 外部传入 price（调用方已有 best_bid，避免重复查询）
+      2. 未传入 → last-trade-price - 滑点
+      3. 都没有 → best_bid_raw * 0.95
     返回: (success, actual_price)
       success=True: 成交
-      success=False, actual_price=None: 正常失败（无买方等）
-      success=False, actual_price="MARKET_CLOSED": CLOB已关闭，不要重试
+      success=False, actual_price=None: 正常失败
+      success=False, actual_price="MARKET_CLOSED": CLOB已关闭（仅最后15秒）
     """
-    # 确定卖价：last-trade-price - 滑点，回退 best_bid * 0.95
+    # 确定卖价
     sell_price = None
-    ltp = get_last_trade_price(token_id)
-    if ltp:
-        sell_price = round(max(ltp - SLIPPAGE, 0.01), 2)
+    if price and price > 0.01:
+        sell_price = round(price, 2)
+    if not sell_price:
+        ltp = get_last_trade_price(token_id)
+        if ltp:
+            sell_price = round(max(ltp - SLIPPAGE, 0.01), 2)
     if not sell_price:
         bid = get_best_bid_raw(token_id)
         if bid:
             sell_price = round(max(bid * 0.95, 0.01), 2)
     if not sell_price:
-        sell_price = 0.01  # 最终兜底
+        sell_price = 0.01
 
-    print(f"    ⚡ 市价止损: ltp=${ltp or 'N/A'} → 卖价=${sell_price:.2f}")
+    print(f"    ⚡ 市价止损: 卖价=${sell_price:.2f}")
 
-    cmd = [
-        "polymarket", "clob", "create-order",
-        "--signature-type", "eoa",
-        "--token", token_id,
-        "--side", "sell",
-        "--price", str(sell_price),
-        "--size", str(size)
-    ]
-    try:
+    def _try_sell(p):
+        cmd = [
+            "polymarket", "clob", "create-order",
+            "--signature-type", "eoa",
+            "--token", token_id,
+            "--side", "sell",
+            "--price", str(round(p, 2)),
+            "--size", str(size)
+        ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return result
+
+    try:
+        result = _try_sell(sell_price)
         if result.returncode == 0:
             info = parse_order_output(result.stdout)
             if info["matched"]:
@@ -388,17 +397,29 @@ def market_sell_immediate(token_id, size):
                 print(f"    ⚡ 市价成交: Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f}")
                 return True, actual_price
             else:
-                # LIVE = 无买方，订单簿空，取消挂单
                 print(f"    ❌ 市价卖出无买方(Status={info['status']})，取消挂单")
                 cancel_all_orders(token_id)
                 return False, None
         else:
-            err = result.stderr.strip()[:120]
-            # CLOB 返回 400 = 市场已关闭或不接受订单
-            if "400" in err or "Bad Request" in err:
-                print(f"    ⚠️ CLOB拒绝(400)，市场可能已关闭，等待结算")
-                return False, "MARKET_CLOSED"
-            print(f"    ❌ 市价卖出命令失败: {err[:80]}")
+            err = result.stderr.strip()
+            print(f"    ❌ 止损被拒: {err[:200]}")
+
+            # 400错误：换价格重试一次（用best_bid直接挂）
+            retry_bid = get_best_bid_raw(token_id)
+            if retry_bid and retry_bid > 0.02 and abs(retry_bid - sell_price) > 0.01:
+                print(f"    🔄 换价重试: best_bid=${retry_bid:.3f}")
+                result2 = _try_sell(retry_bid)
+                if result2.returncode == 0:
+                    info2 = parse_order_output(result2.stdout)
+                    if info2["matched"]:
+                        actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else retry_bid
+                        print(f"    ⚡ 重试成交: Taking=${info2['taking']:.4f} | 实际价=${actual_price:.4f}")
+                        return True, actual_price
+                    else:
+                        cancel_all_orders(token_id)
+                else:
+                    print(f"    ❌ 重试也失败: {result2.stderr.strip()[:150]}")
+
             return False, None
     except Exception as e:
         print(f"    ❌ 市价卖出异常: {str(e)[:80]}")
@@ -1222,19 +1243,14 @@ def monitor():
                         close_attempts[attempt_key] = attempts + 1
                         continue
 
-                    # 市价止损：以$0.01挂卖单，CLOB自动匹配最高bid，一次搞定
+                    # 市价止损：传入已有的best_bid避免重复查询
                     print(f"  🛑 方向错误止损(市价): bid=${best_bid:.3f} | 剩余{remaining:.0f}s")
                     attempted_close = True
-                    ok, actual_price = market_sell_immediate(token_id, size)
+                    ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
                     if ok:
                         sold = True
                         sold_price = actual_price
                         self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
-                    elif actual_price == "MARKET_CLOSED":
-                        # CLOB已关闭，不再重试
-                        print(f"  ⏳ CLOB已关闭，放弃止损等结算 | 剩余{remaining:.0f}s")
-                        close_attempts[attempt_key] = 999  # 标记不再重试
-                        continue
                     elif attempts >= 3:
                         # 连续3次市价都无买方，放弃止损等结算
                         print(f"  🔴 市价止损{attempts+1}次无买方，放弃等结算 | 剩余{remaining:.0f}s")
@@ -1332,7 +1348,7 @@ def monitor():
                                 print(f"  🛡️ 最佳买价${best_bid:.3f}<最低价${min_price:.2f}，跳过市价卖出")
                             else:
                                 attempted_close = True
-                                ok, actual_price = market_sell_immediate(token_id, size)
+                                ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
                                 if ok:
                                     if actual_price >= min_price:
                                         sold = True
@@ -1376,10 +1392,6 @@ def monitor():
                             sold = True
                             sold_price = actual_price
                             self_notify(pos, sold_price, coin, direction, size, "阶段4兜底")
-                        elif actual_price == "MARKET_CLOSED":
-                            # CLOB已关闭，不再重试，等过期结算
-                            print(f"  ⏳ CLOB已关闭，放弃卖出等结算")
-                            attempted_close = False  # 不计入失败重试
                 
                 if sold:
                     close_position(pos, sold_price)
