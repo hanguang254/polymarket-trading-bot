@@ -404,9 +404,36 @@ def market_sell_immediate(token_id, size, price=None):
             err = result.stderr.strip()
             print(f"    ❌ 止损被拒(卖价${sell_price:.2f}): {err[:200]}")
 
-            # "not enough balance" = token余额为零，不必再重试
+            # "not enough balance" → 减量重试（size精度不匹配链上余额）
             if "not enough balance" in err.lower():
-                print(f"    ⚠️ 余额不足，token可能已被卖出或不在此钱包")
+                for retry_size in [round(size * 0.98, 2), round(size * 0.95, 2), round(size * 0.90, 2)]:
+                    if retry_size < 1:
+                        break
+                    print(f"    🔄 余额不足，减量重试: {retry_size}份")
+                    cmd_retry = [
+                        "polymarket", "clob", "create-order",
+                        "--signature-type", "eoa",
+                        "--token", token_id,
+                        "--side", "sell",
+                        "--price", str(sell_price),
+                        "--size", str(retry_size)
+                    ]
+                    try:
+                        r = subprocess.run(cmd_retry, capture_output=True, text=True, timeout=15)
+                        if r.returncode == 0:
+                            info_r = parse_order_output(r.stdout)
+                            if info_r["matched"]:
+                                ap = round(info_r["taking"] / retry_size, 4) if retry_size > 0 and info_r["taking"] > 0 else sell_price
+                                print(f"    ⚡ 减量成交: {retry_size}份 | 实际价=${ap:.4f}")
+                                return True, ap
+                            else:
+                                cancel_all_orders(token_id)
+                                return False, None
+                        elif "not enough balance" not in r.stderr.lower():
+                            break  # 其他错误不再减量
+                    except Exception:
+                        break
+                print(f"    ⚠️ 减量重试均失败，余额可能为零")
                 return False, "NO_BALANCE"
 
             # 其他400错误：降到$0.01地板价重试（CLOB按最高bid撮合）
