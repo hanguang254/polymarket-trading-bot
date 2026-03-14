@@ -259,11 +259,30 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         MIN_EV = float(os.environ.get("EARLY_MIN_EV", "0.03"))
         MIN_CONFIDENCE = float(os.environ.get("EARLY_MIN_CONFIDENCE", "0.40"))
 
+    # ── 15分钟趋势过滤 ──
+    # 弱信号(1.5-2.0ATR) + 15m反向趋势 → 直接跳过
+    # 强信号(>2.5ATR) + 15m反向趋势 → 置信度降低但仍可下注
+    trend_15m_align = details.get("trend_15m_alignment", "neutral")
+    if trend_15m_align == "conflicting":
+        if diff_in_atr < 2.0:
+            # 弱信号 + 15m逆势 → 大概率是1m假突破
+            details["trend_15m_filter"] = "blocked"
+            print(f"  🚫 15m趋势过滤: 1m信号弱({diff_in_atr:.1f}ATR<2.0) + 15m反向 → 跳过")
+        elif diff_in_atr < 2.5:
+            confidence *= 0.7  # 中等信号 → 降30%置信度
+            details["trend_15m_filter"] = "reduced_30"
+        else:
+            confidence *= 0.85  # 强信号 → 降15%置信度
+            details["trend_15m_filter"] = "reduced_15"
+    elif trend_15m_align == "confirming":
+        details["trend_15m_filter"] = "boosted"
+
     should_bet = (
         diff_in_atr >= MIN_ATR_DEVIATION  # ATR偏离：过滤无信号区间
         and ev > MIN_EV                    # 净EV：扣除spread后仍有边际
         and target_odds < MAX_PRICE        # 不买太贵（env可配置）
         and confidence >= MIN_CONFIDENCE   # 置信度（env可配置）
+        and details.get("trend_15m_filter") != "blocked"  # 15m趋势过滤
     )
 
     details["should_bet"] = should_bet
@@ -271,13 +290,15 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["liquidity"] = liq_label
     details["discount_threshold"] = discount_threshold
     early_label = " [早期窗口]" if is_early else ""
+    trend_label = f" 15m:{trend_15m_align}" if trend_15m_align != "neutral" else ""
+    filter_label = f" [{details.get('trend_15m_filter', '')}]" if details.get("trend_15m_filter") else ""
     details["bet_reason"] = (
         f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
         f"ev={ev:+.4f}({'✅' if ev>MIN_EV else '❌'}>{MIN_EV},扣spread{spread_cost:.3f}) "
         f"p_win={p_win:.3f} rw={rw_p_win:.3f} base={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "
-        f"流动性:{liq_label}{early_label}"
+        f"流动性:{liq_label}{early_label}{trend_label}{filter_label}"
     )
 
     # 空簿二次机会：C1校准拉负了折价，但Gamma指标本身OK → 放行，用校准价下单
