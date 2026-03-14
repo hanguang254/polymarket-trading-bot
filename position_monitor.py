@@ -358,6 +358,9 @@ def market_sell_immediate(token_id, size, price=None):
       success=True: 成交
       success=False, actual_price=None: 失败
     """
+    # 先取消可能存在的旧挂单，释放被锁定的token余额
+    cancel_all_orders(token_id)
+
     # 确定卖价：止损优先成交，用传入价格减滑点
     sell_price = None
     if price and price > 0.01:
