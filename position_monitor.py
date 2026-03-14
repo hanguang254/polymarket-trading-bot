@@ -349,15 +349,34 @@ def parse_order_output(output):
     return info
 
 def market_sell_immediate(token_id, size):
-    """市价立即卖出（止损专用）— 以$0.01挂卖单，CLOB按最高bid优先撮合
+    """市价立即卖出（止损专用）— 用 last-trade-price 减滑点作为卖价
+    比$0.01更合理，CLOB不会因价格异常拒绝；CLOB仍按最高bid优先撮合。
+    如果 last-trade-price 获取失败，回退到 best_bid。
     返回: (success, actual_price)
+      success=True: 成交
+      success=False, actual_price=None: 正常失败（无买方等）
+      success=False, actual_price="MARKET_CLOSED": CLOB已关闭，不要重试
     """
+    # 确定卖价：last-trade-price - 滑点，回退 best_bid * 0.95
+    sell_price = None
+    ltp = get_last_trade_price(token_id)
+    if ltp:
+        sell_price = round(max(ltp - SLIPPAGE, 0.01), 2)
+    if not sell_price:
+        bid = get_best_bid_raw(token_id)
+        if bid:
+            sell_price = round(max(bid * 0.95, 0.01), 2)
+    if not sell_price:
+        sell_price = 0.01  # 最终兜底
+
+    print(f"    ⚡ 市价止损: ltp=${ltp or 'N/A'} → 卖价=${sell_price:.2f}")
+
     cmd = [
         "polymarket", "clob", "create-order",
         "--signature-type", "eoa",
         "--token", token_id,
         "--side", "sell",
-        "--price", "0.01",
+        "--price", str(sell_price),
         "--size", str(size)
     ]
     try:
@@ -365,7 +384,7 @@ def market_sell_immediate(token_id, size):
         if result.returncode == 0:
             info = parse_order_output(result.stdout)
             if info["matched"]:
-                actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else 0.01
+                actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
                 print(f"    ⚡ 市价成交: Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f}")
                 return True, actual_price
             else:
@@ -374,7 +393,12 @@ def market_sell_immediate(token_id, size):
                 cancel_all_orders(token_id)
                 return False, None
         else:
-            print(f"    ❌ 市价卖出命令失败: {result.stderr.strip()[:80]}")
+            err = result.stderr.strip()[:120]
+            # CLOB 返回 400 = 市场已关闭或不接受订单
+            if "400" in err or "Bad Request" in err:
+                print(f"    ⚠️ CLOB拒绝(400)，市场可能已关闭，等待结算")
+                return False, "MARKET_CLOSED"
+            print(f"    ❌ 市价卖出命令失败: {err[:80]}")
             return False, None
     except Exception as e:
         print(f"    ❌ 市价卖出异常: {str(e)[:80]}")
@@ -1068,8 +1092,10 @@ def monitor():
                 # 场景：direction_correct=True（Binance价格 vs PTB），但 token 价格暴跌
                 # 说明 PTB 数据可能有误，或价格在边界反转，市场已 price-in 亏损
                 # 早期波动大、CLOB流动性差，需要更宽容的阈值
+                # 注意：最后30秒不降级 — CLOB已关闭无法下单，降级只会白费力气
+                #       方向正确就持有到结算拿$1
                 drawdown_limit = -0.30 if remaining > 180 else -0.20 if remaining > 120 else -0.15 if remaining > 60 else -0.10
-                if direction_correct and profit_rate < drawdown_limit:
+                if direction_correct and profit_rate < drawdown_limit and remaining > 30:
                     print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%（阈值{drawdown_limit*100:.0f}%），市场信号矛盾，不再盲目持有")
                     direction_correct = False  # 降级为方向未知，走正常止损流程
 
@@ -1204,6 +1230,11 @@ def monitor():
                         sold = True
                         sold_price = actual_price
                         self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
+                    elif actual_price == "MARKET_CLOSED":
+                        # CLOB已关闭，不再重试
+                        print(f"  ⏳ CLOB已关闭，放弃止损等结算 | 剩余{remaining:.0f}s")
+                        close_attempts[attempt_key] = 999  # 标记不再重试
+                        continue
                     elif attempts >= 3:
                         # 连续3次市价都无买方，放弃止损等结算
                         print(f"  🔴 市价止损{attempts+1}次无买方，放弃等结算 | 剩余{remaining:.0f}s")
@@ -1328,11 +1359,16 @@ def monitor():
 
                     if stage_ev is not None and stage_ev >= 0:
                         # EV >= 0（token >= entry）→ 持有到结算
-                        # 二元市场: 持有期望值=token_price, 卖出期望值≈token_price
-                        # 最后30秒卖出还有滑点，不如持有等结算$1/$0
                         print(f"  💎 阶段4: {ev_label}>=0，持有到结算")
+                    elif direction_correct:
+                        # 方向正确（Binance确认）→ 持有等$1结算
+                        # 最后30秒CLOB通常已关闭，强行卖出大概率400错误
+                        print(f"  💎 阶段4: 方向正确，持有到结算 ({ev_label})")
+                    elif remaining <= 10:
+                        # 最后10秒 CLOB 基本已关闭，不浪费时间尝试
+                        print(f"  ⏳ 阶段4: 剩余{remaining:.0f}s<10s，CLOB已关闭，等待结算 ({ev_label})")
                     else:
-                        # EV < 0 或无法计算 → 保留原有地板价策略
+                        # EV < 0 + 方向不对 + 还有10-30秒 → 尝试市价
                         print(f"  💀 阶段4：最后机会 ({ev_label})")
                         attempted_close = True
                         ok, actual_price = market_sell_immediate(token_id, size)
@@ -1340,6 +1376,10 @@ def monitor():
                             sold = True
                             sold_price = actual_price
                             self_notify(pos, sold_price, coin, direction, size, "阶段4兜底")
+                        elif actual_price == "MARKET_CLOSED":
+                            # CLOB已关闭，不再重试，等过期结算
+                            print(f"  ⏳ CLOB已关闭，放弃卖出等结算")
+                            attempted_close = False  # 不计入失败重试
                 
                 if sold:
                     close_position(pos, sold_price)

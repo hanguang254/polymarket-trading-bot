@@ -39,7 +39,7 @@ playwright-state.json
 .idea/
 *.swp
 *.swo
-
+.claude/
 # Old/archived scripts (may contain hardcoded secrets)
 .old_scripts/
 
