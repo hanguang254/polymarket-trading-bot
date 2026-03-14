@@ -356,7 +356,8 @@ def market_sell_immediate(token_id, size, price=None):
       3. 都没有 → $0.01（地板价，CLOB按最高bid撮合）
     返回: (success, actual_price)
       success=True: 成交
-      success=False, actual_price=None: 失败
+      success=False, actual_price=None: 正常失败
+      success=False, actual_price="NO_BALANCE": token余额为零，不必再重试
     """
     # 先取消可能存在的旧挂单，释放被锁定的token余额
     cancel_all_orders(token_id)
@@ -403,7 +404,12 @@ def market_sell_immediate(token_id, size, price=None):
             err = result.stderr.strip()
             print(f"    ❌ 止损被拒(卖价${sell_price:.2f}): {err[:200]}")
 
-            # 400错误：降到$0.01地板价重试（CLOB按最高bid撮合）
+            # "not enough balance" = token余额为零，不必再重试
+            if "not enough balance" in err.lower():
+                print(f"    ⚠️ 余额不足，token可能已被卖出或不在此钱包")
+                return False, "NO_BALANCE"
+
+            # 其他400错误：降到$0.01地板价重试（CLOB按最高bid撮合）
             if sell_price > 0.02:
                 print(f"    🔄 降价重试: $0.01地板价")
                 result2 = _try_sell(0.01)
@@ -1301,6 +1307,12 @@ def monitor():
                         sold = True
                         sold_price = actual_price
                         self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
+                    elif actual_price == "NO_BALANCE":
+                        # 余额为零=token已不在钱包，标记关闭不再重试
+                        print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                        close_position(pos, current_price or 0)
+                        close_attempts.pop(attempt_key, None)
+                        continue
                     elif attempts >= 3:
                         # 连续3次市价都无买方，放弃止损等结算
                         print(f"  🔴 市价止损{attempts+1}次无买方，放弃等结算 | 剩余{remaining:.0f}s")
@@ -1399,7 +1411,12 @@ def monitor():
                             else:
                                 attempted_close = True
                                 ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
-                                if ok:
+                                if actual_price == "NO_BALANCE":
+                                    print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                    close_position(pos, current_price or 0)
+                                    close_attempts.pop(attempt_key, None)
+                                    sold = True
+                                elif ok:
                                     if actual_price >= min_price:
                                         sold = True
                                         sold_price = actual_price
@@ -1413,7 +1430,12 @@ def monitor():
                             # 无最低价保护，直接市价
                             attempted_close = True
                             ok, actual_price = market_sell_immediate(token_id, size)
-                            if ok:
+                            if actual_price == "NO_BALANCE":
+                                print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                close_position(pos, current_price or 0)
+                                close_attempts.pop(attempt_key, None)
+                                sold = True
+                            elif ok:
                                 sold = True
                                 sold_price = actual_price
                                 self_notify(pos, sold_price, coin, direction, size, "阶段3市价平仓")
@@ -1438,7 +1460,12 @@ def monitor():
                         print(f"  💀 阶段4：最后机会 ({ev_label})")
                         attempted_close = True
                         ok, actual_price = market_sell_immediate(token_id, size)
-                        if ok:
+                        if actual_price == "NO_BALANCE":
+                            print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                            close_position(pos, current_price or 0)
+                            close_attempts.pop(attempt_key, None)
+                            sold = True
+                        elif ok:
                             sold = True
                             sold_price = actual_price
                             self_notify(pos, sold_price, coin, direction, size, "阶段4兜底")

@@ -517,11 +517,16 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     # 仅 MATCHED 视为成功（LIVE=挂单未成交，不记录持仓）
     success = result.returncode == 0 and info.get("matched", False)
 
-    # 计算实际成交价：BUY 用 Making/Size（USDC花费/token数），SELL 用 Taking/Size
-    # BUY 时 Taking=收到的token数(≈size)，Making=花费的USDC；之前误用 Taking/Size ≈ 1.0
+    # 计算实际成交价和实际份数：
+    # BUY 时 Taking=实际收到的token数, Making=花费的USDC
+    # 实际份数可能少于请求份数（部分成交），必须用实际值记录
+    actual_size = size  # 默认用请求值
     if success and size > 0 and info.get("making", 0) > 0:
         actual_price = round(info["making"] / size, 4)
-        print(f"  📊 成交确认: Status={info['status']} | Making=${info['making']:.4f} | Taking=${info.get('taking', 0):.4f} | 实际价=${actual_price:.4f} (限价=${price})")
+        # 用 Taking 作为实际成交份数（关键：避免卖出时余额不足）
+        if info.get("taking", 0) > 0:
+            actual_size = round(info["taking"], 4)
+        print(f"  📊 成交确认: Status={info['status']} | Making=${info['making']:.4f} | Taking={actual_size} | 实际价=${actual_price:.4f} (限价=${price})")
     else:
         actual_price = price  # 回退：解析失败时用限价
 
@@ -537,8 +542,9 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         "token_id": token_id,
         "price": actual_price,
         "limit_price": price,
-        "size": size,
-        "amount": actual_price * size,
+        "size": actual_size,
+        "requested_size": size,
+        "amount": actual_price * actual_size,
         "success": success,
         "output": output[:200],  # 截断输出
     }
@@ -553,7 +559,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             "slug": slug,
             "direction": direction,
             "entry_price": actual_price,
-            "size": size,
+            "size": actual_size,
             "confidence": confidence,
             "ev": ev,
             "entry_time": datetime.now(timezone.utc).isoformat(),
@@ -576,7 +582,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         with open("logs/positions.jsonl", "a") as f:
             f.write(json.dumps(position) + "\n")
 
-    return success, actual_price, size, output
+    return success, actual_price, actual_size, output
 
 
 if __name__ == "__main__":
