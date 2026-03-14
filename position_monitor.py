@@ -960,9 +960,9 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    print("🔍 持仓监控 v6 启动（全程止损 + EV持续监控 + 双曲止盈 + 3阶段平仓）...")
-    print("   Exit Protocol: 全程方向错误止损/P1对冲 | P0双曲止盈 | EV+ATR持有")
-    print("   全程止损: >30s | 阶段2: 120-60s | 阶段3: 60-30s | 阶段4: 30-0s")
+    print("🔍 持仓监控 v7 启动（早期容忍 + 信号不足退出 + 双曲止盈 + 3阶段平仓）...")
+    print("   Exit Protocol: 早期容忍(ATR梯度) | P0双曲止盈(>30s) | EV+ATR持有 | 全程止损")
+    print("   容忍窗口: <30s/1ATR, <60s/0.7ATR, <90s/0.5ATR | 阶段2: 120-60s | 阶段3: 60-30s | 阶段4: 30-0s")
     
     close_attempts = {}  # (slug, entry_time) -> attempts count
     
@@ -1083,7 +1083,7 @@ def monitor():
                 time_factor = remaining / 60.0
                 profit_threshold = P0_BASE_PROFIT * (1.0 + P0_HYPERBOLIC_K * time_factor)
 
-                if profit_rate >= profit_threshold and remaining > 90:
+                if profit_rate >= profit_threshold and remaining > 30:
                     best_bid = get_best_bid(token_id)
                     if best_bid and best_bid > entry_price:
                         print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | {ev_label_global} | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
@@ -1118,10 +1118,51 @@ def monitor():
                     # EV不足 + ATR不够强 → 放行到阶段策略
                     print(f"  ⚠️ 方向正确但信号不足({ev_label_global} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
 
+                    # ═══ 信号不足早期处理（120s前无阶段策略接管的盲区）═══
+                    # 方向正确但 EV 持续为负，说明市场不认可当前方向优势
+                    # 尝试保本退出，避免空等到阶段2才处理
+                    if remaining > 120 and market_ev is not None and market_ev < -0.05:
+                        best_bid_early = get_best_bid(token_id)
+                        if best_bid_early and best_bid_early >= entry_price * 0.90:
+                            print(f"  📉 早期信号弱退出: EV={market_ev:+.3f}<-5% | bid=${best_bid_early:.3f} | 剩余{remaining:.0f}s")
+                            attempted_close = True
+                            success, output, actual_price = sell_position(token_id, size, best_bid_early, max_retries=2)
+                            if success:
+                                sold = True
+                                sold_price = actual_price or best_bid_early
+                                self_notify(pos, sold_price, coin, direction, size, "信号不足早期退出")
+                                close_position(pos, sold_price)
+                                close_attempts.pop(attempt_key, None)
+                                continue
+
                 # ═══ 全程方向错误止损（remaining > 0，不限阶段）═══
                 # 方向正确的已被前面 direction_correct + EV/ATR continue 跳过
                 # 到这里说明：方向错误 / 方向未知 / 方向正确但信号不足
                 if not direction_correct and remaining > 30:
+                    elapsed = 300 - remaining  # 已持仓时间（秒）
+
+                    # ═══ 早期容忍窗口：偏离小于阈值时不急于止损 ═══
+                    # 5分钟市场前1-2分钟波动大，方向可能短暂反转后回来
+                    # 梯度容忍：持仓越久容忍越小
+                    #   elapsed < 30s  → 容忍 1.0 ATR
+                    #   elapsed 30-60s → 容忍 0.7 ATR
+                    #   elapsed 60-90s → 容忍 0.5 ATR
+                    #   elapsed > 90s  → 不容忍，立即止损
+                    atr_val_sl = pos.get("atr_val") or get_atr_from_binance(coin)
+                    if atr_val_sl and crypto_price and ptb_price and elapsed < 90:
+                        deviation_atr = abs(crypto_price - ptb_price) / atr_val_sl
+                        if elapsed < 30:
+                            tolerance = 1.0
+                        elif elapsed < 60:
+                            tolerance = 0.7
+                        else:
+                            tolerance = 0.5
+
+                        if deviation_atr < tolerance:
+                            if close_attempts.get(attempt_key, 0) % 5 == 0:  # 每5轮打一次日志
+                                print(f"  ⏸️ 方向反了但偏离小({deviation_atr:.2f}ATR<{tolerance})，观望 | 持仓{elapsed:.0f}s | 剩余{remaining:.0f}s")
+                            continue
+
                     attempts = close_attempts.get(attempt_key, 0)
                     # 止损用原始best_bid，不打折扣，追求最快成交
                     best_bid = get_best_bid_raw(token_id)
