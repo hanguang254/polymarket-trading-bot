@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 """
-Polymarket 自动领取已结算收益脚本 v2.1
-- 完全基于 Polymarket CLI（polymarket ctf redeem）
-- 不再依赖 py_clob_client / py_builder_relayer_client / poly_web3 等 SDK
-- 通过 `polymarket data positions` 获取持仓，筛选已结算市场
-- 通过 `polymarket ctf redeem --condition <ID>` 执行链上 redeem
+Polymarket 自动领取已结算收益脚本 v3.0
+- 直接通过 web3 链上交易结算（通过 Gnosis Safe 代理钱包）
+- 不再依赖 polymarket CLI
+- 通过 Data API 获取持仓，链上验证 payoutDenominator 判断是否已结算
+- 通过 Gnosis Safe execTransaction 执行 CTF redeemPositions
+
+v3.0 变更:
+- 完全移除 polymarket CLI 依赖，改用 web3 直接链上结算
+- 支持 normal / neg-risk 两种市场类型的链上 redeem
+- 链上验证是否已结算 (payoutDenominator > 0)
+- 链上检查 token 余额，跳过余额为零的持仓
+- 持久化已 redeem 记录 + 日志按天写入文件
+- Telegram 通知 + USDC 余额变化追踪
+
+需要新增 .env 变量:
+    PRIVATE_KEY       EOA 私钥（用于签名 Safe 交易）
+    POLYGON_RPC_URL   Polygon RPC 端点（默认 https://polygon-rpc.com）
 """
 import os
 import sys
 import json
 import time
 import logging
-import subprocess
 from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
+from eth_abi import encode as abi_encode
+from eth_keys import keys
+from web3 import Web3
 
 # ==============================================================================
 # 配置
@@ -24,24 +38,102 @@ from dotenv import load_dotenv
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
-# 钱包地址（从 .env 读取，或使用默认值）
-# EOA_WALLET:   签名用的 EOA 地址（polymarket wallet address 输出）
-# PROXY_WALLET: Polymarket 代理钱包（持仓实际存储地址）
-# 可通过 `polymarket wallet show` 查看
-EOA_WALLET = os.environ.get("EOA_WALLET", "").strip()
 PROXY_WALLET = os.environ.get("PROXY_WALLET", "").strip()
-if not EOA_WALLET or not PROXY_WALLET:
-    raise RuntimeError("EOA_WALLET and PROXY_WALLET must be set in .env")
-SIGNATURE_TYPE = os.environ.get("SIGNATURE_TYPE", "eoa").strip()
+PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "").strip()
+if not PROXY_WALLET or not PRIVATE_KEY:
+    raise RuntimeError("PROXY_WALLET and PRIVATE_KEY must be set in .env")
+
+RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com").strip()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 REDEEM_INTERVAL = int(os.environ.get("REDEEM_INTERVAL", 600))  # 默认10分钟
 
+# 已 redeem 记录文件
+REDEEMED_FILE = os.path.join(SCRIPT_DIR, "logs", "redeemed_conditions.json")
+
 # ==============================================================================
-# 日志
+# 合约地址 (Polygon mainnet)
 # ==============================================================================
+
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"       # Conditional Tokens Framework
+NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # NegRiskAdapter
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"      # USDC (PoS) on Polygon
+ZERO_ADDRESS = "0x" + "00" * 20
+
+# ==============================================================================
+# 最小 ABI
+# ==============================================================================
+
+CTF_ABI = [
+    {
+        "constant": True,
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "id", "type": "uint256"},
+        ],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    }
+]
+
+USDC_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    }
+]
+
+# ==============================================================================
+# 日志：终端 + 按天日志文件
+# ==============================================================================
+
+LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+class _TeeWriter:
+    """同时写入终端和日志文件，日志按天自动轮转"""
+    def __init__(self, stream):
+        self._stream = stream
+        self._date = None
+        self._file = None
+
+    def _ensure_file(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._date != today:
+            if self._file:
+                self._file.close()
+            self._date = today
+            path = os.path.join(LOG_DIR, f"redeem_{today}.log")
+            self._file = open(path, "a", encoding="utf-8")
+        return self._file
+
+    def write(self, msg):
+        self._stream.write(msg)
+        try:
+            f = self._ensure_file()
+            f.write(msg)
+            f.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self._stream.flush()
+        if self._file:
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+
+sys.stdout = _TeeWriter(sys.__stdout__)
+sys.stderr = _TeeWriter(sys.__stderr__)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +142,38 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("auto_redeem")
+
+# ==============================================================================
+# 已 redeem 记录持久化
+# ==============================================================================
+
+def load_redeemed() -> dict:
+    try:
+        with open(REDEEMED_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_redeemed(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(REDEEMED_FILE), exist_ok=True)
+        with open(REDEEMED_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"保存 redeem 记录失败: {e}")
+
+
+def mark_redeemed(redeemed: dict, condition_id: str, slug: str, value: float,
+                  size: float, tx_hash: str = "") -> None:
+    redeemed[condition_id] = {
+        "slug": slug,
+        "value": value,
+        "size": size,
+        "tx_hash": tx_hash,
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_redeemed(redeemed)
 
 # ==============================================================================
 # Telegram 通知
@@ -69,253 +193,377 @@ def send_telegram(text: str) -> None:
         log.warning(f"Telegram 通知失败: {e}")
 
 # ==============================================================================
-# CLI 工具函数
+# Web3 初始化
 # ==============================================================================
 
-def run_cli(args: list, timeout: int = 30) -> tuple:
-    """
-    执行 polymarket CLI 命令
+def init_web3():
+    """初始化 web3 连接和钱包"""
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    if not w3.is_connected():
+        raise ConnectionError(f"无法连接 RPC: {RPC_URL}")
 
-    Returns:
-        (success, stdout, stderr)
-    """
-    cmd = ["polymarket"] + args
+    wallet = w3.eth.account.from_key(PRIVATE_KEY)
+    pk = keys.PrivateKey(bytes.fromhex(PRIVATE_KEY.replace("0x", "")))
+
+    ctf_contract = w3.eth.contract(
+        address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI
+    )
+    usdc_contract = w3.eth.contract(
+        address=Web3.to_checksum_address(USDC_ADDRESS), abi=USDC_ABI
+    )
+
+    return w3, wallet, pk, ctf_contract, usdc_contract
+
+# ==============================================================================
+# 持仓获取 + 链上验证
+# ==============================================================================
+
+def fetch_positions_api() -> list:
+    """通过 Polymarket Data API 获取持仓"""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", "timeout"
+        url = f"https://data-api.polymarket.com/positions?user={PROXY_WALLET.lower()}"
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        positions = resp.json()
+        if isinstance(positions, list):
+            log.info(f"  Data API: {len(positions)} 个持仓")
+            return positions
     except Exception as e:
-        return False, "", str(e)
+        log.warning(f"  Data API 查询失败: {e}")
+    return []
 
 
-def _parse_positions_output(stdout: str) -> list:
-    """解析 CLI JSON 输出为 position 列表"""
-    if not stdout.strip():
+def check_resolved_onchain(w3: Web3, cond_id: str) -> bool:
+    """链上检查 condition 是否已结算: payoutDenominator > 0"""
+    selector = w3.keccak(text="payoutDenominator(bytes32)")[:4]
+    call_data = selector + abi_encode(
+        ["bytes32"], [bytes.fromhex(cond_id.replace("0x", ""))]
+    )
+    result = w3.eth.call(
+        {"to": Web3.to_checksum_address(CTF_ADDRESS), "data": call_data}
+    )
+    denominator = int(result.hex(), 16)
+    return denominator > 0
+
+
+def find_redeemable(w3: Web3, ctf_contract) -> list[dict]:
+    """获取持仓 -> 筛选已结算 -> 检查链上余额，返回可 redeem 列表"""
+    proxy_cs = Web3.to_checksum_address(PROXY_WALLET)
+    positions = fetch_positions_api()
+
+    if not positions:
         return []
-    try:
-        data = json.loads(stdout)
-        # CLI 返回格式: 直接 [...] 数组
-        if isinstance(data, dict):
-            return data.get("positions", data.get("data", []))
-        elif isinstance(data, list):
-            return data
-        return []
-    except json.JSONDecodeError:
-        return []
 
-
-def fetch_positions() -> list:
-    """
-    通过 CLI 获取钱包持仓
-
-    同时查 proxy 地址和 EOA 地址，合并去重
-    """
-    all_positions = []
-
-    for addr, label in [(PROXY_WALLET, "proxy"), (EOA_WALLET, "eoa")]:
-        success, stdout, stderr = run_cli([
-            "data", "positions", addr,
-            "--signature-type", SIGNATURE_TYPE,
-            "--limit", "100",
-            "-o", "json",
-        ], timeout=20)
-
-        if success:
-            positions = _parse_positions_output(stdout)
-            if positions:
-                log.info(f"  {label} 地址: {len(positions)} 个持仓")
-                all_positions.extend(positions)
-        else:
-            err = stderr[:100] if stderr else "unknown"
-            log.warning(f"  {label} 地址查询失败: {err}")
-
-    # 也尝试 closed-positions（已关闭的可能需要 redeem）
-    for addr in [PROXY_WALLET]:
-        success, stdout, _ = run_cli([
-            "data", "closed-positions", addr,
-            "--signature-type", SIGNATURE_TYPE,
-            "--limit", "50",
-            "-o", "json",
-        ], timeout=20)
-
-        if success:
-            closed = _parse_positions_output(stdout)
-            if closed:
-                log.info(f"  已关闭持仓: {len(closed)} 个")
-                all_positions.extend(closed)
-
-    return all_positions
-
-
-def get_resolved_conditions(positions: list) -> list:
-    """
-    从持仓中筛选已结算的 condition IDs
-
-    已结算判断条件（满足任一）:
-    - resolved == true
-    - redeemable == true
-    - game_status == "resolved"
-    - outcome 字段非空（说明已有结果）
-
-    Returns:
-        list of {condition_id, slug, value, neg_risk}
-    """
-    resolved = []
-    seen = set()
+    redeemable = []
+    seen_conditions = set()
 
     for p in positions:
-        condition_id = p.get("condition_id") or p.get("conditionId")
-        if not condition_id or condition_id in seen:
+        cond_id = p.get("conditionId") or p.get("condition_id", "")
+        token_id = p.get("asset") or p.get("token_id", "")
+        title = p.get("title", p.get("slug", p.get("market_slug", cond_id[:16])))
+        neg_risk = p.get("neg_risk", p.get("negRisk", False))
+        cur_value = float(p.get("current_value", p.get("value", 0)) or 0)
+        size = float(p.get("size", 0) or 0)
+
+        if not cond_id or cond_id in seen_conditions:
+            continue
+        seen_conditions.add(cond_id)
+
+        # 链上检查是否已结算
+        try:
+            if not check_resolved_onchain(w3, cond_id):
+                continue
+        except Exception as e:
+            log.debug(f"  链上检查失败: {cond_id[:18]}... | {e}")
             continue
 
-        is_resolved = (
-            p.get("resolved") is True
-            or p.get("redeemable") is True
-            or p.get("game_status") == "resolved"
-            or p.get("status") == "resolved"
-            or p.get("outcome") not in (None, "", "pending")
-        )
+        # 检查链上 token 余额
+        if token_id:
+            try:
+                bal = ctf_contract.functions.balanceOf(
+                    proxy_cs, int(token_id)
+                ).call()
+            except Exception:
+                bal = 0
 
-        if is_resolved:
-            seen.add(condition_id)
-            resolved.append({
-                "condition_id": condition_id,
-                "slug": p.get("slug", p.get("title", "unknown"))[:50],
-                "value": float(p.get("current_value", p.get("value", 0)) or 0),
-                "neg_risk": p.get("neg_risk", p.get("negRisk", False)),
-                "size": float(p.get("size", 0) or 0),
-            })
+            if bal == 0:
+                continue
+        else:
+            bal = int(size * 1e6) if size > 0 else 0
 
-    return resolved
+        redeemable.append({
+            "condition_id": cond_id,
+            "token_id": token_id,
+            "balance": bal,
+            "slug": (title or "unknown")[:50],
+            "value": cur_value,
+            "neg_risk": neg_risk,
+            "size": size,
+        })
+        log.info(f"  可领取: {title[:40]} (balance: {bal})")
 
+    return redeemable
 
-def redeem_condition(condition_id: str, neg_risk: bool = False, size: float = 0) -> bool:
+# ==============================================================================
+# Gnosis Safe 链上 Redeem
+# ==============================================================================
+
+def _exec_via_safe(w3: Web3, wallet, pk, target: str, inner_data: bytes) -> str | None:
     """
-    执行单个 condition 的 redeem
+    通过 Gnosis Safe 代理钱包执行任意合约调用
 
-    Args:
-        condition_id: 0x 开头的 condition ID
-        neg_risk: 是否为 neg-risk 市场
-        size: 持仓数量（neg-risk 需要）
+    流程:
+    1. 获取 Safe nonce
+    2. 计算 Safe 内部交易哈希 (getTransactionHash)
+    3. EOA 签名
+    4. 提交 execTransaction
 
-    Returns:
-        是否成功
+    Returns: tx_hash hex string on success, None on failure
     """
-    # 确保 condition_id 有 0x 前缀
-    if not condition_id.startswith("0x"):
-        condition_id = "0x" + condition_id
+    proxy_cs = Web3.to_checksum_address(PROXY_WALLET)
+    target_cs = Web3.to_checksum_address(target)
 
-    if neg_risk:
-        # neg-risk 市场: 两个 outcome 的 amount
-        # 赢的 outcome 有 size，输的是 0
-        amt = str(int(size)) if size > 0 else "1"
-        success, stdout, stderr = run_cli([
-            "ctf", "redeem-neg-risk",
-            "--condition", condition_id,
-            "--amounts", f"{amt},{amt}",
-            "--signature-type", SIGNATURE_TYPE,
-        ], timeout=60)
-    else:
-        # 普通市场: 直接 redeem，CLI 自动处理 index-sets
-        success, stdout, stderr = run_cli([
-            "ctf", "redeem",
-            "--condition", condition_id,
-            "--signature-type", SIGNATURE_TYPE,
-        ], timeout=60)
+    # 1. 获取 Safe nonce
+    nonce_selector = w3.keccak(text="nonce()")[:4]
+    safe_nonce = int(
+        w3.eth.call({"to": proxy_cs, "data": nonce_selector}).hex(), 16
+    )
 
-    output = stdout + stderr
-    if success:
-        log.info(f"  ✅ redeem 成功: {condition_id[:18]}...")
-        return True
+    # 2. 计算 Safe 交易哈希
+    get_hash_selector = w3.keccak(
+        text="getTransactionHash(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,uint256)"
+    )[:4]
+    get_hash_data = get_hash_selector + abi_encode(
+        ["address", "uint256", "bytes", "uint8", "uint256", "uint256", "uint256",
+         "address", "address", "uint256"],
+        [target_cs, 0, inner_data, 0, 0, 0, 0, ZERO_ADDRESS, ZERO_ADDRESS, safe_nonce],
+    )
+    safe_tx_hash = w3.eth.call({"to": proxy_cs, "data": get_hash_data})
 
-    err = output[:200].lower()
-    # 常见非错误情况
-    if any(kw in err for kw in ["already", "nothing to redeem", "no payout",
-                                 "zero", "no balance", "no positions"]):
-        log.info(f"  ⏭️ 无需领取: {condition_id[:18]}...")
-        return True
+    # 3. EOA 签名
+    sig = pk.sign_msg_hash(safe_tx_hash)
+    signature = sig.r.to_bytes(32, "big") + sig.s.to_bytes(32, "big") + bytes([sig.v + 27])
 
-    log.warning(f"  ❌ redeem 失败: {condition_id[:18]}... | {output[:150]}")
-    return False
+    # 4. 构建 execTransaction
+    exec_selector = w3.keccak(
+        text="execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)"
+    )[:4]
+    exec_data = exec_selector + abi_encode(
+        ["address", "uint256", "bytes", "uint8", "uint256", "uint256", "uint256",
+         "address", "address", "bytes"],
+        [target_cs, 0, inner_data, 0, 0, 0, 0, ZERO_ADDRESS, ZERO_ADDRESS, signature],
+    )
+
+    # 5. 估算 gas 并发送
+    gas_estimate = w3.eth.estimate_gas(
+        {"from": wallet.address, "to": proxy_cs, "data": exec_data}
+    )
+
+    tx = w3.eth.account.sign_transaction(
+        {
+            "to": proxy_cs,
+            "data": exec_data,
+            "gas": gas_estimate + 50_000,
+            "gasPrice": w3.eth.gas_price,
+            "nonce": w3.eth.get_transaction_count(wallet.address),
+            "chainId": 137,
+        },
+        PRIVATE_KEY,
+    )
+
+    tx_hash = w3.eth.send_raw_transaction(tx.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+    if receipt.status == 1:
+        return tx_hash.hex()
+    return None
+
+
+def redeem_normal(w3: Web3, wallet, pk, cond_id: str) -> str | None:
+    """
+    普通市场 redeem: CTF.redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
+    """
+    usdc_cs = Web3.to_checksum_address(USDC_ADDRESS)
+
+    selector = w3.keccak(
+        text="redeemPositions(address,bytes32,bytes32,uint256[])"
+    )[:4]
+    inner_data = selector + abi_encode(
+        ["address", "bytes32", "bytes32", "uint256[]"],
+        [
+            usdc_cs,
+            b"\x00" * 32,  # parentCollectionId (root)
+            bytes.fromhex(cond_id.replace("0x", "")),
+            [1, 2],        # indexSets: YES + NO
+        ],
+    )
+
+    return _exec_via_safe(w3, wallet, pk, CTF_ADDRESS, inner_data)
+
+
+def redeem_neg_risk(w3: Web3, wallet, pk, cond_id: str, amounts: list[int]) -> str | None:
+    """
+    neg-risk 市场 redeem: NegRiskAdapter.redeemPositions(conditionId, amounts)
+    """
+    selector = w3.keccak(
+        text="redeemPositions(bytes32,uint256[])"
+    )[:4]
+    inner_data = selector + abi_encode(
+        ["bytes32", "uint256[]"],
+        [
+            bytes.fromhex(cond_id.replace("0x", "")),
+            amounts,
+        ],
+    )
+
+    return _exec_via_safe(w3, wallet, pk, NEG_RISK_ADAPTER, inner_data)
+
+
+def redeem_position(w3: Web3, wallet, pk, cond_id: str,
+                    neg_risk: bool = False, balance: int = 0) -> str | None:
+    """
+    执行单个 condition 的链上 redeem
+    策略：先按 neg_risk 标志尝试，失败则切换另一种方式重试
+
+    Returns: tx_hash on success, None on failure
+    """
+    if not cond_id.startswith("0x"):
+        cond_id = "0x" + cond_id
+
+    amt = balance if balance > 0 else 1
+
+    # 第一次尝试
+    label1 = "neg-risk" if neg_risk else "normal"
+    try:
+        if neg_risk:
+            tx = redeem_neg_risk(w3, wallet, pk, cond_id, [amt, amt])
+        else:
+            tx = redeem_normal(w3, wallet, pk, cond_id)
+        if tx:
+            log.info(f"  ✅ redeem 成功({label1}): {cond_id[:18]}... | tx: {tx}")
+            return tx
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "execution reverted" in err_msg and "0x" in err_msg:
+            log.info(f"  🔄 {label1}方式 revert，切换重试: {cond_id[:18]}...")
+        else:
+            log.warning(f"  ⚠️ {label1}失败: {cond_id[:18]}... | {str(e)[:120]}")
+
+    # 第二次：切换方式重试
+    label2 = "normal" if neg_risk else "neg-risk"
+    try:
+        if neg_risk:
+            # neg-risk 失败 -> 尝试 normal
+            tx = redeem_normal(w3, wallet, pk, cond_id)
+        else:
+            # normal 失败 -> 尝试 neg-risk
+            tx = redeem_neg_risk(w3, wallet, pk, cond_id, [amt, amt])
+        if tx:
+            log.info(f"  ✅ redeem 成功({label2}): {cond_id[:18]}... | tx: {tx}")
+            return tx
+    except Exception as e:
+        log.warning(f"  ❌ {label2}也失败: {cond_id[:18]}... | {str(e)[:120]}")
+
+    return None
 
 # ==============================================================================
 # 核心逻辑
 # ==============================================================================
 
-def get_usdc_balance() -> float:
-    """查询当前 USDC 余额"""
-    success, stdout, _ = run_cli([
-        "clob", "balance",
-        "--asset-type", "collateral",
-        "--signature-type", SIGNATURE_TYPE,
-        "-o", "json",
-    ], timeout=15)
-    if success:
-        try:
-            data = json.loads(stdout)
-            return float(data.get("balance", 0))
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return -1  # -1 表示查询失败
+def get_usdc_balance(usdc_contract) -> float:
+    """查询代理钱包 USDC 余额"""
+    try:
+        bal = usdc_contract.functions.balanceOf(
+            Web3.to_checksum_address(PROXY_WALLET)
+        ).call()
+        return bal / 1e6
+    except Exception:
+        return -1
 
 
-def do_redeem() -> float:
-    """执行一轮领取，返回本轮预估领取的 USDC 总额"""
-    positions = fetch_positions()
+def do_redeem(w3: Web3, wallet, pk, ctf_contract, usdc_contract) -> float:
+    """执行一轮领取，返回实际 USDC 收益"""
 
-    if not positions:
-        log.info("✅ 暂无持仓数据")
+    # 1. 获取可 redeem 的持仓
+    redeemable = find_redeemable(w3, ctf_contract)
+
+    if not redeemable:
+        log.info("✅ 暂无可领取的已结算持仓")
         return 0.0
 
-    resolved = get_resolved_conditions(positions)
-    log.info(f"📋 持仓总数: {len(positions)}，已结算可领取: {len(resolved)}")
+    # 2. 过滤已 redeem 的
+    redeemed = load_redeemed()
+    pending = [r for r in redeemable if r["condition_id"] not in redeemed]
+    skipped = len(redeemable) - len(pending)
 
-    if not resolved:
-        log.info("✅ 暂无已结算头寸可领取")
+    log.info(
+        f"📋 链上已结算: {len(redeemable)}，"
+        f"待领取: {len(pending)}" + (f"，已跳过: {skipped}" if skipped else "")
+    )
+
+    if not pending:
+        log.info("✅ 暂无新的已结算头寸可领取")
         return 0.0
 
-    total_value = sum(r["value"] for r in resolved)
-    preview = ", ".join(r["slug"] for r in resolved[:5])
-    if len(resolved) > 5:
-        preview += f" ... 共 {len(resolved)} 个"
-    log.info(f"🎯 准备领取 {len(resolved)} 个头寸，约 ${total_value:.2f} USDC: {preview}")
+    total_value = sum(r["value"] for r in pending)
+    preview = ", ".join(r["slug"] for r in pending[:5])
+    if len(pending) > 5:
+        preview += f" ... 共 {len(pending)} 个"
+    log.info(f"🎯 准备领取 {len(pending)} 个头寸，约 ${total_value:.2f} USDC: {preview}")
 
+    # 3. USDC 余额（领取前）
+    usdc_before = get_usdc_balance(usdc_contract)
+    if usdc_before >= 0:
+        log.info(f"💰 领取前余额: ${usdc_before:.2f} USDC")
+
+    # 4. 逐个 redeem
     success_count = 0
     fail_count = 0
 
-    for r in resolved:
-        ok = redeem_condition(r["condition_id"], r.get("neg_risk", False), r.get("size", 0))
-        if ok:
+    for r in pending:
+        cid = r["condition_id"]
+        val = r.get("value", 0)
+        bal = r.get("balance", 0)
+
+        tx_hash = redeem_position(
+            w3, wallet, pk, cid,
+            neg_risk=r.get("neg_risk", False),
+            balance=bal,
+        )
+
+        if tx_hash:
             success_count += 1
+            mark_redeemed(redeemed, cid, r["slug"], val, r.get("size", 0), tx_hash)
         else:
             fail_count += 1
-        # 每次 redeem 间隔 2 秒，避免 rate limit
-        time.sleep(2)
+
+        # 间隔 3 秒，等区块确认 + 避免 nonce 冲突
+        time.sleep(3)
+
+    # 5. USDC 余额（领取后）
+    usdc_after = get_usdc_balance(usdc_contract)
+    gained = (usdc_after - usdc_before) if usdc_before >= 0 and usdc_after >= 0 else 0
 
     log.info(
         f"{'✅' if success_count > 0 else '⚠️'} 领取完成: "
-        f"{success_count} 成功 / {fail_count} 失败 / {len(resolved)} 总计，"
-        f"约 ${total_value:.2f} USDC"
+        f"{success_count} 成功 / {fail_count} 失败 / {len(pending)} 总计"
     )
+    if usdc_after >= 0:
+        log.info(f"💵 USDC 变化: +${gained:.2f}  |  余额: ${usdc_after:.2f}")
 
-    # 查询当前余额
-    balance = get_usdc_balance()
-    if balance >= 0:
-        log.info(f"💰 当前余额: ${balance:.2f} USDC")
-
-    if success_count > 0 and total_value > 0:
-        balance_line = f"💰 余额: ${balance:.2f} USDC\n" if balance >= 0 else ""
+    # 6. Telegram 通知
+    if success_count > 0 and gained > 0:
+        balance_line = f"💰 余额: ${usdc_after:.2f} USDC\n" if usdc_after >= 0 else ""
         send_telegram(
-            f"💰 <b>Polymarket 自动结算领取</b>\n"
+            f"💰 <b>Polymarket 链上自动结算</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"✅ 成功: {success_count}/{len(resolved)} 笔\n"
-            f"💵 领取: ${total_value:.2f} USDC\n"
+            f"✅ 成功: {success_count}/{len(pending)} 笔\n"
+            f"💵 收益: +${gained:.2f} USDC\n"
             f"{balance_line}"
             f"📅 时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         )
 
-    return total_value if success_count > 0 else 0.0
+    return gained
 
 # ==============================================================================
 # 主循环
@@ -323,12 +571,16 @@ def do_redeem() -> float:
 
 def main() -> None:
     log.info("=" * 55)
-    log.info("🔄 Polymarket 自动领取守护进程启动 (CLI 模式)")
+    log.info("🔄 Polymarket 链上自动结算 v3.0 启动")
     log.info(f"   代理钱包    : {PROXY_WALLET}")
-    log.info(f"   签名类型    : {SIGNATURE_TYPE}")
+    log.info(f"   RPC         : {RPC_URL}")
     log.info(f"   轮询间隔    : {REDEEM_INTERVAL}s ({REDEEM_INTERVAL // 60} 分钟)")
-    log.info(f"   CLI命令     : polymarket ctf redeem")
+    log.info(f"   已领取记录  : {REDEEMED_FILE}")
     log.info("=" * 55)
+
+    w3, wallet, pk, ctf_contract, usdc_contract = init_web3()
+    log.info(f"   EOA 签名地址: {wallet.address}")
+    log.info(f"   RPC 已连接   : chainId={w3.eth.chain_id}")
 
     total_redeemed = 0.0
     cycle = 0
@@ -339,10 +591,18 @@ def main() -> None:
         log.info(f"─── 第 {cycle} 轮 [{now} UTC] ───")
 
         try:
-            amount = do_redeem()
+            amount = do_redeem(w3, wallet, pk, ctf_contract, usdc_contract)
             total_redeemed += amount
             if amount > 0:
                 log.info(f"📊 累计已领取: ${total_redeemed:.2f} USDC")
+        except ConnectionError as e:
+            log.error(f"❌ RPC 连接失败: {e}")
+            # 尝试重新连接
+            try:
+                w3, wallet, pk, ctf_contract, usdc_contract = init_web3()
+                log.info("  🔄 RPC 重连成功")
+            except Exception:
+                pass
         except Exception as e:
             log.error(f"❌ 本轮异常: {type(e).__name__}: {e}")
 
