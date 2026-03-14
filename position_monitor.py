@@ -1184,18 +1184,20 @@ def monitor():
                 profit_threshold = P0_BASE_PROFIT * (1.0 + P0_HYPERBOLIC_K * time_factor)
 
                 if profit_rate >= profit_threshold and remaining > 30:
-                    best_bid = get_best_bid(token_id)
-                    if best_bid and best_bid > entry_price:
-                        print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | {ev_label_global} | bid=${best_bid:.3f}>入场${entry_price:.3f} | 剩余{remaining:.0f}s")
-                        attempted_close = True
-                        success, output, actual_price = sell_position(token_id, size, best_bid, max_retries=2)
-                        if success:
-                            sold = True
-                            sold_price = actual_price or best_bid
-                            self_notify(pos, sold_price, coin, direction, size, "P0早期止盈")
-                            close_position(pos, sold_price)
-                            close_attempts.pop(attempt_key, None)
-                            continue
+                    # 以入场价挂卖单：CLOB按最高bid撮合，天然保护利润
+                    # price=entry_price → 任何 bid > entry 都能成交，bid < entry 不成交
+                    sell_price_p0 = round(entry_price, 2)
+                    print(f"  💰 P0止盈(双曲): 利润{profit_rate*100:.1f}%≥阈值{profit_threshold*100:.1f}% | {ev_label_global} | 挂卖${sell_price_p0:.2f}(入场价) | 剩余{remaining:.0f}s")
+                    attempted_close = True
+                    cancel_all_orders(token_id)
+                    success, output, actual_price = sell_position(token_id, size, sell_price_p0, max_retries=2)
+                    if success:
+                        sold = True
+                        sold_price = actual_price or sell_price_p0
+                        self_notify(pos, sold_price, coin, direction, size, "P0早期止盈")
+                        close_position(pos, sold_price)
+                        close_attempts.pop(attempt_key, None)
+                        continue
 
                 # ═══ 方向正确 → EV + 时间衰减ATR 联合决策 ═══
                 if direction_correct and remaining > 0:
