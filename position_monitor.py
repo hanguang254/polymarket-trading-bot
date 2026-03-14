@@ -1198,7 +1198,8 @@ def monitor():
                     atr_str = f"{diff_atr:.1f}ATR" if diff_atr else ""
 
                     # 时间衰减ATR阈值：越接近结算，需要越弱的信号即可持有
-                    atr_hold_threshold = 1.0 + max(0, remaining - 30) / 30
+                    # 封顶2.0：早期也不应要求不可能达到的ATR倍数
+                    atr_hold_threshold = min(1.0 + max(0, remaining - 60) / 120, 2.0)
 
                     # 市场EV正（token > entry）→ 持有
                     if market_ev is not None and market_ev > 0.03:
@@ -1213,11 +1214,12 @@ def monitor():
                     print(f"  ⚠️ 方向正确但信号不足({ev_label_global} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
 
                     # ═══ 信号不足早期处理（120s前无阶段策略接管的盲区）═══
-                    # 方向正确但 EV 为负，说明市场不认可当前方向优势
-                    # remaining > 120s 时不会进入阶段2/3/4，必须在这里处理
-                    if remaining > 120 and market_ev is not None and market_ev < 0:
+                    # 方向正确但 EV 显著为负 且 ATR信号也弱 → 说明真的不行
+                    # 仅EV微负（-0.01~0）或ATR强（≥1.0）都不应触发退出
+                    if remaining > 120 and market_ev is not None and market_ev < -0.03 \
+                            and (not diff_atr or diff_atr < 1.0):
                         best_bid_early = get_best_bid(token_id)
-                        if best_bid_early and best_bid_early >= entry_price * 0.85:
+                        if best_bid_early and best_bid_early >= entry_price * 0.90:
                             print(f"  📉 早期信号弱退出: EV={market_ev:+.3f}<0 | bid=${best_bid_early:.3f} | 剩余{remaining:.0f}s")
                             attempted_close = True
                             success, output, actual_price = sell_position(token_id, size, best_bid_early, max_retries=2)
