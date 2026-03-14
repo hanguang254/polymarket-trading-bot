@@ -350,29 +350,25 @@ def parse_order_output(output):
 
 def market_sell_immediate(token_id, size, price=None):
     """市价立即卖出（止损专用）
-    价格策略：
+    价格策略（逐级降价，追求成交而非价格）：
       1. 外部传入 price（调用方已有 best_bid，避免重复查询）
       2. 未传入 → last-trade-price - 滑点
-      3. 都没有 → best_bid_raw * 0.95
+      3. 都没有 → $0.01（地板价，CLOB按最高bid撮合）
     返回: (success, actual_price)
       success=True: 成交
-      success=False, actual_price=None: 正常失败
-      success=False, actual_price="MARKET_CLOSED": CLOB已关闭（仅最后15秒）
+      success=False, actual_price=None: 失败
     """
-    # 确定卖价
+    # 确定卖价：止损优先成交，用传入价格减滑点
     sell_price = None
     if price and price > 0.01:
-        sell_price = round(price, 2)
+        # 传入的是best_bid原始值，减滑点确保能吃到bid
+        sell_price = round(max(price - SLIPPAGE, 0.01), 2)
     if not sell_price:
         ltp = get_last_trade_price(token_id)
         if ltp:
             sell_price = round(max(ltp - SLIPPAGE, 0.01), 2)
     if not sell_price:
-        bid = get_best_bid_raw(token_id)
-        if bid:
-            sell_price = round(max(bid * 0.95, 0.01), 2)
-    if not sell_price:
-        sell_price = 0.01
+        sell_price = 0.01  # 地板价：CLOB会按最高bid撮合
 
     print(f"    ⚡ 市价止损: 卖价=${sell_price:.2f}")
 
@@ -402,23 +398,23 @@ def market_sell_immediate(token_id, size, price=None):
                 return False, None
         else:
             err = result.stderr.strip()
-            print(f"    ❌ 止损被拒: {err[:200]}")
+            print(f"    ❌ 止损被拒(卖价${sell_price:.2f}): {err[:200]}")
 
-            # 400错误：换价格重试一次（用best_bid直接挂）
-            retry_bid = get_best_bid_raw(token_id)
-            if retry_bid and retry_bid > 0.02 and abs(retry_bid - sell_price) > 0.01:
-                print(f"    🔄 换价重试: best_bid=${retry_bid:.3f}")
-                result2 = _try_sell(retry_bid)
+            # 400错误：降到$0.01地板价重试（CLOB按最高bid撮合）
+            if sell_price > 0.02:
+                print(f"    🔄 降价重试: $0.01地板价")
+                result2 = _try_sell(0.01)
                 if result2.returncode == 0:
                     info2 = parse_order_output(result2.stdout)
                     if info2["matched"]:
-                        actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else retry_bid
-                        print(f"    ⚡ 重试成交: Taking=${info2['taking']:.4f} | 实际价=${actual_price:.4f}")
+                        actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
+                        print(f"    ⚡ 地板价成交: Taking=${info2['taking']:.4f} | 实际价=${actual_price:.4f}")
                         return True, actual_price
                     else:
                         cancel_all_orders(token_id)
+                        print(f"    ❌ 地板价也无买方")
                 else:
-                    print(f"    ❌ 重试也失败: {result2.stderr.strip()[:150]}")
+                    print(f"    ❌ 地板价也被拒: {result2.stderr.strip()[:150]}")
 
             return False, None
     except Exception as e:
@@ -1166,12 +1162,12 @@ def monitor():
                     print(f"  ⚠️ 方向正确但信号不足({ev_label_global} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
 
                     # ═══ 信号不足早期处理（120s前无阶段策略接管的盲区）═══
-                    # 方向正确但 EV 持续为负，说明市场不认可当前方向优势
-                    # 尝试保本退出，避免空等到阶段2才处理
-                    if remaining > 120 and market_ev is not None and market_ev < -0.05:
+                    # 方向正确但 EV 为负，说明市场不认可当前方向优势
+                    # remaining > 120s 时不会进入阶段2/3/4，必须在这里处理
+                    if remaining > 120 and market_ev is not None and market_ev < 0:
                         best_bid_early = get_best_bid(token_id)
-                        if best_bid_early and best_bid_early >= entry_price * 0.90:
-                            print(f"  📉 早期信号弱退出: EV={market_ev:+.3f}<-5% | bid=${best_bid_early:.3f} | 剩余{remaining:.0f}s")
+                        if best_bid_early and best_bid_early >= entry_price * 0.85:
+                            print(f"  📉 早期信号弱退出: EV={market_ev:+.3f}<0 | bid=${best_bid_early:.3f} | 剩余{remaining:.0f}s")
                             attempted_close = True
                             success, output, actual_price = sell_position(token_id, size, best_bid_early, max_retries=2)
                             if success:
@@ -1181,6 +1177,7 @@ def monitor():
                                 close_position(pos, sold_price)
                                 close_attempts.pop(attempt_key, None)
                                 continue
+                        # bid太低不值得卖，继续观望等下轮
 
                 # ═══ 全程方向错误止损（remaining > 0，不限阶段）═══
                 # 方向正确的已被前面 direction_correct + EV/ATR continue 跳过
