@@ -382,8 +382,9 @@ def _check_and_adjust_size(token_id, size):
             print(f"    ⚠️ 链上余额为0，跳过卖出")
             return 0
         if real_balance < size:
-            print(f"    ⚠️ 链上余额({real_balance})< 记录size({size})，用真实余额卖出")
-            return real_balance
+            adjusted = math.floor(real_balance * 100) / 100.0
+            print(f"    ⚠️ 链上余额({real_balance})< 记录size({size})，用真实余额卖出({adjusted})")
+            return adjusted if adjusted > 0 else 0
         return size
     return None
 
