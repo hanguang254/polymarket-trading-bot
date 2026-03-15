@@ -720,6 +720,8 @@ class MarketTracker:
 
             # 发送通知
             send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
+        elif isinstance(output, str) and output.startswith("PENDING"):
+            logger.warning(f"  ⏳ 挂单待成交: {output} | 已记录待成交，交由 monitor 对账入仓")
         elif isinstance(output, str) and output.startswith("SKIP_"):
             # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
             logger.warning(f"  ⚠️ {output}，跳过（不计入统计）")

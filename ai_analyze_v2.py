@@ -65,6 +65,17 @@ def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, det
         f.write(json.dumps(record) + "\n")
 
 
+PENDING_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "pending_orders.jsonl")
+
+def _append_pending_order(entry):
+    try:
+        os.makedirs(os.path.dirname(PENDING_ORDERS_FILE), exist_ok=True)
+        with open(PENDING_ORDERS_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info=None):
     """
     执行 AI 分析并返回决策
@@ -535,8 +546,11 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     from position_monitor import parse_order_output
     info = parse_order_output(output) if result.returncode == 0 else {}
 
-    # 仅 MATCHED 视为成功（LIVE=挂单未成交，不记录持仓）
-    success = result.returncode == 0 and info.get("matched", False)
+    # 仅 MATCHED 视为成功（LIVE=挂单未成交，进入 pending）
+    accepted = result.returncode == 0 and (info.get("success") is None or info.get("success") is True)
+    matched = info.get("matched", False)
+    success = accepted and matched
+    pending = accepted and not matched
 
     # 计算实际成交价和实际份数：
     # BUY 时 Taking=实际收到的token数, Making=花费的USDC
@@ -551,9 +565,24 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     else:
         actual_price = price  # 回退：解析失败时用限价
 
-    if not success and result.returncode == 0:
+    if pending:
         # returncode=0 但未 MATCHED（LIVE 挂单）
-        print(f"  ⏳ 挂单未成交: Status={info.get('status')} | 不记录持仓")
+        print(f"  ⏳ 挂单未成交: Status={info.get('status')} | 已记录待成交")
+
+        pending_entry = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "order_id": info.get("order_id"),
+            "status": info.get("status") or "LIVE",
+            "slug": slug,
+            "direction": direction,
+            "token_id": token_id,
+            "limit_price": price,
+            "requested_size": size,
+            "confidence": confidence,
+            "ev": ev,
+            "entry_details": entry_details,
+        }
+        _append_pending_order(pending_entry)
 
     # 记录下注结果（使用实际成交价）
     log_entry = {
@@ -567,6 +596,10 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         "requested_size": size,
         "amount": actual_price * actual_size,
         "success": success,
+        "pending": pending,
+        "accepted": accepted,
+        "order_id": info.get("order_id"),
+        "status": info.get("status"),
         "output": output[:200],  # 截断输出
     }
 
@@ -602,6 +635,10 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                 position["opposite_token_id"] = entry_details["opposite_token_id"]
         with open("logs/positions.jsonl", "a") as f:
             f.write(json.dumps(position) + "\n")
+
+    if pending:
+        pending_msg = f"PENDING_LIVE:{info.get('order_id')}" if info.get("order_id") else "PENDING_LIVE"
+        return False, actual_price, actual_size, pending_msg
 
     return success, actual_price, actual_size, output
 

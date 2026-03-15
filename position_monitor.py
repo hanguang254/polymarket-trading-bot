@@ -340,18 +340,36 @@ def find_optimal_price(liquidity, target_size):
 
 def parse_order_output(output):
     """解析CLI订单输出，提取成交状态和实际价格"""
-    info = {"status": None, "matched": False, "making": 0, "taking": 0}
+    info = {
+        "status": None,
+        "matched": False,
+        "making": 0,
+        "taking": 0,
+        "order_id": None,
+        "success": None,
+    }
     for line in output.strip().split("\n"):
         line = line.strip()
-        if line.startswith("Status:"):
+        lower = line.lower()
+        if lower.startswith("order id:") or lower.startswith("order_id:"):
+            info["order_id"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("success:"):
+            val = line.split(":", 1)[1].strip().lower()
+            if val in ("true", "false"):
+                info["success"] = val == "true"
+        elif line.startswith("Status:"):
             info["status"] = line.split(":", 1)[1].strip()
             info["matched"] = info["status"] == "MATCHED"
         elif line.startswith("Making:"):
-            try: info["making"] = float(line.split(":", 1)[1].strip())
-            except: pass
+            try:
+                info["making"] = float(line.split(":", 1)[1].strip())
+            except:
+                pass
         elif line.startswith("Taking:"):
-            try: info["taking"] = float(line.split(":", 1)[1].strip())
-            except: pass
+            try:
+                info["taking"] = float(line.split(":", 1)[1].strip())
+            except:
+                pass
     return info
 
 def market_sell_immediate(token_id, size, price=None):
@@ -976,6 +994,95 @@ def try_sell_with_multiple_prices(token_id, size, best_bid, current_price, entry
 # 预挂单状态追踪（持久化到文件，进程重启不丢失）
 PRE_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "pre_orders.json")
 
+# Pending buy orders (LIVE but not yet matched)
+PENDING_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "pending_orders.jsonl")
+PENDING_ORDER_TTL = int(os.environ.get("PENDING_ORDER_TTL", "20"))
+PENDING_MIN_FILL = float(os.environ.get("PENDING_MIN_FILL", "0.5"))
+
+_pending_positions_cache = {"ts": 0, "data": {}}
+
+def _append_pending_update(entry):
+    try:
+        os.makedirs(os.path.dirname(PENDING_ORDERS_FILE), exist_ok=True)
+        with open(PENDING_ORDERS_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+def _load_pending_orders():
+    orders = {}
+    try:
+        if os.path.exists(PENDING_ORDERS_FILE):
+            with open(PENDING_ORDERS_FILE, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    key = entry.get("order_id") or entry.get("pending_id")
+                    if not key:
+                        key = f"{entry.get('slug','')}-{entry.get('token_id','')}-{entry.get('created_at','')}"
+                        entry["pending_id"] = key
+                    orders[key] = entry
+    except Exception:
+        pass
+    return orders
+
+def _get_wallet_address():
+    return os.environ.get("PROXY_WALLET") or os.environ.get("EOA_WALLET") or ""
+
+def _coerce_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+def _extract_positions_snapshot(obj, out):
+    if isinstance(obj, dict):
+        token_id = obj.get("token_id") or obj.get("tokenId") or obj.get("id")
+        size = _coerce_float(
+            obj.get("size") or obj.get("amount") or obj.get("shares") or obj.get("position")
+            or obj.get("qty") or obj.get("quantity")
+        )
+        if token_id and size is not None:
+            avg_price = _coerce_float(
+                obj.get("avg_price") or obj.get("avgPrice") or obj.get("averagePrice")
+                or obj.get("average_price") or obj.get("entryPrice") or obj.get("price")
+            )
+            out[str(token_id)] = {"size": size, "avg_price": avg_price}
+        for v in obj.values():
+            _extract_positions_snapshot(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_positions_snapshot(item, out)
+
+def _fetch_positions_snapshot():
+    wallet = _get_wallet_address()
+    if not wallet:
+        return {}
+    try:
+        cmd = ["polymarket", "data", "positions", wallet, "-o", "json"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout or "{}")
+        out = {}
+        _extract_positions_snapshot(data, out)
+        return {k: v for k, v in out.items() if v.get("size", 0) > 0}
+    except Exception:
+        return {}
+
+def _get_positions_snapshot_cached(ttl=3):
+    now = time.time()
+    if now - _pending_positions_cache["ts"] < ttl:
+        return _pending_positions_cache["data"]
+    data = _fetch_positions_snapshot()
+    _pending_positions_cache["ts"] = now
+    _pending_positions_cache["data"] = data
+    return data
+
 def _load_pre_orders():
     """从文件加载预挂单状态"""
     try:
@@ -1026,6 +1133,122 @@ def cancel_all_orders(token_id):
         return result.returncode == 0
     except:
         return False
+
+def reconcile_pending_orders():
+    """Promote LIVE buy orders to positions when they fill; cancel stale ones."""
+    orders = _load_pending_orders()
+    if not orders:
+        return
+
+    active_status = {"LIVE", "PENDING", "ACCEPTED"}
+    active = {k: v for k, v in orders.items() if v.get("status") in active_status}
+    if not active:
+        return
+
+    positions_snapshot = _get_positions_snapshot_cached()
+    open_positions = get_open_positions()
+    open_keys = {(p.get("slug"), p.get("token_id")) for p in open_positions}
+
+    now = datetime.now(timezone.utc)
+
+    for key, order in active.items():
+        slug = order.get("slug")
+        token_id = order.get("token_id")
+        if not slug or not token_id:
+            continue
+
+        if (slug, token_id) in open_keys:
+            _append_pending_update({
+                "order_id": order.get("order_id"),
+                "pending_id": order.get("pending_id"),
+                "slug": slug,
+                "token_id": token_id,
+                "status": "RESOLVED_ALREADY",
+                "resolved_at": now.isoformat(),
+            })
+            continue
+
+        created_at = order.get("created_at") or order.get("entry_time")
+        age = None
+        if created_at:
+            try:
+                age = (now - datetime.fromisoformat(created_at.replace("Z", "+00:00"))).total_seconds()
+            except Exception:
+                age = None
+
+        snapshot = positions_snapshot.get(str(token_id))
+        filled_size = snapshot.get("size") if snapshot else None
+        if filled_size and filled_size >= PENDING_MIN_FILL:
+            avg_price = snapshot.get("avg_price") if snapshot else None
+            entry_price = order.get("limit_price")
+            price_source = "limit_price"
+            if avg_price and 0.01 < avg_price < 0.99:
+                entry_price = avg_price
+                price_source = "positions_avg"
+            if not entry_price:
+                ltp = get_last_trade_price(token_id)
+                if ltp:
+                    entry_price = ltp
+                    price_source = "last_trade"
+            if not entry_price:
+                entry_price = order.get("limit_price", 0.50)
+
+            size = filled_size if filled_size else order.get("requested_size") or order.get("size") or 0
+
+            position = {
+                "token_id": token_id,
+                "slug": slug,
+                "direction": order.get("direction"),
+                "entry_price": entry_price,
+                "size": size,
+                "confidence": order.get("confidence"),
+                "ev": order.get("ev"),
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "closed": False,
+                "pending_order_id": order.get("order_id") or order.get("pending_id"),
+                "entry_price_source": price_source,
+            }
+
+            entry_details = order.get("entry_details") or {}
+            for key_name in ("price_to_beat", "atr", "estimated_value", "diff_in_atr",
+                             "base_rate", "p_win_final"):
+                if key_name in entry_details:
+                    position[key_name] = entry_details[key_name]
+            if "atr" in entry_details:
+                position["atr_val"] = entry_details["atr"]
+            if "price_to_beat" in entry_details:
+                position["ptb"] = entry_details["price_to_beat"]
+            if "opposite_token_id" in entry_details:
+                position["opposite_token_id"] = entry_details["opposite_token_id"]
+
+            os.makedirs("logs", exist_ok=True)
+            with open("logs/positions.jsonl", "a") as f:
+                f.write(json.dumps(position) + "\n")
+
+            cancel_all_orders(token_id)
+            _append_pending_update({
+                "order_id": order.get("order_id"),
+                "pending_id": order.get("pending_id"),
+                "slug": slug,
+                "token_id": token_id,
+                "status": "FILLED",
+                "filled_size": size,
+                "entry_price": entry_price,
+                "entry_price_source": price_source,
+                "resolved_at": now.isoformat(),
+            })
+            continue
+
+        if age is not None and age >= PENDING_ORDER_TTL:
+            cancel_all_orders(token_id)
+            _append_pending_update({
+                "order_id": order.get("order_id"),
+                "pending_id": order.get("pending_id"),
+                "slug": slug,
+                "token_id": token_id,
+                "status": "EXPIRED",
+                "resolved_at": now.isoformat(),
+            })
 
 def _looks_like_token_balance_listing(output):
     if not output:
@@ -1195,6 +1418,7 @@ def monitor():
     
     while True:
         try:
+            reconcile_pending_orders()
             positions = get_open_positions()
             
             if not positions:
