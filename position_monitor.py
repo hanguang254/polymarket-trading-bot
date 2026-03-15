@@ -1429,6 +1429,10 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
         if info["matched"]:
             actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
             return True, actual_price
+        else:
+            raw = (result.stdout or "").strip()
+            if raw:
+                print(f"    [SELL] raw_output={raw[:400]}")
 
         # LIVE挂单：等待一小段时间确认成交
         start = time.time()
