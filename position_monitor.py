@@ -996,7 +996,8 @@ PRE_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs
 
 # Pending buy orders (LIVE but not yet matched)
 PENDING_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "pending_orders.jsonl")
-PENDING_ORDER_TTL = int(os.environ.get("PENDING_ORDER_TTL", "20"))
+PENDING_ORDER_TTL = int(os.environ.get("PENDING_ORDER_TTL", "120"))
+PENDING_AUTO_CANCEL = os.environ.get("PENDING_AUTO_CANCEL", "0") == "1"
 PENDING_MIN_FILL = float(os.environ.get("PENDING_MIN_FILL", "0.5"))
 
 _pending_positions_cache = {"ts": 0, "data": {}}
@@ -1178,7 +1179,13 @@ def reconcile_pending_orders():
 
         snapshot = positions_snapshot.get(str(token_id))
         filled_size = snapshot.get("size") if snapshot else None
+        if not filled_size:
+            balance = get_token_balance(token_id)
+            if balance is not None and balance > 0:
+                filled_size = balance
+                snapshot = snapshot or {"size": balance, "avg_price": None}
         if filled_size and filled_size >= PENDING_MIN_FILL:
+            print(f"  ✅ pending 成交入仓: {slug} token={str(token_id)[:10]}... size={filled_size}")
             avg_price = snapshot.get("avg_price") if snapshot else None
             entry_price = order.get("limit_price")
             price_source = "limit_price"
@@ -1226,6 +1233,18 @@ def reconcile_pending_orders():
                 f.write(json.dumps(position) + "\n")
 
             cancel_all_orders(token_id)
+            try:
+                coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+                msg = (
+                    "🔔 <b>挂单成交入仓</b>\n\n"
+                    f"币种: {coin}\n"
+                    f"方向: {order.get('direction')}\n"
+                    f"价格: ${entry_price:.2f} × {size}份\n"
+                    f"来源: {price_source}"
+                )
+                send_telegram(msg)
+            except Exception:
+                pass
             _append_pending_update({
                 "order_id": order.get("order_id"),
                 "pending_id": order.get("pending_id"),
@@ -1239,7 +1258,8 @@ def reconcile_pending_orders():
             })
             continue
 
-        if age is not None and age >= PENDING_ORDER_TTL:
+        if PENDING_AUTO_CANCEL and age is not None and age >= PENDING_ORDER_TTL:
+            print(f"  ⚠️ pending 过期取消: {slug} token={str(token_id)[:10]}... age={int(age)}s")
             cancel_all_orders(token_id)
             _append_pending_update({
                 "order_id": order.get("order_id"),
@@ -1305,6 +1325,20 @@ def _parse_token_balance_from_output(output, token_id):
         m = re.search(r"([0-9]*\.?[0-9]+)", after)
         if m:
             return _coerce(m.group(1))
+    return None
+
+def get_token_balance(token_id):
+    """查询钱包中指定 token 余额（用于挂单成交对账）"""
+    try:
+        cmd = ["polymarket", "clob", "balance", "--signature-type", "eoa"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            output = result.stdout or ""
+            balance = _parse_token_balance_from_output(output, token_id)
+            if balance is not None:
+                return balance
+    except Exception:
+        pass
     return None
 
 def check_balance_changed(token_id, expected_size):
