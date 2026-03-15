@@ -386,6 +386,16 @@ def market_sell_immediate(token_id, size, price=None):
     # 先取消可能存在的旧挂单，释放被锁定的token余额
     cancel_all_orders(token_id)
 
+    # 校验链上真实余额，避免用 positions.jsonl 记录的 size 与实际不符
+    real_balance = get_token_balance(token_id)
+    if real_balance is not None:
+        if real_balance <= 0:
+            print(f"    ⚠️ 链上余额为0，跳过卖出")
+            return False, "NO_BALANCE"
+        if real_balance < size:
+            print(f"    ⚠️ 链上余额({real_balance})< 记录size({size})，用真实余额卖出")
+            size = real_balance
+
     # 确定卖价：止损优先成交，用传入价格减滑点
     sell_price = None
     if price and price > 0.01:
