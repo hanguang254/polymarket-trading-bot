@@ -831,9 +831,15 @@ def update_realtime_confidence(initial_confidence, direction, crypto_price, ptb_
             penalty = min(diff_in_atr * 0.12, 0.5)
             return max(initial_confidence - penalty, 0.1)
 
-def compute_p0_profit_threshold(remaining_seconds, base_profit, hyperbolic_k):
+def compute_p0_profit_threshold(remaining_seconds, base_profit, hyperbolic_k, entry_price=None):
     time_factor = remaining_seconds / 60.0
-    return base_profit * (1.0 + hyperbolic_k * time_factor)
+    threshold = base_profit * (1.0 + hyperbolic_k * time_factor)
+    # 适配昂贵token：阈值不能超过最大可能利润的80%
+    # 入场价0.82时最大利润21.9%，若阈值26%则永远无法触发止盈
+    if entry_price and entry_price > 0:
+        max_possible_profit = (1.0 - entry_price) / entry_price
+        threshold = min(threshold, max_possible_profit * 0.80)
+    return threshold
 
 def should_attempt_stop_loss(direction_correct):
     return direction_correct is False
@@ -1686,7 +1692,7 @@ def monitor():
                 ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
 
                 # ═══ P0: 双曲贴现止盈（首次达标+强信号→等$1结算，回调后再达标→立即卖）═══
-                profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K)
+                profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K, entry_price)
 
                 # 回调检测：利润跌回阈值以下 + 之前是 FIRST_TOUCH → 标记 PULLED_BACK
                 if profit_rate < profit_threshold and tp_state.get(attempt_key) == "FIRST_TOUCH":
@@ -1923,6 +1929,10 @@ def monitor():
                 # ═══ 阶段2：结束前120-60秒（流动性下降期）═══
                 # 方向错误已被全程止损处理，这里处理信号不足的情况
                 if 60 < remaining <= 120:
+                    # 方向正确 → 跳过阶段2，等后续阶段处理（阶段3/4有方向保护）
+                    if direction_correct:
+                        print(f"  💎 阶段2: 方向正确，跳过平仓等后续 | {ev_label_global} | 剩余{remaining:.0f}s")
+                        continue
                     print(f"  ⚠️ 阶段2：{ev_label_global} | {'分批挂单' if size > 5 else '挂单确认'}")
 
                     best_bid = get_best_bid(token_id)
