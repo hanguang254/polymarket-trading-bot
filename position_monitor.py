@@ -1629,29 +1629,63 @@ def monitor():
 
 
                 if profit_rate >= profit_threshold and remaining > 30:
-                    # Use executable bid to avoid paper profit that cannot fill.
-                    best_bid_raw = get_best_bid_raw(token_id)
-                    if not best_bid_raw or best_bid_raw < entry_price:
-                        if best_bid_raw:
-                            bid_profit = (best_bid_raw - entry_price) / entry_price * 100
-                            print(f"  [P0] Triggered but bid below entry: best_bid=${best_bid_raw:.3f} (< entry ${entry_price:.2f}) | realizable {bid_profit:+.1f}% | remaining {remaining:.0f}s")
+                    # Executable-price-first: use orderbook depth, fallback to LTP - slippage.
+                    exec_price = None
+                    exec_source = None
+
+                    liquidity = analyze_liquidity(token_id, size)
+                    if liquidity:
+                        best_bid = liquidity.get("best_bid")
+                        best_bid_size = liquidity.get("best_bid_size", 0)
+                        total_liquidity = liquidity.get("total_liquidity", 0)
+                        if best_bid:
+                            if best_bid_size >= size:
+                                exec_price = best_bid
+                                exec_source = "best_bid"
+                            elif total_liquidity >= size:
+                                optimal_price = find_optimal_price(liquidity, size)
+                                if optimal_price:
+                                    exec_price = optimal_price
+                                    exec_source = "depth"
+                            else:
+                                exec_source = "thin_book"
+
+                    if exec_price is None:
+                        ltp = get_last_trade_price(token_id)
+                        if ltp:
+                            exec_price = max(ltp - SLIPPAGE, 0.01)
+                            exec_source = "ltp"
+
+                    if exec_price is not None and entry_price > 0:
+                        # Floor to 2 decimals to avoid rounding above executable price.
+                        exec_price = max(0.01, math.floor(exec_price * 100) / 100.0)
+                        exec_profit_rate = (exec_price - entry_price) / entry_price
+                        if exec_profit_rate >= profit_threshold:
+                            print(
+                                f"  [P0] TP exec: {exec_profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% "
+                                f"| {ev_label_global} | price ${exec_price:.2f} ({exec_source}) | remaining {remaining:.0f}s"
+                            )
+                            attempted_stop_loss = True
+                            cancel_all_orders(token_id)
+                            success, actual = sell_and_confirm(token_id, size, exec_price, timeout_sec=4)
+                            if success:
+                                sold = True
+                                sold_price = actual or exec_price
+                                self_notify(pos, sold_price, coin, direction, size, "P0 take-profit")
+                                close_position(pos, sold_price)
+                                close_attempts.pop(attempt_key, None)
+                                stop_loss_attempts.pop(attempt_key, None)
+                                continue
                         else:
-                            print(f"  [P0] Triggered but no bid available | remaining {remaining:.0f}s")
+                            print(
+                                f"  [P0] Exec below threshold: {exec_profit_rate*100:.1f}% < {profit_threshold*100:.1f}% "
+                                f"| price ${exec_price:.2f} ({exec_source}) | remaining {remaining:.0f}s"
+                            )
                     else:
-                        # Floor to 2 decimals to avoid rounding above best bid.
-                        sell_price_p0 = max(entry_price, math.floor(best_bid_raw * 100) / 100.0)
-                        print(f"  [P0] TP: profit {profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% | {ev_label_global} | place sell ${sell_price_p0:.2f} | remaining {remaining:.0f}s")
-                        attempted_stop_loss = True
-                        cancel_all_orders(token_id)
-                        success, actual = sell_and_confirm(token_id, size, sell_price_p0, timeout_sec=4)
-                        if success:
-                            sold = True
-                            sold_price = actual or sell_price_p0
-                            self_notify(pos, sold_price, coin, direction, size, "P0 take-profit")
-                            close_position(pos, sold_price)
-                            close_attempts.pop(attempt_key, None)
-                            stop_loss_attempts.pop(attempt_key, None)
-                            continue
+                        if exec_source == "thin_book":
+                            print(f"  [P0] Triggered but book too thin for size | remaining {remaining:.0f}s")
+                        else:
+                            print(f"  [P0] Triggered but no executable price | remaining {remaining:.0f}s")
                 if direction_correct and remaining > 0:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
