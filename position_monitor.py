@@ -1539,6 +1539,7 @@ def monitor():
     
     close_attempts = {}  # (slug, entry_time) -> attempts count
     stop_loss_attempts = {}  # (slug, entry_time) -> stop loss attempts
+    tp_state = {}  # (slug, entry_time) -> "FIRST_TOUCH" | "PULLED_BACK"
     
     while True:
         try:
@@ -1552,6 +1553,7 @@ def monitor():
             open_keys = {(p.get("slug", "unknown"), p.get("entry_time", "")) for p in positions}
             close_attempts = {k: v for k, v in close_attempts.items() if k in open_keys}
             stop_loss_attempts = {k: v for k, v in stop_loss_attempts.items() if k in open_keys}
+            tp_state = {k: v for k, v in tp_state.items() if k in open_keys}
             
             for pos in positions:
                 token_id = pos["token_id"]
@@ -1671,74 +1673,105 @@ def monitor():
                 market_ev = current_price - entry_price if current_price else None
                 ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
 
-                # ═══ P0: 双曲贴现止盈（不被EV阻挡 — 有利润就能卖）═══
+                # ═══ P0: 双曲贴现止盈（首次达标+强信号→等$1结算，回调后再达标→立即卖）═══
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K)
 
+                # 回调检测：利润跌回阈值以下 + 之前是 FIRST_TOUCH → 标记 PULLED_BACK
+                if profit_rate < profit_threshold and tp_state.get(attempt_key) == "FIRST_TOUCH":
+                    tp_state[attempt_key] = "PULLED_BACK"
+                    print(f"  [P0] 回调检测: 利润{profit_rate*100:.1f}%跌破阈值{profit_threshold*100:.1f}%，标记PULLED_BACK | 剩余{remaining:.0f}s")
 
                 if profit_rate >= profit_threshold and remaining > 30:
-                    # Executable-price-first: use orderbook depth, fallback to LTP - slippage.
-                    exec_price = None
-                    exec_source = None
+                    # 判断是否应该跳过本次止盈（首次达标+强信号→等结算）
+                    cur_tp_state = tp_state.get(attempt_key)
+                    should_skip_tp = False
 
-                    liquidity = analyze_liquidity(token_id, size)
-                    if liquidity:
-                        best_bid = liquidity.get("best_bid")
-                        best_bid_size = liquidity.get("best_bid_size", 0)
-                        total_liquidity = liquidity.get("total_liquidity", 0)
-                        if best_bid:
-                            if best_bid_size >= size:
-                                exec_price = best_bid
-                                exec_source = "best_bid"
-                            elif total_liquidity >= size:
-                                optimal_price = find_optimal_price(liquidity, size)
-                                if optimal_price:
-                                    exec_price = optimal_price
-                                    exec_source = "depth"
+                    if cur_tp_state is None:
+                        # 首次达标：检查是否满足跳过条件
+                        atr_val_tp = pos.get("atr_val") or get_atr_from_binance(coin)
+                        _, _, diff_atr_tp = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val_tp, entry_price)
+                        if direction_correct and diff_atr_tp and diff_atr_tp >= 2.0 and remaining > 60:
+                            tp_state[attempt_key] = "FIRST_TOUCH"
+                            atr_str_tp = f"{diff_atr_tp:.1f}ATR" if diff_atr_tp else ""
+                            print(
+                                f"  [P0] 首次达标跳过: {profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% "
+                                f"| 方向✅ {atr_str_tp}≥2.0 | 等$1结算 | 剩余{remaining:.0f}s"
+                            )
+                            should_skip_tp = True
+                    elif cur_tp_state == "FIRST_TOUCH":
+                        # 还在首次触发区间（没回调过），继续持有
+                        print(f"  [P0] 持续持有: 利润{profit_rate*100:.1f}% | 等回调或结算 | 剩余{remaining:.0f}s")
+                        should_skip_tp = True
+
+                    # PULLED_BACK 或 首次达标但不满足跳过条件 → 执行止盈
+                    if not should_skip_tp:
+                        tp_label = "回调后止盈" if cur_tp_state == "PULLED_BACK" else "P0 take-profit"
+
+                        # Executable-price-first: use orderbook depth, fallback to LTP - slippage.
+                        exec_price = None
+                        exec_source = None
+
+                        liquidity = analyze_liquidity(token_id, size)
+                        if liquidity:
+                            best_bid = liquidity.get("best_bid")
+                            best_bid_size = liquidity.get("best_bid_size", 0)
+                            total_liquidity = liquidity.get("total_liquidity", 0)
+                            if best_bid:
+                                if best_bid_size >= size:
+                                    exec_price = best_bid
+                                    exec_source = "best_bid"
+                                elif total_liquidity >= size:
+                                    optimal_price = find_optimal_price(liquidity, size)
+                                    if optimal_price:
+                                        exec_price = optimal_price
+                                        exec_source = "depth"
+                                else:
+                                    exec_source = "thin_book"
+
+                        if exec_price is None:
+                            ltp = get_last_trade_price(token_id)
+                            if ltp:
+                                exec_price = max(ltp - SLIPPAGE, 0.01)
+                                exec_source = "ltp"
+
+                        if exec_price is not None and entry_price > 0:
+                            # Floor to 2 decimals to avoid rounding above executable price.
+                            exec_price = max(0.01, math.floor(exec_price * 100) / 100.0)
+                            exec_profit_rate = (exec_price - entry_price) / entry_price
+                            if exec_profit_rate >= profit_threshold:
+                                print(
+                                    f"  [P0] TP exec ({tp_label}): {exec_profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% "
+                                    f"| {ev_label_global} | price ${exec_price:.2f} ({exec_source}) | remaining {remaining:.0f}s"
+                                )
+                                attempted_stop_loss = True
+                                cancel_all_orders(token_id)
+                                success, actual = sell_and_confirm(token_id, size, exec_price, timeout_sec=4)
+                                if success:
+                                    sold = True
+                                    sold_price = actual or exec_price
+                                    self_notify(pos, sold_price, coin, direction, size, tp_label)
+                                    close_position(pos, sold_price)
+                                    close_attempts.pop(attempt_key, None)
+                                    stop_loss_attempts.pop(attempt_key, None)
+                                    tp_state.pop(attempt_key, None)
+                                    continue
+                                elif actual == "NO_BALANCE":
+                                    print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                    close_position(pos, current_price or 0)
+                                    close_attempts.pop(attempt_key, None)
+                                    stop_loss_attempts.pop(attempt_key, None)
+                                    tp_state.pop(attempt_key, None)
+                                    continue
                             else:
-                                exec_source = "thin_book"
-
-                    if exec_price is None:
-                        ltp = get_last_trade_price(token_id)
-                        if ltp:
-                            exec_price = max(ltp - SLIPPAGE, 0.01)
-                            exec_source = "ltp"
-
-                    if exec_price is not None and entry_price > 0:
-                        # Floor to 2 decimals to avoid rounding above executable price.
-                        exec_price = max(0.01, math.floor(exec_price * 100) / 100.0)
-                        exec_profit_rate = (exec_price - entry_price) / entry_price
-                        if exec_profit_rate >= profit_threshold:
-                            print(
-                                f"  [P0] TP exec: {exec_profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% "
-                                f"| {ev_label_global} | price ${exec_price:.2f} ({exec_source}) | remaining {remaining:.0f}s"
-                            )
-                            attempted_stop_loss = True
-                            cancel_all_orders(token_id)
-                            success, actual = sell_and_confirm(token_id, size, exec_price, timeout_sec=4)
-                            if success:
-                                sold = True
-                                sold_price = actual or exec_price
-                                self_notify(pos, sold_price, coin, direction, size, "P0 take-profit")
-                                close_position(pos, sold_price)
-                                close_attempts.pop(attempt_key, None)
-                                stop_loss_attempts.pop(attempt_key, None)
-                                continue
-                            elif actual == "NO_BALANCE":
-                                print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                close_position(pos, current_price or 0)
-                                close_attempts.pop(attempt_key, None)
-                                stop_loss_attempts.pop(attempt_key, None)
-                                continue
+                                print(
+                                    f"  [P0] Exec below threshold: {exec_profit_rate*100:.1f}% < {profit_threshold*100:.1f}% "
+                                    f"| price ${exec_price:.2f} ({exec_source}) | remaining {remaining:.0f}s"
+                                )
                         else:
-                            print(
-                                f"  [P0] Exec below threshold: {exec_profit_rate*100:.1f}% < {profit_threshold*100:.1f}% "
-                                f"| price ${exec_price:.2f} ({exec_source}) | remaining {remaining:.0f}s"
-                            )
-                    else:
-                        if exec_source == "thin_book":
-                            print(f"  [P0] Triggered but book too thin for size | remaining {remaining:.0f}s")
-                        else:
-                            print(f"  [P0] Triggered but no executable price | remaining {remaining:.0f}s")
+                            if exec_source == "thin_book":
+                                print(f"  [P0] Triggered but book too thin for size | remaining {remaining:.0f}s")
+                            else:
+                                print(f"  [P0] Triggered but no executable price | remaining {remaining:.0f}s")
                 if direction_correct and remaining > 0:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
