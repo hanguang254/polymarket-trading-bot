@@ -372,6 +372,21 @@ def parse_order_output(output):
                 pass
     return info
 
+def _check_and_adjust_size(token_id, size):
+    """校验链上真实余额，返回调整后的 size。
+    返回: adjusted_size (>0正常, 0=余额为零, None=查询失败用原size)
+    """
+    real_balance = get_token_balance(token_id)
+    if real_balance is not None:
+        if real_balance <= 0:
+            print(f"    ⚠️ 链上余额为0，跳过卖出")
+            return 0
+        if real_balance < size:
+            print(f"    ⚠️ 链上余额({real_balance})< 记录size({size})，用真实余额卖出")
+            return real_balance
+        return size
+    return None
+
 def market_sell_immediate(token_id, size, price=None):
     """市价立即卖出（止损专用）
     价格策略（逐级降价，追求成交而非价格）：
@@ -386,15 +401,12 @@ def market_sell_immediate(token_id, size, price=None):
     # 先取消可能存在的旧挂单，释放被锁定的token余额
     cancel_all_orders(token_id)
 
-    # 校验链上真实余额，避免用 positions.jsonl 记录的 size 与实际不符
-    real_balance = get_token_balance(token_id)
-    if real_balance is not None:
-        if real_balance <= 0:
-            print(f"    ⚠️ 链上余额为0，跳过卖出")
-            return False, "NO_BALANCE"
-        if real_balance < size:
-            print(f"    ⚠️ 链上余额({real_balance})< 记录size({size})，用真实余额卖出")
-            size = real_balance
+    # 校验链上真实余额
+    adjusted = _check_and_adjust_size(token_id, size)
+    if adjusted == 0:
+        return False, "NO_BALANCE"
+    if adjusted is not None:
+        size = adjusted
 
     # 确定卖价：止损优先成交，用传入价格减滑点
     sell_price = None
@@ -497,6 +509,13 @@ def sell_position(token_id, size, price, max_retries=3):
       - success: True仅当Status=MATCHED
       - actual_price: 实际成交价（Taking/Size），None表示未知
     """
+    # 校验链上真实余额
+    adjusted = _check_and_adjust_size(token_id, size)
+    if adjusted == 0:
+        return False, "NO_BALANCE", None
+    if adjusted is not None:
+        size = adjusted
+
     price = round(price, 2)
 
     for attempt in range(max_retries):
@@ -1416,6 +1435,13 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
     """挂单并确认成交，未成交则取消
     返回: (success, msg_or_actual_price)
     """
+    # 校验链上真实余额
+    adjusted = _check_and_adjust_size(token_id, size)
+    if adjusted == 0:
+        return False, "NO_BALANCE"
+    if adjusted is not None:
+        size = adjusted
+
     price = round(price, 2)
     cmd = [
         "polymarket", "clob", "create-order",
@@ -1697,6 +1723,12 @@ def monitor():
                                 close_attempts.pop(attempt_key, None)
                                 stop_loss_attempts.pop(attempt_key, None)
                                 continue
+                            elif actual == "NO_BALANCE":
+                                print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                close_position(pos, current_price or 0)
+                                close_attempts.pop(attempt_key, None)
+                                stop_loss_attempts.pop(attempt_key, None)
+                                continue
                         else:
                             print(
                                 f"  [P0] Exec below threshold: {exec_profit_rate*100:.1f}% < {profit_threshold*100:.1f}% "
@@ -1859,6 +1891,12 @@ def monitor():
                             sold = True
                             sold_price = actual
                             self_notify(pos, sold_price, coin, direction, size, "阶段2平仓")
+                        elif actual == "NO_BALANCE":
+                            print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                            close_position(pos, current_price or 0)
+                            close_attempts.pop(attempt_key, None)
+                            stop_loss_attempts.pop(attempt_key, None)
+                            continue
                         else:
                             price2 = round(best_bid * 0.90, 2)
                             attempted_close = True
