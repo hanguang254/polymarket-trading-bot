@@ -1794,9 +1794,10 @@ def monitor():
                     print(f"  ⚠️ 方向正确但信号不足({ev_label_global} {atr_str}<{atr_hold_threshold:.1f})，放行到阶段策略 | 剩余{remaining:.0f}s")
 
                     # ═══ 信号不足早期处理（120s前无阶段策略接管的盲区）═══
-                    # 方向正确但 EV 显著为负 且 ATR信号也弱 → 说明真的不行
+                    # 方向错误时 EV 显著为负 且 ATR信号也弱 → 及时止损
+                    # 方向正确时跳过：token价格可能滞后于crypto，方向对就不算弱信号
                     # 仅EV微负（-0.01~0）或ATR强（≥1.0）都不应触发退出
-                    if remaining > 120 and market_ev is not None and market_ev < -0.03 \
+                    if not direction_correct and remaining > 120 and market_ev is not None and market_ev < -0.03 \
                             and (not diff_atr or diff_atr < 1.0):
                         best_bid_early = get_best_bid(token_id)
                         if best_bid_early and best_bid_early >= entry_price * 0.90:
