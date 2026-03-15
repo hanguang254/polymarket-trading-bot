@@ -2078,8 +2078,8 @@ def monitor():
         
         except Exception as e:
             print(f"❌ 监控错误: {e}")
-        
-        time.sleep(2)
+
+        time.sleep(1)
 
 
 def self_notify(pos, sell_price, coin, direction, size, label):
