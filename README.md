@@ -1,6 +1,6 @@
-# Polymarket Trading Bot v6.0
+# Polymarket Trading Bot v7.0
 
-Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, LMSR theoretical pricing, market-price stop-loss, and correlated exposure control.
+Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
 ## Strategy
 
@@ -15,8 +15,10 @@ The bot uses Bayesian sequential updating to detect directional signals, enters 
 2s    PTB acquisition (Playwright → HTML → Gamma API fallback)
 20s   Bayesian warmup (5s intervals, 3s after 80s)
 40s   PTB deadline
-100s  Bet window opens (80s observation data available)
-160s  Bet window closes → Real-time EV monitoring starts
+90s   Early bet window opens (lower thresholds, CLOB mispricing)
+95s   Early bet window closes
+100s  Late bet window opens (standard thresholds)
+160s  Late bet window closes → Real-time EV monitoring starts
       ── Exit Protocol ──
 >30s  Universal stop-loss: direction wrong → market-price ladder sell
 >30s  P1 hedge: bid < $0.05 → buy opposite token for $1 pair
@@ -24,7 +26,7 @@ The bot uses Bayesian sequential updating to detect directional signals, enters 
 120s  Stage 2: Weak signal exit (batch sell)
 60s   Stage 3: Aggressive exit (EV floor protection)
 30s   Stage 4: EV ≥ 0 → hold to settlement, EV < 0 → floor prices
-0s    Market ends → Settlement
+0s    Market ends → Settlement (API real outcome)
 ```
 
 ## Architecture
@@ -33,15 +35,19 @@ The bot uses Bayesian sequential updating to detect directional signals, enters 
 systemd services (auto-restart, boot-start):
 
 polymarket-bot.service     → auto_bot_v3.py      (betting engine)
-polymarket-monitor.service → position_monitor.py  (EV-driven position monitor)
+polymarket-monitor.service → position_monitor.py  (EV-driven position monitor + pending order reconciliation)
 polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance query)
+watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 ```
 
 ## Features
 
 ### Entry (P0 + P2 + P3)
+- **Random Walk p_win**: Uses `Φ(|gap|/σ√t)` (normal CDF) to compute real probability from price deviation, replacing static base_rate lookup. More theoretically grounded for 5-min markets.
 - **Base Rate Calibration**: Conservative ATR-band priors (0.50-0.85), auto-calibrates with empirical data after 30+ samples per band. Weak edge (base_rate < 0.55) halves Kelly.
-- **Strict Binary EV**: `EV = p_win - price` (replaces discount/odds ratio). Minimum 3% edge required.
+- **Strict Binary EV**: `EV = p_win - price` (replaces discount/odds ratio). Minimum edge required (configurable via `MIN_EV`).
+- **Early Bet Window (90-95s)**: Enters before CLOB fully prices in, with lower thresholds (`EARLY_MIN_EV`, `EARLY_MIN_CONFIDENCE`). Captures mispricing before market makers adjust.
+- **15-min K-line Trend Filter**: Checks Binance 15-min candle trend to avoid counter-trend trades. Reduces entries against dominant macro direction.
 - **Bayesian Fusion**: Base rate (40%) + Bayesian posterior (60%) when direction-aligned with confidence > 30%.
 - **Cross-Validation**: Flags overestimation when `estimated_value > p_win + 0.15` (reduces confidence 15%).
 - **LMSR Inefficiency Signal**: When realtime `best_ask` diverges >10% from `p_win`, lowers discount threshold by 2% (min 6%) for easier entry on mispriced markets.
@@ -50,17 +56,20 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Correlated Exposure Control**: BTC/ETH correlation ~0.85. Same-direction position halves Kelly sizing.
 - **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds.
 - **Liquidity-Capped Sizing (P3)**: Kelly size capped at 50% of exit bid depth. Works with P2 — P2 gates entry, P3 adjusts size.
+- **Balance Auto-Retry**: When balance insufficient, automatically retries with reduced size (98%/95%/90%) instead of skipping entirely.
 - **CLOB C1 Calibration**: Replaces Gamma odds with CLOB `best_ask` for discount/EV/price checks — prevents buying at $0.85 while thinking price is $0.50. Empty book detection (ask ≥ 0.95) falls back to `last-trade-price`.
 - **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
+- **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
 
 ### Exit (P0-P1 + P4)
-- **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.15) and `P0_HYPERBOLIC_K` (default 0.15). Example: 240s → 26%, 100s → 20%.
+- **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.20) and `P0_HYPERBOLIC_K` (default 0.15). P0 sells at entry_price (guaranteed fill) instead of best_bid.
+- **Market-Price Immediate Stop-Loss**: `market_sell_immediate()` cancels existing orders first (prevents balance lock), then ladder sells at bid→95%→90%→80%→$0.05→$0.01 (~6s to clear).
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
-- **EV-Driven Diamond Hands**: Direction correct + ≤120s remaining → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥1.0) → hold to settlement. Weak EV (0~0.03) → releases to Stage 3/4 fine-grained EV strategy instead of blindly holding.
+- **EV-Driven Diamond Hands**: Direction correct + ≤120s remaining → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥1.0, capped at 2.0) → hold to settlement. Weak EV (0~0.03) → releases to Stage 3/4 fine-grained EV strategy. Early exit requires both EV < -3% AND ATR < 1.0 (dual condition).
 - **Direction-Based Exit**: Uses crypto price vs PTB to determine win/loss (not token orderbook price, which can be misleading due to wide bid-ask spreads near settlement).
   - Direction correct + EV > 0.03 or strong ATR → **hold to settlement** ($1.00)
   - Direction correct but weak signal → releases to stage exit strategy
-  - Direction wrong → **Universal market-price stop-loss** (bid→95%→90%→80%→$0.05→$0.01, ~6s to clear)
+  - Direction wrong → **Universal market-price stop-loss** (immediate ladder sell)
   - No buyers (bid < $0.05) → Attempt hedge (P1), fall back to wait for expiry
   - Safety: direction correct but token drops >10% → downgrade to "unknown", trigger stop-loss
 - **Wide Spread Protection**: `get_market_price()` detects bid-ask spread > 50% and falls back to midpoint API → `last-trade-price` → single-side price, preventing false loss signals.
@@ -68,7 +77,8 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
 - **3-Stage Graduated Exit**: For remaining edge cases — Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) EV≥0 hold / EV<0 floor prices.
-- **Accurate Settlement**: Expiry cleanup uses crypto price vs PTB to determine $1.00/$0.00, not unreliable token price.
+- **API-Based Settlement**: Expiry cleanup uses Polymarket API real outcome (not Binance price guess) to determine $1.00/$0.00.
+- **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
 
 ### Infrastructure
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
@@ -76,51 +86,58 @@ polymarket-redeem.service  → auto_redeem_v2.py    (auto settlement + balance q
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
 - **Playwright Smart Degradation**: Skip browser PTB after 3 consecutive failures
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
-- **Telegram Notifications**: Bets, exits, settlements, errors, balance
+- **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
 - **Auto Redeem**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`), shows USDC balance after each round
+- **Watchdog**: `watchdog_v3.sh` monitors all 3 services and auto-restarts on failure
 - **systemd Management**: Auto-restart on crash, boot-start
 
 ## Components
 
 | File | Role |
 |------|------|
-| `auto_bot_v3.py` | Main engine: market discovery, warmup, betting, correlation control |
-| `ai_analyze_v2.py` | Decision engine: strict EV, Kelly sizing, Bayesian fusion, bet execution |
+| `auto_bot_v3.py` | Main engine: market discovery, warmup, early/late betting, correlation control |
+| `ai_analyze_v2.py` | Decision engine: strict EV, Kelly sizing, Bayesian fusion, bet execution, pending order tracking |
 | `ai_trader/ai_model_v2.py` | Scoring model: ATR deviation → token value estimation → discount |
 | `ai_trader/base_rate.py` | Base Rate calibration: conservative priors + empirical learning |
 | `scripts/validate_base_rate.py` | Base Rate calibration validator: ATR-band win rates vs priors |
 | `ai_trader/bayesian_engine.py` | Bayesian sequential updater: sigmoid likelihood, log-space, anti-saturation |
 | `ai_trader/lmsr_liquidity.py` | Orderbook liquidity: spread + depth + slippage → dynamic threshold |
-| `position_monitor.py` | EV-driven exit + 4-stage closing + outcome recording |
+| `position_monitor.py` | EV-driven exit + 4-stage closing + pending order reconciliation + outcome recording |
 | `auto_redeem_v2.py` | Auto claim settled positions (Polymarket CLI) |
 | `ai_trader/binance_api.py` | Binance market data (klines, price, 24h stats) |
 | `ai_trader/indicators.py` | Technical indicators (EMA, RSI, ATR, Bollinger Bands) |
 | `ai_trader/polymarket_api.py` | Polymarket API + PTB HTML scraper |
 | `ai_trader/playwright_ptb.py` | PTB extraction via headless Chromium |
 | `trading_state.py` | State management: cooldown, daily PnL, win/loss tracking |
+| `watchdog_v3.sh` | Process watchdog: monitors and auto-restarts all services |
 
 ## Betting Conditions
 
 All must be met (all configurable via `.env`):
 
-| Condition | Threshold | Env Key | Source |
-|-----------|-----------|---------|--------|
-| EV | > 0.03 (3%) | `MIN_EV` | `p_win - exec_price` |
-| Confidence | ≥ 60% | `MIN_CONFIDENCE` | Bayesian-fused momentum |
-| Odds | < 0.92 | `MAX_BUY_PRICE` | Don't buy overpriced tokens |
-| Base Rate | Checked | — | < 0.55 → Kelly halved |
-| Correlation | Checked | — | Same-direction → Kelly halved |
+| Condition | Late Window | Early Window | Env Key |
+|-----------|-------------|--------------|---------|
+| EV | > `MIN_EV` (0.10) | > `EARLY_MIN_EV` (0.08) | `MIN_EV` / `EARLY_MIN_EV` |
+| Confidence | ≥ `MIN_CONFIDENCE` (0.70) | ≥ `EARLY_MIN_CONFIDENCE` (0.60) | `MIN_CONFIDENCE` / `EARLY_MIN_CONFIDENCE` |
+| ATR Deviation | ≥ `MIN_ATR_DEVIATION` (1.4) | ≥ 1.0 | `MIN_ATR_DEVIATION` |
+| Odds | < `MAX_BUY_PRICE` (0.90) | same | `MAX_BUY_PRICE` |
+| 15-min Trend | Not counter-trend | same | — |
+| Base Rate | < 0.55 → Kelly halved | same | — |
+| Correlation | Same-direction → Kelly halved | same | — |
 
 ## Risk Controls
 
 ```
 Layer 1 — Entry Filters
-  ├─ EV > MIN_EV (default 3%, env configurable)
-  ├─ Confidence ≥ MIN_CONFIDENCE (default 60%, env configurable)
-  ├─ Odds < MAX_BUY_PRICE (default 0.92, env configurable)
+  ├─ EV > MIN_EV (default 10%, env configurable)
+  ├─ Confidence ≥ MIN_CONFIDENCE (default 70%, env configurable)
+  ├─ ATR deviation ≥ MIN_ATR_DEVIATION (default 1.4)
+  ├─ Odds < MAX_BUY_PRICE (default 0.90, env configurable)
+  ├─ 15-min K-line trend filter (anti counter-trend)
   ├─ Base Rate calibration (weak edge → Kelly halved)
   ├─ P2: Exit liquidity gate (bid_depth < 5 → skip entry)
-  └─ Empty book override (Gamma EV pass → bet with calibrated price)
+  ├─ Empty book override (Gamma EV pass → bet with calibrated price)
+  └─ Early window: lower thresholds (EV 8%, conf 60%, ATR 1.0)
 
 Layer 2 — Position Sizing
   ├─ 1/4 Kelly (binary formula)
@@ -131,13 +148,14 @@ Layer 2 — Position Sizing
   └─ Balance constraints (10-20% of balance)
 
 Layer 3 — Position Management
-  ├─ P0: Hyperbolic discounting profit-take (dynamic threshold, configurable)
+  ├─ P0: Hyperbolic discounting profit-take (entry_price sell for guaranteed fill)
   ├─ P1: Opposite token hedge (bid < $0.05 → buy opposite for $1 pair)
-  ├─ Universal stop-loss (direction wrong → market-price ladder, full duration >30s)
+  ├─ Market-price immediate stop-loss (cancel first, then ladder sell)
   ├─ Wide spread detection (prevents false loss signals)
   ├─ Post-close safety (no trades after market ends)
   ├─ 3-stage graduated closing (Stage 2/3/4 for remaining edge cases)
-  └─ Accurate settlement ($1/$0 from crypto price vs PTB)
+  ├─ API-based settlement (real outcome, not price guess)
+  └─ Pending order reconciliation (LIVE → detect fill → record position → notify)
 
 Layer 4 — System Protection
   ├─ Max open positions: 2 (configurable)
@@ -201,18 +219,31 @@ See `.env.example` for all configurable parameters:
 | `EOA_WALLET` | Yes | EOA wallet address for signing |
 | `PROXY_WALLET` | Yes | Polymarket proxy wallet (holds positions) |
 | `SIGNATURE_TYPE` | Yes | Signature type (`eoa` or `gnosis-safe`) |
+| `PRIVATE_KEY` | Yes | Private key for on-chain settlement |
+| `POLYGON_RPC_URL` | No | Polygon RPC endpoint (default: public) |
 | `TELEGRAM_BOT_TOKEN` | No | Telegram bot token for notifications |
 | `TELEGRAM_CHAT_ID` | No | Telegram chat ID for notifications |
 | `REDEEM_INTERVAL` | No | Auto redeem polling interval in seconds (default: 600) |
 | `MAX_DAILY_LOSS` | No | Daily loss limit in USD (default: 10) |
 | `MAX_OPEN_POSITIONS` | No | Max concurrent positions (default: 2) |
 | `MIN_BALANCE` | No | Min balance to place bets (default: 5) |
-| `MAX_BUY_PRICE` | No | Max buy price for entry (default: 0.92) |
-| `MIN_EV` | No | Min EV to place bet (default: 0.03) |
-| `MIN_CONFIDENCE` | No | Min confidence to place bet (default: 0.60) |
-| `SLIPPAGE` | No | Empty book fallback slippage for last-trade-price ± (default: 0.01) |
-| `P0_BASE_PROFIT` | No | P0 take-profit base threshold (default: 0.15) |
+| `MAX_BUY_PRICE` | No | Max buy price for entry (default: 0.90) |
+| `MIN_EV` | No | Min EV for late window (default: 0.10) |
+| `MIN_CONFIDENCE` | No | Min confidence for late window (default: 0.70) |
+| `MIN_ATR_DEVIATION` | No | Min ATR deviation for entry (default: 1.4) |
+| `P_WIN_CAP` | No | Max p_win cap (default: 0.92) |
+| `EARLY_BET_START` | No | Early bet window start in seconds (default: 90) |
+| `EARLY_BET_END` | No | Early bet window end in seconds (default: 95) |
+| `EARLY_MIN_EV` | No | Min EV for early window (default: 0.08) |
+| `EARLY_MIN_CONFIDENCE` | No | Min confidence for early window (default: 0.60) |
+| `LATE_BET_START` | No | Late bet window start (default: 100) |
+| `LATE_BET_END` | No | Late bet window end (default: 160) |
+| `SLIPPAGE` | No | Empty book fallback slippage for last-trade-price ± (default: 0.02) |
+| `P0_BASE_PROFIT` | No | P0 take-profit base threshold (default: 0.20) |
+| `PROFIT_THRESHOLD` | No | General profit threshold (default: 0.15) |
 | `P0_HYPERBOLIC_K` | No | Hyperbolic discounting coefficient (default: 0.15) |
+| `PENDING_ORDER_TTL` | No | Max wait for LIVE orders before cancel (default: 120s) |
+| `PENDING_MIN_FILL` | No | Min filled size to record position (default: 0.5) |
 
 ### Running
 
@@ -261,10 +292,13 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/base_rates.json` | Empirical win rates by ATR band |
 | `logs/trading_state.json` | State machine (cooldown, daily PnL) |
 | `logs/pre_orders.json` | Pre-order state persistence |
+| `logs/pending_orders.jsonl` | LIVE (unfilled) buy orders awaiting reconciliation |
 | `logs/polymarket-bot.log` | Application log |
+| `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
 
+- **v7.0**: Pending order reconciliation + early bet window + random walk p_win — LIVE orders tracked in `pending_orders.jsonl`, monitor auto-detects fills via wallet balance and records positions with distinct TG notification (⏰). Early bet window (90-95s) with lower thresholds captures CLOB mispricing. Random walk probability `Φ(|gap|/σ√t)` replaces static base_rate. 15-min K-line trend filter reduces counter-trend entries. Balance auto-retry (98%/95%/90%). Market-price immediate stop-loss cancels existing orders first. P0 sells at entry_price for guaranteed fill. Settlement uses API real outcome. ATR hold threshold capped at 2.0 with dual early-exit condition.
 - **v6.0**: Full-duration stop-loss + EV-only entry — Stop-loss covers entire market duration (>30s) instead of stage-limited windows. Market-price ladder sell (bid→95%→90%→80%→$0.05→$0.01, ~6s). Removed discount condition from entry (was blocking almost all bets due to conservative estimated_value ≈ 0.51). Entry now uses 3 conditions: EV > MIN_EV, confidence ≥ MIN_CONFIDENCE, odds < MAX_BUY_PRICE (all env configurable). Consolidated duplicated P1 hedge code into single universal block. New `get_best_bid_raw()` for stop-loss (no discount, no slippage deduction).
 - **v4.0**: Empty book resilience — Entry: CLOB C1 calibration (best_ask校准防虚假折价) + empty book override (Gamma EV二次放行, 校准价下单). Exit: `get_best_bid/ask/market_price` fall back to `last-trade-price ± SLIPPAGE` when orderbook empty. Stage 3/4 EV sanity check (market price halved → override fake positive EV). New env: `MAX_BUY_PRICE`, `SLIPPAGE`. Fixes BTC DOWN $0.21→$0.01→$0.00 全程无止损 case.
 - **v3.9**: EV-driven diamond hands — direction correct + ≤120s no longer blindly holds; calculates real-time EV (base_rate lookup) and releases weak signals (EV 0~0.03) to Stage 3/4 fine-grained exit. P1 hedge extended to Stage 1 (120-180s) — bid < $0.05 now triggers opposite token hedge instead of doing nothing. Direction-correct hold blocks (>60s) now log EV/ATR for signal quality observation. Removed dead EV computation in Stage 1 entry.

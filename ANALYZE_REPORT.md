@@ -2,9 +2,9 @@
 
 ## 一、系统概览
 
-**用途**：Polymarket 5分钟二元期权市场的下注决策引擎，负责市场分析、EV 计算、下注条件判断、仓位计算和订单执行。
+**用途**：Polymarket 5分钟二元期权市场的下注决策引擎，负责市场分析、EV 计算、下注条件判断、仓位计算、订单执行和挂单追踪。
 
-**核心策略**：折价套利 — 不预测方向，而是检测 token 是否被低估，买入后提前平仓锁定利润。
+**核心策略**：EV 驱动套利 — 使用随机游走概率模型检测 token 是否被低估，通过双窗口（早期+晚期）捕获市场定价偏差。
 
 **核心发现**（基于 889 条历史数据）：
 - 5分钟市场结束时价格回归 PTB（偏离缩小 91.7%）
@@ -301,7 +301,8 @@ polymarket clob create-order --side buy --price <best_ask> --size <kelly_size>
 
 成交判断：
   Status = MATCHED → 成功，记录持仓
-  Status = LIVE → 挂单未成交，不记录持仓
+  Status = LIVE → 挂单未成交，记录到 pending_orders.jsonl
+                   交由 position_monitor reconcile_pending_orders() 对账入仓
 
 实际成交价：
   BUY 时用 Making / Size（USDC 花费 / token 数）
@@ -310,7 +311,9 @@ polymarket clob create-order --side buy --price <best_ask> --size <kelly_size>
 
 ### 持仓记录
 
-成功成交后写入 `logs/positions.jsonl`，包含供 `position_monitor.py` 使用的丰富字段：
+成功成交（MATCHED）后写入 `logs/positions.jsonl`。LIVE 挂单写入 `logs/pending_orders.jsonl`，由 monitor 对账后补写 positions。
+
+持仓包含供 `position_monitor.py` 使用的丰富字段：
 
 ```json
 {

@@ -1146,7 +1146,15 @@ def reconcile_pending_orders():
     if not active:
         return
 
-    positions_snapshot = _get_positions_snapshot_cached()
+    print(f"  🔄 reconcile: 检查 {len(active)} 笔挂单...")
+
+    # 先尝试 positions snapshot，失败不影响后续 balance 查询
+    positions_snapshot = {}
+    try:
+        positions_snapshot = _get_positions_snapshot_cached()
+    except Exception as e:
+        print(f"  ⚠️ reconcile: positions snapshot 失败: {e}")
+
     open_positions = get_open_positions()
     open_keys = {(p.get("slug"), p.get("token_id")) for p in open_positions}
 
@@ -1158,7 +1166,9 @@ def reconcile_pending_orders():
         if not slug or not token_id:
             continue
 
+        # 已经在 positions.jsonl 中有记录，跳过
         if (slug, token_id) in open_keys:
+            print(f"  ✅ reconcile: {slug} 已在持仓中，标记 RESOLVED_ALREADY")
             _append_pending_update({
                 "order_id": order.get("order_id"),
                 "pending_id": order.get("pending_id"),
@@ -1177,15 +1187,22 @@ def reconcile_pending_orders():
             except Exception:
                 age = None
 
+        # 检测成交：先查 positions snapshot，再 fallback 到 token balance
         snapshot = positions_snapshot.get(str(token_id))
         filled_size = snapshot.get("size") if snapshot else None
+
         if not filled_size:
-            balance = get_token_balance(token_id)
-            if balance is not None and balance > 0:
-                filled_size = balance
-                snapshot = snapshot or {"size": balance, "avg_price": None}
+            try:
+                balance = get_token_balance(token_id)
+                print(f"  📊 reconcile: {slug} token balance={balance}")
+                if balance is not None and balance > 0:
+                    filled_size = balance
+                    snapshot = {"size": balance, "avg_price": None}
+            except Exception as e:
+                print(f"  ⚠️ reconcile: get_token_balance 失败: {e}")
+
         if filled_size and filled_size >= PENDING_MIN_FILL:
-            print(f"  ✅ pending 成交入仓: {slug} token={str(token_id)[:10]}... size={filled_size}")
+            print(f"  ✅ reconcile 成交入仓: {slug} token={str(token_id)[:10]}... size={filled_size}")
             avg_price = snapshot.get("avg_price") if snapshot else None
             entry_price = order.get("limit_price")
             price_source = "limit_price"
@@ -1202,14 +1219,18 @@ def reconcile_pending_orders():
 
             size = filled_size if filled_size else order.get("requested_size") or order.get("size") or 0
 
+            coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+            confidence = order.get("confidence") or 0
+            ev = order.get("ev") or 0
+
             position = {
                 "token_id": token_id,
                 "slug": slug,
                 "direction": order.get("direction"),
                 "entry_price": entry_price,
                 "size": size,
-                "confidence": order.get("confidence"),
-                "ev": order.get("ev"),
+                "confidence": confidence,
+                "ev": ev,
                 "entry_time": datetime.now(timezone.utc).isoformat(),
                 "closed": False,
                 "pending_order_id": order.get("order_id") or order.get("pending_id"),
@@ -1233,18 +1254,24 @@ def reconcile_pending_orders():
                 f.write(json.dumps(position) + "\n")
 
             cancel_all_orders(token_id)
+
+            # 挂单成交通知（区分于直接成交的 🎯 通知）
             try:
-                coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+                wait_sec = int(age) if age else "?"
                 msg = (
-                    "🔔 <b>挂单成交入仓</b>\n\n"
+                    f"⏰ <b>Polymarket 挂单成交</b>\n\n"
                     f"币种: {coin}\n"
                     f"方向: {order.get('direction')}\n"
-                    f"价格: ${entry_price:.2f} × {size}份\n"
-                    f"来源: {price_source}"
+                    f"置信度: {confidence*100:.0f}%\n"
+                    f"EV: {ev:+.3f}\n"
+                    f"价格: ${entry_price:.2f} × {size}份 = ${entry_price*size:.2f}\n"
+                    f"等待: {wait_sec}s | 来源: {price_source}"
                 )
                 send_telegram(msg)
-            except Exception:
-                pass
+                print(f"  📨 reconcile: TG通知已发送 - {coin} {order.get('direction')}")
+            except Exception as e:
+                print(f"  ❌ reconcile: TG通知失败: {e}")
+
             _append_pending_update({
                 "order_id": order.get("order_id"),
                 "pending_id": order.get("pending_id"),
@@ -1258,8 +1285,11 @@ def reconcile_pending_orders():
             })
             continue
 
-        if PENDING_AUTO_CANCEL and age is not None and age >= PENDING_ORDER_TTL:
-            print(f"  ⚠️ pending 过期取消: {slug} token={str(token_id)[:10]}... age={int(age)}s")
+        # 未成交，记录调试信息
+        print(f"  ⏳ reconcile: {slug} 未成交 filled_size={filled_size} age={int(age) if age else '?'}s")
+
+        if age is not None and age >= PENDING_ORDER_TTL:
+            print(f"  ⚠️ reconcile 过期取消: {slug} token={str(token_id)[:10]}... age={int(age)}s")
             cancel_all_orders(token_id)
             _append_pending_update({
                 "order_id": order.get("order_id"),
@@ -1269,6 +1299,19 @@ def reconcile_pending_orders():
                 "status": "EXPIRED",
                 "resolved_at": now.isoformat(),
             })
+            # 过期取消通知
+            try:
+                coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+                msg = (
+                    f"⌛ <b>挂单过期取消</b>\n\n"
+                    f"币种: {coin}\n"
+                    f"方向: {order.get('direction')}\n"
+                    f"限价: ${order.get('limit_price', 0):.2f} × {order.get('requested_size', 0)}份\n"
+                    f"等待: {int(age)}s"
+                )
+                send_telegram(msg)
+            except Exception:
+                pass
 
 def _looks_like_token_balance_listing(output):
     if not output:

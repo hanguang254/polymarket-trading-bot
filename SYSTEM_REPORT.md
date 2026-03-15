@@ -1,15 +1,16 @@
-# Polymarket Trading Bot v3.3 — 完整功能报告
+# Polymarket Trading Bot v7.0 — 完整功能报告
 
 ## 一、系统概述
 
-全自动 Polymarket 5 分钟加密货币二元市场交易机器人。核心策略为**折价套利**（非方向预测）：在价格偏离 PTB 时买入被低估的 token，通过提前平仓锁利，不依赖结算结果。
+全自动 Polymarket 5 分钟加密货币二元市场交易机器人。核心策略为**EV 驱动套利**：使用随机游走概率模型（`Φ(|gap|/σ√t)`）检测 token 是否被低估，通过 EV 驱动的分阶段退出管理持仓。
 
-**三大进程：**
+**三大进程 + 看门狗：**
 | 进程 | 文件 | 功能 |
 |------|------|------|
-| 主交易循环 | `auto_bot_v3.py` | 市场发现 → 预热观察 → 下注执行 |
-| 持仓监控 | `position_monitor.py` | 实时盯盘 → 4 阶段平仓 |
-| 自动领取 | `auto_redeem_v2.py` | 30 分钟轮询 → 结算领取 |
+| 主交易循环 | `auto_bot_v3.py` | 市场发现 → 预热观察 → 早期/晚期窗口下注 |
+| 持仓监控 | `position_monitor.py` | 实时盯盘 → 4 阶段平仓 → 挂单对账入仓 |
+| 自动领取 | `auto_redeem_v2.py` | 轮询 → 结算领取 |
+| 看门狗 | `watchdog_v3.sh` | 监控三进程 → 自动重启 |
 
 ---
 
@@ -20,14 +21,17 @@
  2s ─────── PTB 获取开始（Playwright → HTML → Gamma API 三级降级）
 20s ─────── 预热扫描开始（贝叶斯序贯更新，每5秒采样）
 40s ─────── PTB 获取截止
-100s ────── 下注窗口开启（已有80秒观察数据）
-160s ────── 下注窗口关闭
+90s ─────── 早期下注窗口开启（低门槛，抢CLOB定价偏差）
+95s ─────── 早期下注窗口关闭
+100s ────── 晚期下注窗口开启（标准门槛）
+160s ────── 晚期下注窗口关闭
      ─────── 实时盯盘开始（EV 驱动退出）
+     ─────── 挂单对账循环（LIVE → 检测成交 → 入仓 → TG通知）
 180s ────── 阶段1：流动性健康期（120-180s 剩余）
 240s ────── 阶段2：流动性下降期（60-120s 剩余）
 270s ────── 阶段3：流动性枯竭期（30-60s 剩余）
 290s ────── 阶段4：最后机会（0-30s 剩余）
-300s ────── 市场结束 → 结算
+300s ────── 市场结束 → API 查询真实 outcome → 结算
 ```
 
 ---
@@ -246,9 +250,9 @@ log P(UP|D1..Dt) = log P(UP) + Σ log P(Dk|UP)
 
 ---
 
-### 3.7 持仓监控 (`position_monitor.py`) — P1+P4
+### 3.7 持仓监控 (`position_monitor.py`) — P1+P4 + 挂单对账
 
-每 2 秒轮询所有未关闭持仓。
+每 2 秒轮询所有未关闭持仓。每轮还执行 `reconcile_pending_orders()` 对账挂单。
 
 #### EV 驱动实时退出（P1）— 替代固定 % 阈值
 
@@ -304,7 +308,36 @@ close_position() → record_outcome(slug, direction, diff_in_atr, won)
 
 ---
 
-### 3.8 交易状态管理 (`trading_state.py`)
+### 3.8 挂单对账系统 (`position_monitor.py` — `reconcile_pending_orders()`)
+
+**问题**：CLI 下单返回 `Status: LIVE`（挂单未立即成交），不记录持仓。若后续链上成交，持仓丢失。
+
+**解决方案**：
+```
+execute_bet() LIVE → 写入 pending_orders.jsonl
+                          ↓
+monitor 每轮调用 reconcile_pending_orders()
+                          ↓
+    ┌─ 已在 positions.jsonl? → RESOLVED_ALREADY
+    ├─ 查 positions snapshot / token balance
+    │   └─ filled_size ≥ PENDING_MIN_FILL → 入仓 + TG通知(⏰)
+    └─ age ≥ PENDING_ORDER_TTL → cancel_all + TG通知(⌛)
+```
+
+**成交检测优先级**：
+1. `polymarket data positions` snapshot（API 查链上持仓）
+2. `polymarket clob balance` token 余额（fallback）
+
+**TG 通知区分**：
+| 场景 | 标题 | 内容 |
+|------|------|------|
+| 直接成交 | 🎯 Polymarket 下注成功 | 币种/方向/置信度/EV/价格×份数 |
+| 挂单成交 | ⏰ Polymarket 挂单成交 | 同上 + 等待时间 + 价格来源 |
+| 挂单过期 | ⌛ 挂单过期取消 | 币种/方向/限价/等待时间 |
+
+---
+
+### 3.9 交易状态管理 (`trading_state.py`)
 
 | 功能 | 参数 | 说明 |
 |------|------|------|
@@ -315,7 +348,7 @@ close_position() → record_outcome(slug, direction, diff_in_atr, won)
 
 ---
 
-### 3.9 自动领取 (`auto_redeem_v2.py`)
+### 3.10 自动领取 (`auto_redeem_v2.py`)
 
 - 30 分钟轮询
 - 查询 PROXY_WALLET + EOA_WALLET 持仓
@@ -433,10 +466,11 @@ base_rate ──→ 先验/实证胜率 ───────┘
 ```
 polymarket-trading-bot/
 ├── auto_bot_v3.py              # 主交易循环（入口）
-├── ai_analyze_v2.py            # 决策引擎（EV + Kelly）
-├── position_monitor.py         # 持仓监控（EV 退出 + 4 阶段）
+├── ai_analyze_v2.py            # 决策引擎（EV + Kelly + 挂单记录）
+├── position_monitor.py         # 持仓监控（EV 退出 + 4 阶段 + 挂单对账）
 ├── auto_redeem_v2.py           # 自动结算领取
 ├── trading_state.py            # 状态管理
+├── watchdog_v3.sh              # 进程看门狗
 ├── ai_trader/
 │   ├── ai_model_v2.py         # 折价套利评分模型
 │   ├── base_rate.py           # Base Rate 校准（P0）
@@ -448,6 +482,7 @@ polymarket-trading-bot/
 │   └── indicators.py          # 技术指标（EMA/RSI/ATR/BB）
 ├── logs/
 │   ├── polymarket-bot.log     # 运行日志
+│   ├── monitor_YYYY-MM-DD.log # monitor 每日日志
 │   ├── positions.jsonl        # 持仓记录
 │   ├── bets.jsonl             # 下注记录
 │   ├── decisions_v2.jsonl     # 决策记录
@@ -455,7 +490,8 @@ polymarket-trading-bot/
 │   ├── trading_state.json     # 状态机
 │   ├── outcomes.jsonl         # 交易结果（base_rate 学习）
 │   ├── base_rates.json        # 实证胜率
-│   └── pre_orders.json        # 预挂单状态
+│   ├── pre_orders.json        # 预挂单状态
+│   └── pending_orders.jsonl   # LIVE 挂单追踪（对账用）
 ├── .env                        # 环境变量
 └── .env.example                # 环境变量模板
 ```

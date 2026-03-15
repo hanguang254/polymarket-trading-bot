@@ -2,21 +2,29 @@
 
 ## 一、系统概览
 
-**用途**：Polymarket 5分钟二元期权市场的持仓自动管理系统，负责止盈、止损、对冲、分批平仓和结算清理。
+**用途**：Polymarket 5分钟二元期权市场的持仓自动管理系统，负责止盈、止损、对冲、分批平仓、结算清理和**挂单对账入仓**。
 
-**运行方式**：`while True` 主循环，每 2 秒轮询一次所有未关闭持仓。
+**运行方式**：`while True` 主循环，每 2 秒轮询一次。每轮先执行 `reconcile_pending_orders()` 对账挂单，再处理所有未关闭持仓。
 
 **数据源**：
 | 数据 | 来源 |
 |------|------|
 | 持仓信息 | `logs/positions.jsonl`（本地文件） |
+| 挂单信息 | `logs/pending_orders.jsonl`（LIVE 挂单追踪） |
 | Token 价格/订单簿 | Polymarket CLOB API |
+| Token 余额 | `polymarket clob balance`（挂单成交检测） |
+| 链上持仓 | `polymarket data positions`（挂单成交检测） |
 | 加密货币实时价 | Binance API |
 | PTB (Price To Beat) | 持仓记录中的 `ptb` 字段 |
 | ATR (平均真实波幅) | Binance 1分钟K线计算 |
 | 胜率查表 | `ai_trader.base_rate` 模块 |
 
-**通知**：所有平仓事件通过 Telegram 推送。
+**通知**：
+| 事件 | 标题 |
+|------|------|
+| 平仓（止盈/止损/对冲） | 📈/📉 Polymarket 平仓通知 |
+| 挂单成交入仓 | ⏰ Polymarket 挂单成交 |
+| 挂单过期取消 | ⌛ 挂单过期取消 |
 
 ---
 
@@ -56,6 +64,16 @@
 | `close_position()` | 标记关闭 + 写回文件 + 记录到 base_rate 校准 |
 | `update_position()` | 更新仓位大小（分批卖出后的剩余） |
 | `cancel_all_orders()` | 取消某 token 所有活跃订单 |
+
+### 挂单对账
+| 函数 | 功能 |
+|------|------|
+| `reconcile_pending_orders()` | 主对账逻辑：检测 LIVE 挂单成交 → 写入持仓 + TG 通知 |
+| `_load_pending_orders()` | 从 `pending_orders.jsonl` 读取活跃挂单 |
+| `_append_pending_update()` | 写入状态更新（FILLED/EXPIRED/RESOLVED_ALREADY） |
+| `_fetch_positions_snapshot()` | 查询链上持仓快照（`polymarket data positions`） |
+| `_get_positions_snapshot_cached()` | 带 3s TTL 缓存的持仓快照 |
+| `get_token_balance()` | 查询特定 token 余额（fallback 成交检测） |
 
 ---
 
