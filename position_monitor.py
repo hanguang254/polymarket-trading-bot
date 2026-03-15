@@ -1963,69 +1963,73 @@ def monitor():
                 
                 # ═══ 阶段3：结束前60-30秒（流动性枯竭期）═══
                 if not sold and 30 < remaining <= 60:
-                    stage_ev = market_ev
-                    ev_label = ev_label_global
+                    # 方向正确 → 跳过阶段3，等阶段4持有到结算拿$1
+                    if direction_correct:
+                        print(f"  💎 阶段3: 方向正确，跳过平仓等结算 | {ev_label_global} | 剩余{remaining:.0f}s")
+                    else:
+                        stage_ev = market_ev
+                        ev_label = ev_label_global
 
-                    print(f"  🚨 阶段3：平仓 ({ev_label})")
+                        print(f"  🚨 阶段3：平仓 ({ev_label})")
 
-                    # EV > 0（token > entry）→ 设最低价保护，不用地板价
-                    min_price = None
-                    if stage_ev is not None and stage_ev > 0:
-                        min_price = max(entry_price * 0.85, 0.15)
-                        print(f"  🛡️ EV正，最低价保护: ${min_price:.2f}")
+                        # EV > 0（token > entry）→ 设最低价保护，不用地板价
+                        min_price = None
+                        if stage_ev is not None and stage_ev > 0:
+                            min_price = max(entry_price * 0.85, 0.15)
+                            print(f"  🛡️ EV正，最低价保护: ${min_price:.2f}")
 
-                    attempted_close = True
-                    result = smart_sell_position(token_id, size, is_losing)
-                    if result:
-                        success, sell_price, output = result
-                        if success and (min_price is None or sell_price >= min_price):
-                            sold = True
-                            sold_price = sell_price
-                            self_notify(pos, sold_price, coin, direction, size, "阶段3智能平仓")
-                        elif success and min_price and sell_price < min_price:
-                            # 已在交易所成交，必须标记关闭，否则产生幽灵持仓
-                            sold = True
-                            sold_price = sell_price
-                            print(f"  🛡️ 成交价${sell_price:.2f}<最低价${min_price:.2f}，已成交标记关闭")
-                            self_notify(pos, sold_price, coin, direction, size, "阶段3低价成交")
+                        attempted_close = True
+                        result = smart_sell_position(token_id, size, is_losing)
+                        if result:
+                            success, sell_price, output = result
+                            if success and (min_price is None or sell_price >= min_price):
+                                sold = True
+                                sold_price = sell_price
+                                self_notify(pos, sold_price, coin, direction, size, "阶段3智能平仓")
+                            elif success and min_price and sell_price < min_price:
+                                # 已在交易所成交，必须标记关闭，否则产生幽灵持仓
+                                sold = True
+                                sold_price = sell_price
+                                print(f"  🛡️ 成交价${sell_price:.2f}<最低价${min_price:.2f}，已成交标记关闭")
+                                self_notify(pos, sold_price, coin, direction, size, "阶段3低价成交")
 
-                    if not sold:
-                        # EV > 0 时保护最低价
-                        if min_price:
-                            best_bid = get_best_bid(token_id)
-                            if best_bid and best_bid < min_price:
-                                print(f"  🛡️ 最佳买价${best_bid:.3f}<最低价${min_price:.2f}，跳过市价卖出")
+                        if not sold:
+                            # EV > 0 时保护最低价
+                            if min_price:
+                                best_bid = get_best_bid(token_id)
+                                if best_bid and best_bid < min_price:
+                                    print(f"  🛡️ 最佳买价${best_bid:.3f}<最低价${min_price:.2f}，跳过市价卖出")
+                                else:
+                                    attempted_close = True
+                                    ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
+                                    if actual_price == "NO_BALANCE":
+                                        print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                        close_position(pos, current_price or 0)
+                                        close_attempts.pop(attempt_key, None)
+                                        sold = True
+                                    elif ok:
+                                        if actual_price >= min_price:
+                                            sold = True
+                                            sold_price = actual_price
+                                            self_notify(pos, sold_price, coin, direction, size, "阶段3市价平仓")
+                                        else:
+                                            sold = True
+                                            sold_price = actual_price
+                                            print(f"  🛡️ 市价成交${actual_price:.2f}<最低价${min_price:.2f}，已成交标记关闭")
+                                            self_notify(pos, sold_price, coin, direction, size, "阶段3低价成交")
                             else:
+                                # 无最低价保护，直接市价
                                 attempted_close = True
-                                ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
+                                ok, actual_price = market_sell_immediate(token_id, size)
                                 if actual_price == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
                                     close_position(pos, current_price or 0)
                                     close_attempts.pop(attempt_key, None)
                                     sold = True
                                 elif ok:
-                                    if actual_price >= min_price:
-                                        sold = True
-                                        sold_price = actual_price
-                                        self_notify(pos, sold_price, coin, direction, size, "阶段3市价平仓")
-                                    else:
-                                        sold = True
-                                        sold_price = actual_price
-                                        print(f"  🛡️ 市价成交${actual_price:.2f}<最低价${min_price:.2f}，已成交标记关闭")
-                                        self_notify(pos, sold_price, coin, direction, size, "阶段3低价成交")
-                        else:
-                            # 无最低价保护，直接市价
-                            attempted_close = True
-                            ok, actual_price = market_sell_immediate(token_id, size)
-                            if actual_price == "NO_BALANCE":
-                                print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                close_position(pos, current_price or 0)
-                                close_attempts.pop(attempt_key, None)
-                                sold = True
-                            elif ok:
-                                sold = True
-                                sold_price = actual_price
-                                self_notify(pos, sold_price, coin, direction, size, "阶段3市价平仓")
+                                    sold = True
+                                    sold_price = actual_price
+                                    self_notify(pos, sold_price, coin, direction, size, "阶段3市价平仓")
                 
                 # ═══ 阶段4：结束前30秒（最后机会）═══
                 if not sold and 0 < remaining <= 30:
