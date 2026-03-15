@@ -36,7 +36,7 @@ def _random_walk_p_win(gap, atr_val, remaining_seconds):
     z = abs(gap) / sigma_total
     p_win = 0.5 * (1 + math.erf(z / math.sqrt(2)))   # Φ(z)
 
-    return min(p_win, 0.92)                # hard cap
+    return p_win                             # cap 由 P_WIN_CAP env 统一控制
 
 
 def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, details, action="SKIP"):
@@ -288,9 +288,16 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     elif trend_15m_align == "confirming":
         details["trend_15m_filter"] = "boosted"
 
+    # ── 等比EV门槛：昂贵token的EV天花板天然更低，按利润空间等比缩放 ──
+    # price=0.50 时门槛 = MIN_EV（不变）; price=0.85 时门槛 = MIN_EV × 0.30
+    potential_profit = max(1 - target_odds, 0.05)   # 每份合约最大利润，下限5%
+    ev_threshold = MIN_EV * potential_profit / 0.50  # 以 price=0.50 为基准等比缩放
+    ev_threshold = max(ev_threshold, 0.01)           # 绝对下限：防止极端情况
+    details["ev_threshold"] = round(ev_threshold, 4)
+
     should_bet = (
         diff_in_atr >= MIN_ATR_DEVIATION  # ATR偏离：过滤无信号区间
-        and ev > MIN_EV                    # 净EV：扣除spread后仍有边际
+        and ev > ev_threshold              # 等比EV：按token价格自适应门槛
         and target_odds < MAX_PRICE        # 不买太贵（env可配置）
         and confidence >= MIN_CONFIDENCE   # 置信度（env可配置）
         and details.get("trend_15m_filter") != "blocked"  # 15m趋势过滤
@@ -305,7 +312,7 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     filter_label = f" [{details.get('trend_15m_filter', '')}]" if details.get("trend_15m_filter") else ""
     details["bet_reason"] = (
         f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
-        f"ev={ev:+.4f}({'✅' if ev>MIN_EV else '❌'}>{MIN_EV},扣spread{spread_cost:.3f}) "
+        f"ev={ev:+.4f}({'✅' if ev>ev_threshold else '❌'}>{ev_threshold:.3f}[adapt],扣spread{spread_cost:.3f}) "
         f"p_win={p_win:.3f} rw={rw_p_win:.3f} base={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "
