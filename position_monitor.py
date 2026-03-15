@@ -1032,7 +1032,7 @@ PRE_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs
 
 # Pending buy orders (LIVE but not yet matched)
 PENDING_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "pending_orders.jsonl")
-PENDING_ORDER_TTL = int(os.environ.get("PENDING_ORDER_TTL", "120"))
+PENDING_ORDER_TTL = int(os.environ.get("PENDING_ORDER_TTL", "30"))
 PENDING_AUTO_CANCEL = os.environ.get("PENDING_AUTO_CANCEL", "0") == "1"
 PENDING_MIN_FILL = float(os.environ.get("PENDING_MIN_FILL", "0.5"))
 
@@ -1323,6 +1323,39 @@ def reconcile_pending_orders():
 
         # 未成交，记录调试信息
         print(f"  ⏳ reconcile: {slug} 未成交 filled_size={filled_size} age={int(age) if age else '?'}s")
+
+        # ═══ 价格守卫：当前市价大幅低于挂单限价时，立即取消避免高位接盘 ═══
+        limit_price = order.get("limit_price")
+        if limit_price and limit_price > 0:
+            current_ltp = get_last_trade_price(token_id)
+            if current_ltp and current_ltp < limit_price * 0.95:
+                deviation_pct = (limit_price - current_ltp) / limit_price * 100
+                print(f"  🛡️ 价格守卫: 市价${current_ltp:.3f} < 挂单价${limit_price:.3f}×0.95 (偏离{deviation_pct:.1f}%)，取消挂单")
+                cancel_all_orders(token_id)
+                _append_pending_update({
+                    "order_id": order.get("order_id"),
+                    "pending_id": order.get("pending_id"),
+                    "slug": slug,
+                    "token_id": token_id,
+                    "status": "PRICE_GUARD_CANCELLED",
+                    "limit_price": limit_price,
+                    "current_price": current_ltp,
+                    "deviation_pct": round(deviation_pct, 1),
+                    "resolved_at": now.isoformat(),
+                })
+                try:
+                    coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+                    msg = (
+                        f"🛡️ <b>挂单价格保护取消</b>\n\n"
+                        f"币种: {coin}\n"
+                        f"方向: {order.get('direction')}\n"
+                        f"挂单价: ${limit_price:.2f} → 市价: ${current_ltp:.3f}\n"
+                        f"偏离: {deviation_pct:.1f}%，避免高位接盘"
+                    )
+                    send_telegram(msg)
+                except Exception:
+                    pass
+                continue
 
         if age is not None and age >= PENDING_ORDER_TTL:
             print(f"  ⚠️ reconcile 过期取消: {slug} token={str(token_id)[:10]}... age={int(age)}s")

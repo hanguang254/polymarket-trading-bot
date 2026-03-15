@@ -519,6 +519,13 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 实际买入价${price:.2f}≥${MAX_PRICE}，上行空间不足，跳过下注")
         return False, 0, 0, "SKIP_PRICE_TOO_HIGH"
 
+    # 限价上限保护：买入价不应超过 p_win（理论公允价），防止出价过高
+    p_win_cap = entry_details.get("p_win_final") if entry_details else None
+    if p_win_cap and p_win_cap > 0.10 and price > p_win_cap:
+        capped_price = round(p_win_cap, 2)
+        print(f"  🛡️ 限价保护: ${price:.2f} > p_win=${p_win_cap:.3f}，降至${capped_price:.2f}")
+        price = capped_price
+
     # P2: 退出流动性检查 — 下注前检查能否卖出
     bid_depth = check_bid_depth(token_id)
     if bid_depth is not None:
