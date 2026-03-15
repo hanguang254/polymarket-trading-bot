@@ -1662,10 +1662,22 @@ def monitor():
                 # 早期波动大、CLOB流动性差，需要更宽容的阈值
                 # 注意：最后30秒不降级 — CLOB已关闭无法下单，降级只会白费力气
                 #       方向正确就持有到结算拿$1
-                drawdown_limit = -0.30 if remaining > 180 else -0.20 if remaining > 120 else -0.15 if remaining > 60 else -0.10
-                if direction_correct and profit_rate < drawdown_limit and remaining > 30:
-                    print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%（阈值{drawdown_limit*100:.0f}%），市场信号矛盾，不再盲目持有")
-                    direction_correct = False  # 降级为方向未知，走正常止损流程
+                # 持仓时间保护：入场<60秒CLOB流动性差，token价格波动不代表真实信号
+                hold_seconds = 0
+                if entry_time:
+                    try:
+                        entry_dt = datetime.fromisoformat(entry_time)
+                        hold_seconds = (datetime.now(timezone.utc) - entry_dt).total_seconds()
+                    except (ValueError, TypeError):
+                        hold_seconds = 0
+
+                if hold_seconds < 60:
+                    pass  # 入场<60秒，跳过降级检查，CLOB流动性差token价格不可靠
+                else:
+                    drawdown_limit = -0.30 if remaining > 180 else -0.20 if remaining > 120 else -0.15 if remaining > 60 else -0.10
+                    if direction_correct and profit_rate < drawdown_limit and remaining > 30:
+                        print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%（阈值{drawdown_limit*100:.0f}%），市场信号矛盾，不再盲目持有")
+                        direction_correct = False  # 降级为方向未知，走正常止损流程
 
                 # ═══ EV 持续监控（Exit Protocol）═══
                 # 二元市场: token_price ≈ 市场隐含胜率 → EV = token_price - entry_price
