@@ -1418,9 +1418,14 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
+            print(f"    [SELL] create-order failed: rc={result.returncode} stderr={result.stderr.strip()[:200]} stdout={result.stdout.strip()[:200]}")
             return False, result.stderr.strip() or "下单失败"
 
         info = parse_order_output(result.stdout)
+        print(
+            f"    [SELL] status={info['status']} matched={info['matched']} "
+            f"making={info['making']:.4f} taking={info['taking']:.4f} order_id={info.get('order_id')}"
+        )
         if info["matched"]:
             actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
             return True, actual_price
@@ -1433,8 +1438,10 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
             time.sleep(1)
 
         cancel_all_orders(token_id)
+        print(f"    [SELL] not matched after {timeout_sec}s, order cancelled")
         return False, "未成交已取消"
     except Exception as e:
+        print(f"    [SELL] exception: {str(e)[:200]}")
         return False, str(e)
 
 def sell_in_batches(token_id, total_size, base_price):
