@@ -1400,15 +1400,21 @@ def _parse_token_balance_from_output(output, token_id):
     return None
 
 def get_token_balance(token_id):
-    """查询钱包中指定 token 余额（用于挂单成交对账）"""
+    """查询钱包中指定 conditional token 余额"""
     try:
-        cmd = ["polymarket", "clob", "balance", "--signature-type", "eoa"]
+        cmd = [
+            "polymarket", "clob", "balance",
+            "--asset-type", "conditional",
+            "--token", str(token_id),
+            "--signature-type", "eoa",
+            "--output", "json",
+        ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            output = result.stdout or ""
-            balance = _parse_token_balance_from_output(output, token_id)
-            if balance is not None:
-                return balance
+            data = json.loads(result.stdout)
+            bal = data.get("balance")
+            if bal is not None:
+                return float(bal)
     except Exception:
         pass
     return None
@@ -1416,17 +1422,10 @@ def get_token_balance(token_id):
 def check_balance_changed(token_id, expected_size):
     """通过查询token余额判断是否成交（余额减少=卖出成功）"""
     try:
-        cmd = ["polymarket", "clob", "balance", "--signature-type", "eoa"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            # 解析余额输出，检查token是否还在
-            output = result.stdout or ""
-            balance = _parse_token_balance_from_output(output, token_id)
-            if balance is not None:
-                threshold = max(0.01, expected_size * 0.01)
-                return balance <= threshold
-            if _looks_like_token_balance_listing(output) and token_id not in output:
-                return True
+        balance = get_token_balance(token_id)
+        if balance is not None:
+            threshold = max(0.01, expected_size * 0.01)
+            return balance <= threshold
     except:
         pass
     return False
