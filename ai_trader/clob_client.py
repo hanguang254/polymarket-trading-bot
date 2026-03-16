@@ -87,26 +87,52 @@ def precache_token(token_id):
 
 
 def _warmup():
-    """预热签名库 + TLS连接池，首次调用后后续下单延迟从 ~200ms 降至 ~26ms"""
-    try:
-        t0 = time.time()
-        # 1. 预热TLS连接池：发真实HTTP请求建立连接
-        _client.get_server_time()
-        t1 = time.time()
-        tls_ms = (t1 - t0) * 1000
+    """预热签名库 + TLS/HTTP2连接池
 
-        # 2. 预热签名库：本地创建假单触发 coincurve/secp256k1 加载
-        #    使用 get_tick_size 先缓存 tick_size，避免额外查询
+    原理：首次 EIP-712 签名需加载 coincurve/secp256k1（~150ms），
+    首次 HTTPS 请求需 TLS 握手 + HTTP/2 协商（~300ms）。
+    预热后复用连接池，后续下单只剩纯网络延迟（~25-350ms 取决于物理距离）。
+
+    步骤：
+    1. 假签名：create_order 触发 coincurve 加载（本地，~1ms after first）
+    2. GET 预热：get_server_time 建立 TLS + HTTP/2 连接
+    3. POST 预热：假 post_order 确保 POST endpoint 的 HTTP/2 stream 就绪
+    """
+    t0 = time.time()
+    try:
+        # 1. 预热签名库：本地创建假单触发 coincurve/secp256k1 加载
+        #    neg_risk=True 避免 SDK 内部把 False 当 falsy 触发额外 HTTP 查询
         _client.create_order(
             OrderArgs(token_id="0", price=0.01, size=1.0, side=BUY),
-            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=True),
         )
-        t2 = time.time()
-        sign_ms = (t2 - t1) * 1000
+        t1 = time.time()
+        sign_ms = (t1 - t0) * 1000
 
-        logger.info(f"🔥 预热完成: TLS={tls_ms:.0f}ms 签名={sign_ms:.0f}ms 总计={(t2-t0)*1000:.0f}ms")
+        # 2. GET 预热：建立 TLS 连接 + HTTP/2 协商
+        _client.get_server_time()
+        t2 = time.time()
+        tls_ms = (t2 - t1) * 1000
+
+        # 3. POST 预热：用假单发一次真实 POST 到 /order endpoint
+        #    SDK 内部 httpx.Client 按 (host,port) 复用连接，但 POST 可能走不同的 HTTP/2 stream
+        #    这一步确保 POST 路径完全就绪（含 API 鉴权头序列化）
+        try:
+            fake_order = _client.create_order(
+                OrderArgs(token_id="0", price=0.01, size=1.0, side=BUY),
+                options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=True),
+            )
+            _client.post_order(fake_order, OrderType.GTC)
+        except Exception:
+            pass  # 假token必定被服务器拒绝，但 POST 连接已建立
+        t3 = time.time()
+        post_ms = (t3 - t2) * 1000
+
+        logger.info(
+            f"🔥 预热完成: 签名={sign_ms:.0f}ms TLS={tls_ms:.0f}ms "
+            f"POST={post_ms:.0f}ms 总计={(t3-t0)*1000:.0f}ms"
+        )
     except Exception as e:
-        # create_order 用假token可能报错，但签名库已加载，目的达到
         elapsed = (time.time() - t0) * 1000
         logger.info(f"🔥 预热完成(签名库已加载): {elapsed:.0f}ms | {e}")
 
