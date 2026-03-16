@@ -1427,7 +1427,13 @@ def monitor():
                 attempt_key = (slug, entry_time)
                 coin = "BTC" if "btc" in slug else "ETH"
                 direction = pos.get("direction", "UP")
-                
+
+                # 预缓存 neg_risk/fee_rate，避免平仓时额外HTTP查询
+                clob_client.precache_token(token_id)
+                opposite_token = pos.get("opposite_token_id")
+                if opposite_token:
+                    clob_client.precache_token(opposite_token)
+
                 # 获取当前token价格
                 current_price = get_market_price(token_id)
                 if current_price is None:

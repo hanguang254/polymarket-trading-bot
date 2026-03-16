@@ -595,6 +595,10 @@ class MarketTracker:
             # 先用 up_token 做 LMSR 评估（方向确定后会用正确的）
             extra_info["token_id"] = up_token
 
+            # 预缓存 neg_risk/fee_rate/tick_size，避免下单时额外HTTP查询（省~200ms×2）
+            clob_client.precache_token(up_token)
+            clob_client.precache_token(down_token)
+
             # CLOB 订单簿数据：mid 供参考，best_ask 在 analyze_and_decide 中用于执行价校准
             # Gamma 赔率用于方向/概率判断，CLOB best_ask 用于 EV/折价的执行价校准(C1)
             clob = get_realtime_odds(up_token, down_token)

@@ -50,6 +50,42 @@ def get_client() -> ClobClient:
     return _client
 
 
+# ── 预缓存（消除下单时的额外HTTP查询） ──
+
+_token_cache = {}  # token_id -> {"neg_risk": bool, "fee_rate_bps": int, "tick_size": str}
+
+
+def precache_token(token_id):
+    """预缓存 token 的 neg_risk/fee_rate/tick_size，避免下单时额外HTTP查询
+
+    调用时机：获取到 token_id 后立即调用（在分析阶段），
+    这样下单时 create_order 内部的缓存已就绪，延迟从 ~3.5s 降至 ~500ms。
+    """
+    token_id = str(token_id)
+    if token_id in _token_cache:
+        return _token_cache[token_id]
+
+    t0 = time.time()
+    try:
+        # 这3个调用会填充 SDK 内部缓存，后续 create_order 直接命中缓存
+        neg_risk = _client.get_neg_risk(token_id)
+        fee_rate = _client.get_fee_rate_bps(token_id)
+        tick_size = _client.get_tick_size(token_id)
+
+        _token_cache[token_id] = {
+            "neg_risk": neg_risk,
+            "fee_rate_bps": fee_rate,
+            "tick_size": tick_size,
+        }
+        elapsed = (time.time() - t0) * 1000
+        logger.info(f"📦 预缓存token: neg_risk={neg_risk} fee={fee_rate}bps tick={tick_size} | {elapsed:.0f}ms")
+        return _token_cache[token_id]
+    except Exception as e:
+        elapsed = (time.time() - t0) * 1000
+        logger.warning(f"⚠️ 预缓存失败: {e} | {elapsed:.0f}ms")
+        return None
+
+
 def _warmup():
     """预热签名库 + TLS连接池，首次调用后后续下单延迟从 ~200ms 降至 ~26ms"""
     try:
@@ -91,17 +127,20 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
         dict: {success, matched, order_id, status, making, taking, raw}
     """
     t0 = time.time()
+    token_id = str(token_id)
+    cached = _token_cache.get(token_id, {})
+    neg_risk = cached.get("neg_risk", None)
+    # neg_risk=None 时 SDK 内部查缓存（precache_token 已填充）；True 直接跳过查询
     try:
         resp = _client.create_and_post_order(
             OrderArgs(
-                token_id=str(token_id),
+                token_id=token_id,
                 price=float(price),
                 size=float(size),
                 side=side,
             ),
-            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
         )
-        # post_order 不接受 order_type 参数，GTC 是默认值
         elapsed = (time.time() - t0) * 1000
         result = _parse_response(resp)
         result["elapsed_ms"] = round(elapsed, 1)
@@ -131,13 +170,15 @@ def place_fok_order(token_id, side, price, size):
         dict: 同 place_order
     """
     t0 = time.time()
+    token_id = str(token_id)
+    cached = _token_cache.get(token_id, {})
+    neg_risk = cached.get("neg_risk", None)
     try:
         # MarketOrderArgs 的 amount 对 SELL 是份数，对 BUY 是美元金额
-        # 但 FOK 需要 price 作为最差价限制
         amount = float(price) * float(size) if side == BUY else float(size)
         order = _client.create_market_order(
             MarketOrderArgs(
-                token_id=str(token_id),
+                token_id=token_id,
                 amount=amount,
                 side=side,
                 price=float(price),
@@ -146,7 +187,7 @@ def place_fok_order(token_id, side, price, size):
                 taker="0x0000000000000000000000000000000000000000",
                 order_type=OrderType.FOK,
             ),
-            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
         )
         resp = _client.post_order(order, OrderType.FOK)
         elapsed = (time.time() - t0) * 1000
@@ -266,17 +307,20 @@ def _parse_response(resp):
     if isinstance(raw, dict):
         status = raw.get("status", raw.get("orderStatus", ""))
         order_id = raw.get("orderID", raw.get("order_id", raw.get("id", "")))
-        matched = status == "MATCHED" or status == "FILLED"
-        making = float(raw.get("making", raw.get("makerAmount", 0)) or 0)
-        taking = float(raw.get("taking", raw.get("takerAmount", 0)) or 0)
+        # API 返回的 status 可能是小写 "matched" 或大写 "MATCHED"
+        status_upper = status.upper() if isinstance(status, str) else ""
+        matched = status_upper in ("MATCHED", "FILLED")
+        making = float(raw.get("making", raw.get("makingAmount", raw.get("makerAmount", 0))) or 0)
+        taking = float(raw.get("taking", raw.get("takingAmount", raw.get("takerAmount", 0))) or 0)
     else:
         status = str(getattr(raw, "status", ""))
         order_id = str(getattr(raw, "orderID", getattr(raw, "order_id", "")))
-        matched = "MATCHED" in status or "FILLED" in status
+        status_upper = status.upper()
+        matched = status_upper in ("MATCHED", "FILLED")
         making = float(getattr(raw, "making", 0) or 0)
         taking = float(getattr(raw, "taking", 0) or 0)
 
-    success = matched or status in ("MATCHED", "FILLED", "LIVE")
+    success = matched or status.upper() in ("MATCHED", "FILLED", "LIVE")
 
     return {
         "success": success,
