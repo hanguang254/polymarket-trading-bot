@@ -5,6 +5,8 @@ Polymarket CLOB SDK 客户端封装 — 替代 CLI subprocess 调用
 import os
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
@@ -18,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 # ── 全局单例 ──
 _client: ClobClient = None
+_executor = ThreadPoolExecutor(max_workers=4)
+
+# ── 订单簿缓存（2秒TTL，消除同一分析周期内的重复HTTP请求） ──
+_book_cache = {}        # token_id -> (book, timestamp)
+_book_cache_lock = threading.Lock()
+BOOK_CACHE_TTL = 2.0    # 秒
 
 
 def init_client():
@@ -84,6 +92,21 @@ def precache_token(token_id):
         elapsed = (time.time() - t0) * 1000
         logger.warning(f"⚠️ 预缓存失败: {e} | {elapsed:.0f}ms")
         return None
+
+
+def precache_tokens(token_ids):
+    """并行预缓存多个token的neg_risk/fee_rate/tick_size（省~50%延迟）"""
+    t0 = time.time()
+    futures = {tid: _executor.submit(precache_token, tid) for tid in token_ids}
+    results = {}
+    for tid, fut in futures.items():
+        try:
+            results[tid] = fut.result(timeout=5)
+        except Exception:
+            results[tid] = None
+    elapsed = (time.time() - t0) * 1000
+    logger.info(f"📦 并行预缓存{len(token_ids)}个token完成 | {elapsed:.0f}ms")
+    return results
 
 
 def _warmup():
@@ -174,6 +197,7 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
         )
         elapsed = (time.time() - t0) * 1000
+        invalidate_book_cache(token_id)  # 下单后清除缓存，确保后续数据新鲜
         result = _parse_response(resp)
         result["elapsed_ms"] = round(elapsed, 1)
         logger.info(f"📡 SDK下单 {side} {size}@{price} | {result['status']} | {elapsed:.0f}ms")
@@ -223,6 +247,7 @@ def place_fok_order(token_id, side, price, size):
         )
         resp = _client.post_order(order, OrderType.FOK)
         elapsed = (time.time() - t0) * 1000
+        invalidate_book_cache(token_id)  # FOK后清除缓存
         result = _parse_response(resp)
         result["elapsed_ms"] = round(elapsed, 1)
         logger.info(f"⚡ FOK {side} {size}@{price} | {result['status']} | {elapsed:.0f}ms")
@@ -294,13 +319,42 @@ def get_token_balance(token_id):
 
 # ── 市场数据 ──
 
-def get_orderbook(token_id):
-    """获取订单簿"""
+def get_orderbook(token_id, max_age=None):
+    """获取订单簿（2秒TTL缓存，同一分析周期内避免重复HTTP）
+
+    Args:
+        token_id: 代币ID
+        max_age: 缓存最大年龄（秒），None=使用默认TTL，0=强制刷新
+    """
+    token_id = str(token_id)
+    ttl = max_age if max_age is not None else BOOK_CACHE_TTL
+
+    # 检查缓存
+    if ttl > 0:
+        with _book_cache_lock:
+            if token_id in _book_cache:
+                book, ts = _book_cache[token_id]
+                if time.time() - ts < ttl:
+                    return book
+
+    # 缓存未命中或过期，发起HTTP请求
     try:
-        return _client.get_order_book(str(token_id))
+        book = _client.get_order_book(token_id)
+        with _book_cache_lock:
+            _book_cache[token_id] = (book, time.time())
+        return book
     except Exception as e:
         logger.warning(f"获取订单簿失败: {e}")
         return None
+
+
+def invalidate_book_cache(token_id=None):
+    """清除订单簿缓存（下单/平仓后调用，确保后续获取新鲜数据）"""
+    with _book_cache_lock:
+        if token_id:
+            _book_cache.pop(str(token_id), None)
+        else:
+            _book_cache.clear()
 
 
 def get_midpoint(token_id):

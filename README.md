@@ -57,13 +57,15 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds.
 - **Liquidity-Capped Sizing (P3)**: Kelly size capped at 50% of exit bid depth. Works with P2 — P2 gates entry, P3 adjusts size.
 - **Balance Auto-Retry**: When balance insufficient, automatically retries with reduced size (98%/95%/90%) instead of skipping entirely.
+- **Post-Buy Allowance Refresh**: After successful buy (both direct and pending fill), queries actual on-chain `token_balance` and calls `update_balance_allowance` to ensure sell authorization is pre-set. Prevents "not enough balance / allowance" errors at exit time.
+- **Parallel Entry Fetch**: Balance + orderbook queries run concurrently via ThreadPoolExecutor, saving ~0.5s per bet execution.
 - **CLOB C1 Calibration**: Replaces Gamma odds with CLOB `best_ask` for discount/EV/price checks — prevents buying at $0.85 while thinking price is $0.50. Empty book detection (ask ≥ 0.95) falls back to `last-trade-price`.
 - **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
 - **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
 
 ### Exit (P0-P1 + P4)
 - **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.20) and `P0_HYPERBOLIC_K` (default 0.15). P0 sells at entry_price (guaranteed fill) instead of best_bid.
-- **Market-Price Immediate Stop-Loss**: `market_sell_immediate()` cancels existing orders first (prevents balance lock), then ladder sells at bid→95%→90%→80%→$0.05→$0.01 (~6s to clear).
+- **Market-Price Immediate Stop-Loss**: `market_sell_immediate()` cancels existing orders first (prevents balance lock), then ladder sells at bid→95%→90%→80%→$0.05→$0.01 (~6s to clear). On "not enough balance / allowance" error with confirmed on-chain balance, auto-refreshes allowance and retries before falling back to reduced-size attempts.
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
 - **EV-Driven Diamond Hands**: Direction correct + ≤120s remaining → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥1.0, capped at 2.0) → hold to settlement. Weak EV (0~0.03) → releases to Stage 3/4 fine-grained EV strategy. Early exit requires both EV < -3% AND ATR < 1.0 (dual condition).
 - **Direction-Based Exit**: Uses crypto price vs PTB to determine win/loss (not token orderbook price, which can be misleading due to wide bid-ask spreads near settlement).
@@ -81,6 +83,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
 
 ### Infrastructure
+- **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
+- **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
@@ -184,9 +188,14 @@ clob_client.get_orderbook(token_id)
 clob_client.get_midpoint(token_id)
 clob_client.get_last_trade_price(token_id)
 
-# Balance
-clob_client.get_balance()              # USDC collateral
-clob_client.get_token_balance(token_id) # Conditional token
+# Balance & Allowance
+clob_client.get_balance()                  # USDC collateral
+clob_client.get_token_balance(token_id)    # Conditional token balance
+clob_client.update_token_allowance(token_id) # Refresh token sell authorization
+
+# Warmup & Cache
+clob_client.precache_tokens([t1, t2])      # Parallel neg_risk/fee_rate/tick_size cache
+clob_client.invalidate_book_cache(token_id) # Clear orderbook cache after trades
 
 # Cancel
 clob_client.cancel_all(token_id)
@@ -301,7 +310,7 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 
 ## Version History
 
-- **v8.0**: SDK migration + unbiased Bayesian — All trading operations (order, cancel, balance, orderbook) migrated from Polymarket CLI subprocess (2-8s) to py-clob-client SDK direct calls (<50ms). SDK warmup pre-loads TLS connection pool + coincurve signing library + pre-caches neg_risk/fee_rate/tick_size into SDK internal cache (bypasses per-order HTTP lookups). Fake POST warmup pre-establishes HTTP/2 stream for first real order. Pending order reconciliation uses SDK `get_order()` instead of CLI subprocess (CLI dependency fully removed from monitor). Entry pricing uses best_ask from orderbook (primary) instead of stale last-trade-price. FOK (Fill-or-Kill) orders for all exit/stop-loss operations. Bayesian prior changed from market odds to unbiased 0.5 (fixes DOWN directional bias). Tie-breaking at price==PTB now assigns UP instead of DOWN. Circuit breaker fix: empty market list no longer triggers false 300s cooldown. EV spread cost scales by early exit probability (EARLY_EXIT_RATIO, default 0.3). Sell operations return NO_BALANCE on insufficient balance instead of infinite retry. Status field normalized to uppercase throughout (fixes "live"/"pending" case mismatch from SDK responses).
+- **v8.0**: SDK migration + unbiased Bayesian — All trading operations (order, cancel, balance, orderbook) migrated from Polymarket CLI subprocess (2-8s) to py-clob-client SDK direct calls (<50ms). SDK warmup pre-loads TLS connection pool + coincurve signing library + pre-caches neg_risk/fee_rate/tick_size into SDK internal cache (bypasses per-order HTTP lookups). Fake POST warmup pre-establishes HTTP/2 stream for first real order. Pending order reconciliation uses SDK `get_order()` instead of CLI subprocess (CLI dependency fully removed from monitor). Entry pricing uses best_ask from orderbook (primary) instead of stale last-trade-price. FOK (Fill-or-Kill) orders for all exit/stop-loss operations. Bayesian prior changed from market odds to unbiased 0.5 (fixes DOWN directional bias). Tie-breaking at price==PTB now assigns UP instead of DOWN. Circuit breaker fix: empty market list no longer triggers false 300s cooldown. EV spread cost scales by early exit probability (EARLY_EXIT_RATIO, default 0.3). Sell operations return NO_BALANCE on insufficient balance instead of infinite retry. Status field normalized to uppercase throughout (fixes "live"/"pending" case mismatch from SDK responses). Post-buy `token_balance` saved to position + `update_balance_allowance` called to pre-authorize sells (fixes "not enough balance / allowance" at exit). Sell functions auto-refresh allowance and retry when on-chain balance confirmed but API rejects. Monitor uses `token_balance` (actual chain balance) over `size` (order response) for sell sizing. Parallel balance+orderbook fetch in execute_bet (~0.5s saved). Orderbook 2s TTL cache eliminates redundant HTTP within analysis cycle. Warmup phase pre-caches token_ids + SDK parameters in parallel (~2s saved at analysis time).
 - **v7.0**: Pending order reconciliation + early bet window + random walk p_win — LIVE orders tracked in `pending_orders.jsonl`, monitor auto-detects fills via wallet balance and records positions with distinct TG notification (⏰). Early bet window (90-95s) with lower thresholds captures CLOB mispricing. Random walk probability `Φ(|gap|/σ√t)` replaces static base_rate. 15-min K-line trend filter reduces counter-trend entries. Balance auto-retry (98%/95%/90%). Market-price immediate stop-loss cancels existing orders first. P0 sells at entry_price for guaranteed fill. Settlement uses API real outcome. ATR hold threshold capped at 2.0 with dual early-exit condition.
 - **v6.0**: Full-duration stop-loss + EV-only entry — Stop-loss covers entire market duration (>30s) instead of stage-limited windows. Market-price ladder sell (bid→95%→90%→80%→$0.05→$0.01, ~6s). Removed discount condition from entry (was blocking almost all bets due to conservative estimated_value ≈ 0.51). Entry now uses 3 conditions: EV > MIN_EV, confidence ≥ MIN_CONFIDENCE, odds < MAX_BUY_PRICE (all env configurable). Consolidated duplicated P1 hedge code into single universal block. New `get_best_bid_raw()` for stop-loss (no discount, no slippage deduction).
 - **v4.0**: Empty book resilience — Entry: CLOB C1 calibration (best_ask校准防虚假折价) + empty book override (Gamma EV二次放行, 校准价下单). Exit: `get_best_bid/ask/market_price` fall back to `last-trade-price ± SLIPPAGE` when orderbook empty. Stage 3/4 EV sanity check (market price halved → override fake positive EV). New env: `MAX_BUY_PRICE`, `SLIPPAGE`. Fixes BTC DOWN $0.21→$0.01→$0.00 全程无止损 case.

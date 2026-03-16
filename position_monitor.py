@@ -368,6 +368,16 @@ def market_sell_immediate(token_id, size, price=None):
         print(f"    ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
         err = info.get("error", "") or info.get("raw", "")
         if "not enough balance" in err.lower():
+            # 链上确认有余额 → 可能是allowance不足，刷新后重试原始size
+            if adjusted and adjusted > 0:
+                print(f"    🔄 链上有余额但授权不足，刷新allowance后重试")
+                clob_client.update_token_allowance(token_id)
+                info_a = clob_client.place_fok_order(token_id, SELL, sell_price, size)
+                if info_a["matched"]:
+                    ap = round(info_a["taking"] / size, 4) if size > 0 and info_a["taking"] > 0 else sell_price
+                    print(f"    ⚡ allowance刷新后成交: 实际价=${ap:.4f} | {info_a.get('elapsed_ms', 0):.0f}ms")
+                    return True, ap
+            # allowance刷新无效或链上余额不确定 → 减量重试
             for retry_size in [round(size * 0.98, 2), round(size * 0.95, 2), round(size * 0.90, 2)]:
                 if retry_size < 1:
                     break
@@ -898,9 +908,7 @@ def try_sell_with_multiple_prices(token_id, size, best_bid, current_price, entry
             return True, actual_price or price, output
         if output == "NO_BALANCE":
             return False, None, "NO_BALANCE"
-        # 前几次失败后等待，让市场稳定
-        if i < len(valid_prices) - 1:
-            time.sleep(1)
+        # FOK后缓存已自动清除，无需sleep等待
 
     return False, None, "所有价格尝试均失败"
 
@@ -1129,6 +1137,15 @@ def reconcile_pending_orders():
             if "opposite_token_id" in entry_details:
                 position["opposite_token_id"] = entry_details["opposite_token_id"]
 
+            # 挂单成交后查链上真实余额 + 刷新allowance
+            try:
+                real_balance = get_token_balance(token_id)
+                if real_balance and real_balance > 0:
+                    position["token_balance"] = real_balance
+                clob_client.update_token_allowance(token_id)
+            except Exception:
+                pass
+
             os.makedirs("logs", exist_ok=True)
             with open("logs/positions.jsonl", "a") as f:
                 f.write(json.dumps(position) + "\n")
@@ -1263,14 +1280,31 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
         if info["matched"]:
             actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
             return True, actual_price
-        # 余额/授权不足 → 返回 NO_BALANCE 停止重试
+        # 余额/授权不足 → 尝试刷新allowance重试一次
         err = info.get("error", "") or info.get("raw", "")
         if "not enough balance" in err.lower():
+            if adjusted and adjusted > 0:
+                print(f"    🔄 链上有余额但授权不足，刷新allowance后重试")
+                clob_client.update_token_allowance(token_id)
+                info2 = clob_client.place_fok_order(token_id, SELL, price, size)
+                if info2["matched"]:
+                    actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else price
+                    return True, actual_price
             return False, "NO_BALANCE"
         return False, "FOK未成交"
     except Exception as e:
         print(f"    [SELL] exception: {str(e)[:200]}")
         if "not enough balance" in str(e).lower():
+            if adjusted and adjusted > 0:
+                print(f"    🔄 链上有余额但授权不足，刷新allowance后重试")
+                clob_client.update_token_allowance(token_id)
+                try:
+                    info2 = clob_client.place_fok_order(token_id, SELL, price, size)
+                    if info2["matched"]:
+                        actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else price
+                        return True, actual_price
+                except Exception:
+                    pass
             return False, "NO_BALANCE"
         return False, str(e)
 
@@ -1350,7 +1384,7 @@ def monitor():
             for pos in positions:
                 token_id = pos["token_id"]
                 entry_price = pos["entry_price"]
-                size = pos["size"]
+                size = pos.get("token_balance") or pos["size"]
                 slug = pos.get("slug", "unknown")
                 entry_time = pos.get("entry_time", "")
                 attempt_key = (slug, entry_time)

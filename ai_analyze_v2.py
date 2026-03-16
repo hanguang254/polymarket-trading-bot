@@ -9,13 +9,15 @@ import os
 import json
 import math
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 
 from ai_trader.ai_model_v2 import analyze_market
 from ai_trader.base_rate import get_base_rate
 from ai_trader import clob_client
 from py_clob_client.order_builder.constants import BUY
-import subprocess
+
+_bet_executor = ThreadPoolExecutor(max_workers=3)
 
 
 def _random_walk_p_win(gap, atr_val, remaining_seconds):
@@ -447,8 +449,13 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         entry_details: 完整分析详情（用于持仓记录丰富字段）
         kelly_reduction: Kelly 缩减因子（base_rate/相关性）
     """
-    # 获取当前余额（SDK直连）
-    balance = clob_client.get_balance()
+    # ── 并行获取: 余额 + 订单簿(best_ask + bid_depth) ──
+    # 三个独立HTTP请求并行执行，省~0.5s
+    fut_balance = _bet_executor.submit(clob_client.get_balance)
+    fut_book = _bet_executor.submit(clob_client.get_orderbook, token_id, 0)  # max_age=0 强制刷新
+
+    balance = fut_balance.result(timeout=5)
+    book = fut_book.result(timeout=5)
 
     # 余额不足时直接跳过，不记录为失败
     MIN_BALANCE = float(os.environ.get("MIN_BALANCE", "5.0"))
@@ -456,15 +463,15 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 余额不足: ${balance:.2f} < ${MIN_BALANCE:.2f}，跳过下注")
         return False, 0, 0, "SKIP_NO_BALANCE"
 
-    # 获取买入价：优先 best_ask（实时最优卖价） → last-trade + 滑点 → midpoint + 滑点
+    # 从已获取的orderbook提取best_ask和bid_depth（0次额外HTTP）
     SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))
     price = None
     price_source = "unknown"
+    bid_depth = None
 
-    # 1. best_ask — 订单簿实时最优卖价，买入直接吃ask最精准
-    try:
-        book = clob_client.get_orderbook(token_id)
-        if book and book.asks:
+    if book:
+        # best_ask
+        if book.asks:
             from ai_trader.polymarket_api import normalize_orderbook
             raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
             _, sorted_asks = normalize_orderbook([], raw_asks)
@@ -474,8 +481,9 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                     price = best_ask
                     price_source = "best_ask"
                     print(f"  📡 best_ask: ${best_ask:.2f} → 限价${price:.2f}")
-    except:
-        pass
+        # bid_depth（从同一个book提取，不再额外HTTP）
+        if book.bids:
+            bid_depth = sum(float(b.size) for b in book.bids)
 
     # 2. last-trade-price + 滑点 回退
     if price is None:
@@ -514,8 +522,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  🛡️ 限价保护: ${price:.2f} > p_win=${p_win_cap:.3f}，降至${capped_price:.2f}")
         price = capped_price
 
-    # P2: 退出流动性检查 — 下注前检查能否卖出
-    bid_depth = check_bid_depth(token_id)
+    # P2: 退出流动性检查（已从上面的book提取，无额外HTTP）
     if bid_depth is not None:
         print(f"  📊 P2退出流动性: bid_depth={bid_depth:.1f}份")
         if bid_depth < 5:
@@ -620,6 +627,15 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             # P1: 反向token_id（供对冲使用）
             if "opposite_token_id" in entry_details:
                 position["opposite_token_id"] = entry_details["opposite_token_id"]
+        # 买入后立即查链上真实余额 + 刷新allowance（确保后续卖出不因授权不足失败）
+        try:
+            real_balance = clob_client.get_token_balance(token_id)
+            if real_balance and real_balance > 0:
+                position["token_balance"] = real_balance
+            clob_client.update_token_allowance(token_id)
+        except Exception:
+            pass
+
         with open("logs/positions.jsonl", "a") as f:
             f.write(json.dumps(position) + "\n")
 

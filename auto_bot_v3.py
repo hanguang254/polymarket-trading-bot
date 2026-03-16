@@ -324,6 +324,7 @@ class MarketTracker:
         self.warmup_data = {}  # slug -> [{price, direction, timestamp}, ...]
         self.warmup_started = set()  # 已开始预热的市场
         self.bayesian_updaters = {}  # slug -> BayesianUpdater
+        self.token_cache = {}  # slug -> (up_token, down_token)  预热阶段缓存token_ids
     
     def update_markets(self):
         """更新市场列表"""
@@ -405,6 +406,15 @@ class MarketTracker:
                         logger.info(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s | 贝叶斯先验UP=0.500(无偏) ATR={atr_val}")
                     except Exception as e:
                         logger.warning(f"\n🔥 预热开始(无贝叶斯): {market['coin']} | {slug} | {e}")
+
+                    # 预热阶段提前获取token_ids + 预缓存SDK参数（省去分析时~2s延迟）
+                    try:
+                        up_t, down_t = get_token_ids(slug)
+                        if up_t and down_t:
+                            self.token_cache[slug] = (up_t, down_t)
+                            clob_client.precache_tokens([up_t, down_t])
+                    except Exception:
+                        pass
 
                 # 每5秒采集一次，有PTB时才做贝叶斯更新
                 ptb_now = self.ptb_cache.get(slug)
@@ -585,8 +595,12 @@ class MarketTracker:
         print(f"  💰 PTB: ${ptb:,.2f}")
         print(f"  📊 赔率: UP={up_odds:.3f} DOWN={down_odds:.3f}")
         
-        # 提前获取 token_id，供 LMSR 流动性评估使用
-        up_token, down_token = get_token_ids(slug)
+        # 提前获取 token_id（优先用预热阶段缓存，省~500ms Gamma API调用）
+        cached_tokens = self.token_cache.get(slug)
+        if cached_tokens:
+            up_token, down_token = cached_tokens
+        else:
+            up_token, down_token = get_token_ids(slug)
         if extra_info is None:
             extra_info = {}
         if up_token and down_token:
@@ -595,9 +609,8 @@ class MarketTracker:
             # 先用 up_token 做 LMSR 评估（方向确定后会用正确的）
             extra_info["token_id"] = up_token
 
-            # 预缓存 neg_risk/fee_rate/tick_size，避免下单时额外HTTP查询（省~200ms×2）
-            clob_client.precache_token(up_token)
-            clob_client.precache_token(down_token)
+            # 并行预缓存 neg_risk/fee_rate/tick_size（预热已缓存则跳过）
+            clob_client.precache_tokens([up_token, down_token])
 
             # CLOB 订单簿数据：mid 供参考，best_ask 在 analyze_and_decide 中用于执行价校准
             # Gamma 赔率用于方向/概率判断，CLOB best_ask 用于 EV/折价的执行价校准(C1)
