@@ -94,16 +94,23 @@ def _warmup():
     预热后复用连接池，后续下单只剩纯网络延迟（~25-350ms 取决于物理距离）。
 
     步骤：
-    1. 假签名：create_order 触发 coincurve 加载（本地，~1ms after first）
+    1. 假签名：create_order 触发 coincurve 加载（纯本地，0 HTTP）
     2. GET 预热：get_server_time 建立 TLS + HTTP/2 连接
-    3. POST 预热：假 post_order 确保 POST endpoint 的 HTTP/2 stream 就绪
+    3. POST 预热：假 post_order 确保 POST 路径的 HTTP/2 stream 就绪
     """
+    FAKE_TOKEN = "0"
     t0 = time.time()
     try:
-        # 1. 预热签名库：本地创建假单触发 coincurve/secp256k1 加载
-        #    neg_risk=True 避免 SDK 内部把 False 当 falsy 触发额外 HTTP 查询
+        # 1. 预热签名库（纯本地，0 HTTP 请求）
+        #    SDK 的 create_order 内部 __resolve_tick_size / get_neg_risk / get_fee_rate_bps
+        #    即使传了 options 也会查询。解决：直接写入 SDK 内部缓存，绕过 HTTP。
+        _client._ClobClient__tick_sizes[FAKE_TOKEN] = "0.01"
+        _client._ClobClient__tick_size_timestamps[FAKE_TOKEN] = time.monotonic()
+        _client._ClobClient__neg_risk[FAKE_TOKEN] = False
+        _client._ClobClient__fee_rates[FAKE_TOKEN] = 0
+
         _client.create_order(
-            OrderArgs(token_id="0", price=0.01, size=1.0, side=BUY),
+            OrderArgs(token_id=FAKE_TOKEN, price=0.01, size=1.0, side=BUY),
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=True),
         )
         t1 = time.time()
@@ -114,17 +121,16 @@ def _warmup():
         t2 = time.time()
         tls_ms = (t2 - t1) * 1000
 
-        # 3. POST 预热：用假单发一次真实 POST 到 /order endpoint
-        #    SDK 内部 httpx.Client 按 (host,port) 复用连接，但 POST 可能走不同的 HTTP/2 stream
-        #    这一步确保 POST 路径完全就绪（含 API 鉴权头序列化）
+        # 3. POST 预热：用假单发真实 POST 到 /order endpoint
+        #    服务器会拒绝（假token），但 HTTP/2 POST stream + API 鉴权头序列化已完成
         try:
             fake_order = _client.create_order(
-                OrderArgs(token_id="0", price=0.01, size=1.0, side=BUY),
+                OrderArgs(token_id=FAKE_TOKEN, price=0.01, size=1.0, side=BUY),
                 options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=True),
             )
             _client.post_order(fake_order, OrderType.GTC)
         except Exception:
-            pass  # 假token必定被服务器拒绝，但 POST 连接已建立
+            pass  # 假token必定被拒绝，但 POST 连接已建立
         t3 = time.time()
         post_ms = (t3 - t2) * 1000
 
@@ -134,7 +140,7 @@ def _warmup():
         )
     except Exception as e:
         elapsed = (time.time() - t0) * 1000
-        logger.info(f"🔥 预热完成(签名库已加载): {elapsed:.0f}ms | {e}")
+        logger.info(f"🔥 预热完成(部分): {elapsed:.0f}ms | {e}")
 
 
 # ── 下单 ──
