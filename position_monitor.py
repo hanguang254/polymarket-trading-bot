@@ -1488,28 +1488,17 @@ def monitor():
                 attempted_stop_loss = False
                 stop_loss_attempt_recorded = False
 
-                # ═══ 安全检查：token 价格与方向判断矛盾时，信任市场 ═══
-                # 场景：direction_correct=True（Binance价格 vs PTB），但 token 价格暴跌
-                # 说明 PTB 数据可能有误，或价格在边界反转，市场已 price-in 亏损
-                # 早期波动大、CLOB流动性差，需要更宽容的阈值
-                # 注意：最后30秒不降级 — CLOB已关闭无法下单，降级只会白费力气
-                #       方向正确就持有到结算拿$1
-                # 持仓时间保护：入场<60秒CLOB流动性差，token价格波动不代表真实信号
-                hold_seconds = 0
-                if entry_time:
-                    try:
-                        entry_dt = datetime.fromisoformat(entry_time)
-                        hold_seconds = (datetime.now(timezone.utc) - entry_dt).total_seconds()
-                    except (ValueError, TypeError):
-                        hold_seconds = 0
-
-                if hold_seconds < 60:
-                    pass  # 入场<60秒，跳过降级检查，CLOB流动性差token价格不可靠
-                else:
-                    drawdown_limit = -0.30 if remaining > 180 else -0.20 if remaining > 120 else -0.15 if remaining > 60 else -0.10
-                    if direction_correct and profit_rate < drawdown_limit and remaining > 30:
-                        print(f"  ⚠️ 方向✅但token跌{profit_rate*100:.1f}%（阈值{drawdown_limit*100:.0f}%），市场信号矛盾，不再盲目持有")
-                        direction_correct = False  # 降级为方向未知，走正常止损流程
+                # ═══ 方向信号：只用 crypto 价格判断，不用 token 价格降级 ═══
+                # 二元市场方向对=$1.00，token中途波动是CLOB流动性噪音不是方向信号
+                # crypto 边界保护：价格离 PTB 很近时标记弱方向，供阶段策略参考
+                weak_direction = False
+                if direction_correct and ptb_price and crypto_price and remaining > 60:
+                    atr_val_wd = pos.get("atr_val") or get_atr_from_binance(coin)
+                    if atr_val_wd and atr_val_wd > 0:
+                        gap_ratio = abs(crypto_price - ptb_price) / atr_val_wd
+                        if gap_ratio < 0.3:
+                            weak_direction = True
+                            print(f"  ⚠️ crypto离PTB很近({gap_ratio:.2f}ATR<0.3)，翻转风险高 | 剩余{remaining:.0f}s")
 
                 # ═══ EV 持续监控（Exit Protocol）═══
                 # 二元市场: token_price ≈ 市场隐含胜率 → EV = token_price - entry_price

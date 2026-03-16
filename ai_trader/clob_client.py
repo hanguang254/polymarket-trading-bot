@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # ── 全局单例 ──
 _client: ClobClient = None
+_client_lock = threading.Lock()  # httpx HTTP/2不线程安全，所有SDK HTTP调用需加锁
 _executor = ThreadPoolExecutor(max_workers=4)
 
 # ── 订单簿缓存（2秒TTL，消除同一分析周期内的重复HTTP请求） ──
@@ -68,6 +69,7 @@ def precache_token(token_id):
 
     调用时机：获取到 token_id 后立即调用（在分析阶段），
     这样下单时 create_order 内部的缓存已就绪，延迟从 ~3.5s 降至 ~500ms。
+    所有SDK HTTP调用需加 _client_lock，httpx HTTP/2连接不线程安全。
     """
     token_id = str(token_id)
     if token_id in _token_cache:
@@ -75,10 +77,10 @@ def precache_token(token_id):
 
     t0 = time.time()
     try:
-        # 这3个调用会填充 SDK 内部缓存，后续 create_order 直接命中缓存
-        neg_risk = _client.get_neg_risk(token_id)
-        fee_rate = _client.get_fee_rate_bps(token_id)
-        tick_size = _client.get_tick_size(token_id)
+        with _client_lock:
+            neg_risk = _client.get_neg_risk(token_id)
+            fee_rate = _client.get_fee_rate_bps(token_id)
+            tick_size = _client.get_tick_size(token_id)
 
         _token_cache[token_id] = {
             "neg_risk": neg_risk,
@@ -95,15 +97,11 @@ def precache_token(token_id):
 
 
 def precache_tokens(token_ids):
-    """并行预缓存多个token的neg_risk/fee_rate/tick_size（省~50%延迟）"""
+    """预缓存多个token（串行，避免HTTP/2连接竞争）"""
     t0 = time.time()
-    futures = {tid: _executor.submit(precache_token, tid) for tid in token_ids}
     results = {}
-    for tid, fut in futures.items():
-        try:
-            results[tid] = fut.result(timeout=5)
-        except Exception:
-            results[tid] = None
+    for tid in token_ids:
+        results[tid] = precache_token(tid)
     elapsed = (time.time() - t0) * 1000
     logger.info(f"📦 并行预缓存{len(token_ids)}个token完成 | {elapsed:.0f}ms")
     return results
@@ -187,17 +185,18 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
     neg_risk = cached.get("neg_risk", None)
     # neg_risk=None 时 SDK 内部查缓存（precache_token 已填充）；True 直接跳过查询
     try:
-        resp = _client.create_and_post_order(
-            OrderArgs(
-                token_id=token_id,
-                price=float(price),
-                size=float(size),
-                side=side,
-            ),
-            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
-        )
+        with _client_lock:
+            resp = _client.create_and_post_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=float(price),
+                    size=float(size),
+                    side=side,
+                ),
+                options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
+            )
         elapsed = (time.time() - t0) * 1000
-        invalidate_book_cache(token_id)  # 下单后清除缓存，确保后续数据新鲜
+        invalidate_book_cache(token_id)
         result = _parse_response(resp)
         result["elapsed_ms"] = round(elapsed, 1)
         logger.info(f"📡 SDK下单 {side} {size}@{price} | {result['status']} | {elapsed:.0f}ms")
@@ -232,22 +231,23 @@ def place_fok_order(token_id, side, price, size):
     try:
         # MarketOrderArgs 的 amount 对 SELL 是份数，对 BUY 是美元金额
         amount = float(price) * float(size) if side == BUY else float(size)
-        order = _client.create_market_order(
-            MarketOrderArgs(
-                token_id=token_id,
-                amount=amount,
-                side=side,
-                price=float(price),
-                fee_rate_bps=0,
-                nonce=0,
-                taker="0x0000000000000000000000000000000000000000",
-                order_type=OrderType.FOK,
-            ),
-            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
-        )
-        resp = _client.post_order(order, OrderType.FOK)
+        with _client_lock:
+            order = _client.create_market_order(
+                MarketOrderArgs(
+                    token_id=token_id,
+                    amount=amount,
+                    side=side,
+                    price=float(price),
+                    fee_rate_bps=0,
+                    nonce=0,
+                    taker="0x0000000000000000000000000000000000000000",
+                    order_type=OrderType.FOK,
+                ),
+                options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
+            )
+            resp = _client.post_order(order, OrderType.FOK)
         elapsed = (time.time() - t0) * 1000
-        invalidate_book_cache(token_id)  # FOK后清除缓存
+        invalidate_book_cache(token_id)
         result = _parse_response(resp)
         result["elapsed_ms"] = round(elapsed, 1)
         logger.info(f"⚡ FOK {side} {size}@{price} | {result['status']} | {elapsed:.0f}ms")
@@ -268,10 +268,11 @@ def cancel_all(token_id=None):
     token_id指定: 取消该token的所有订单
     """
     try:
-        if token_id:
-            resp = _client.cancel_market_orders(asset_id=str(token_id))
-        else:
-            resp = _client.cancel_all()
+        with _client_lock:
+            if token_id:
+                resp = _client.cancel_market_orders(asset_id=str(token_id))
+            else:
+                resp = _client.cancel_all()
         return True
     except Exception as e:
         logger.warning(f"取消订单失败: {e}")
@@ -283,13 +284,14 @@ def cancel_all(token_id=None):
 def get_balance():
     """获取 USDC 余额（collateral）"""
     try:
-        resp = _client.get_balance_allowance(
-            BalanceAllowanceParams(
-                asset_type=AssetType.COLLATERAL,
-                token_id="",
-                signature_type=0,
+        with _client_lock:
+            resp = _client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    token_id="",
+                    signature_type=0,
+                )
             )
-        )
         # resp 可能是 dict 或对象
         if isinstance(resp, dict):
             return float(resp.get("balance", 0))
@@ -302,19 +304,38 @@ def get_balance():
 def get_token_balance(token_id):
     """获取 conditional token 余额"""
     try:
-        resp = _client.get_balance_allowance(
-            BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL,
-                token_id=str(token_id),
-                signature_type=0,
+        with _client_lock:
+            resp = _client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=str(token_id),
+                    signature_type=0,
+                )
             )
-        )
         if isinstance(resp, dict):
             return float(resp.get("balance", 0))
         return float(getattr(resp, "balance", 0))
     except Exception as e:
         logger.warning(f"获取token余额失败: {e}")
         return None
+
+
+def update_token_allowance(token_id):
+    """刷新 conditional token 的 allowance（重新授权交易所扣token）"""
+    try:
+        with _client_lock:
+            resp = _client.update_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=str(token_id),
+                    signature_type=0,
+                )
+            )
+        logger.info(f"🔓 更新token allowance: {resp}")
+        return True
+    except Exception as e:
+        logger.warning(f"更新token allowance失败: {e}")
+        return False
 
 
 # ── 市场数据 ──
@@ -339,7 +360,8 @@ def get_orderbook(token_id, max_age=None):
 
     # 缓存未命中或过期，发起HTTP请求
     try:
-        book = _client.get_order_book(token_id)
+        with _client_lock:
+            book = _client.get_order_book(token_id)
         with _book_cache_lock:
             _book_cache[token_id] = (book, time.time())
         return book
@@ -360,7 +382,8 @@ def invalidate_book_cache(token_id=None):
 def get_midpoint(token_id):
     """获取中间价"""
     try:
-        resp = _client.get_midpoint(str(token_id))
+        with _client_lock:
+            resp = _client.get_midpoint(str(token_id))
         if isinstance(resp, dict):
             return float(resp.get("mid", 0))
         return float(resp)
@@ -371,7 +394,8 @@ def get_midpoint(token_id):
 def get_last_trade_price(token_id):
     """获取最近成交价"""
     try:
-        resp = _client.get_last_trade_price(str(token_id))
+        with _client_lock:
+            resp = _client.get_last_trade_price(str(token_id))
         if isinstance(resp, dict):
             return float(resp.get("price", 0))
         return float(resp)
@@ -384,7 +408,8 @@ def get_last_trade_price(token_id):
 def get_order(order_id):
     """查询单个订单状态（用于挂单对账）"""
     try:
-        return _client.get_order(str(order_id))
+        with _client_lock:
+            return _client.get_order(str(order_id))
     except Exception as e:
         logger.warning(f"查询订单失败: {e}")
         return None
@@ -395,7 +420,8 @@ def get_orders(asset_id=None):
     try:
         from py_clob_client.clob_types import OpenOrderParams
         params = OpenOrderParams(asset_id=str(asset_id)) if asset_id else None
-        return _client.get_orders(params)
+        with _client_lock:
+            return _client.get_orders(params)
     except Exception as e:
         logger.warning(f"查询订单列表失败: {e}")
         return []
