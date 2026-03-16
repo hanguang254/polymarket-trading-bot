@@ -47,7 +47,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Base Rate Calibration**: Conservative ATR-band priors (0.50-0.85), auto-calibrates with empirical data after 30+ samples per band. Weak edge (base_rate < 0.55) halves Kelly.
 - **Strict Binary EV**: `EV = p_win - price` (replaces discount/odds ratio). Minimum edge required (configurable via `MIN_EV`).
 - **Early Bet Window (90-95s)**: Enters before CLOB fully prices in, with lower thresholds (`EARLY_MIN_EV`, `EARLY_MIN_CONFIDENCE`). Captures mispricing before market makers adjust.
-- **15-min K-line Trend Filter**: Checks Binance 15-min candle trend to avoid counter-trend trades. Reduces entries against dominant macro direction.
+- **5-min K-line Trend Filter**: Checks Binance 5-min candle trend (same timeframe as market) to avoid counter-trend trades. Replaces 15-min filter which was too slow for 5-minute markets.
 - **Bayesian Fusion**: Base rate (40%) + Bayesian posterior (60%) when direction-aligned with confidence > 30%.
 - **Cross-Validation**: Flags overestimation when `estimated_value > p_win + 0.15` (reduces confidence 15%).
 - **LMSR Inefficiency Signal**: When realtime `best_ask` diverges >10% from `p_win`, lowers discount threshold by 2% (min 6%) for easier entry on mispriced markets.

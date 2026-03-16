@@ -21,20 +21,20 @@ from ai_trader.binance_api import get_klines, get_current_price
 from ai_trader.indicators import ema, rsi, atr
 
 
-def analyze_15m_trend(coin, price_to_beat):
+def analyze_5m_trend(coin, price_to_beat):
     """
-    15分钟K线趋势分析 — 为5分钟市场提供中期趋势过滤
+    5分钟K线趋势分析 — 与5分钟市场同频的趋势过滤
 
     返回: dict
       trend_dir: "UP" / "DOWN" / None (无明确趋势)
       trend_strength: 0.0-1.0 (趋势强度)
-      momentum_15m: 最近2根15m K线涨跌幅之和
+      momentum_5m: 最近2根5m K线涨跌幅之和
       ptb_position: PTB在近期高低点中的相对位置 (0=最低, 1=最高)
     """
     symbol = f"{coin}USDT"
-    klines = get_klines(symbol, "15m", 8)
+    klines = get_klines(symbol, "5m", 6)
 
-    result = {"trend_dir": None, "trend_strength": 0.0, "momentum_15m": 0.0, "ptb_position": 0.5}
+    result = {"trend_dir": None, "trend_strength": 0.0, "momentum_5m": 0.0, "ptb_position": 0.5}
 
     if not klines or len(klines) < 4:
         return result
@@ -43,7 +43,7 @@ def analyze_15m_trend(coin, price_to_beat):
     highs = [k["high"] for k in klines]
     lows = [k["low"] for k in klines]
 
-    # ── 信号1: 最近3根15m K线的方向 ──
+    # ── 信号1: 最近3根5m K线的方向 ──
     recent_3 = closes[-3:]
     up_count = sum(1 for i in range(1, len(recent_3)) if recent_3[i] > recent_3[i-1])
     down_count = sum(1 for i in range(1, len(recent_3)) if recent_3[i] < recent_3[i-1])
@@ -55,13 +55,13 @@ def analyze_15m_trend(coin, price_to_beat):
         result["trend_dir"] = "DOWN"
         result["trend_strength"] = 0.7 if down_count == 2 else 1.0
 
-    # ── 信号2: 最近2根15m K线的动量 ──
+    # ── 信号2: 最近2根5m K线的动量 ──
     if len(closes) >= 3 and closes[-3] > 0:
         pct1 = (closes[-2] - closes[-3]) / closes[-3] * 100
         pct2 = (closes[-1] - closes[-2]) / closes[-2] * 100
-        result["momentum_15m"] = round(pct1 + pct2, 4)
+        result["momentum_5m"] = round(pct1 + pct2, 4)
 
-    # ── 信号3: PTB在近4根15m高低点中的位置 ──
+    # ── 信号3: PTB在近4根5m高低点中的位置 ──
     recent_highs = highs[-4:]
     recent_lows = lows[-4:]
     range_high = max(recent_highs)
@@ -204,30 +204,30 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
     details["momentum_bonus"] = momentum_bonus
 
     # ═══════════════════════════════════════
-    # 辅助指标：15分钟趋势过滤
+    # 辅助指标：5分钟趋势过滤（与市场周期同频）
     # ═══════════════════════════════════════
-    trend_15m = analyze_15m_trend(coin, price_to_beat)
-    details["trend_15m"] = trend_15m["trend_dir"]
-    details["trend_15m_strength"] = trend_15m["trend_strength"]
-    details["momentum_15m"] = trend_15m["momentum_15m"]
-    details["ptb_position"] = trend_15m["ptb_position"]
+    trend_5m = analyze_5m_trend(coin, price_to_beat)
+    details["trend_5m"] = trend_5m["trend_dir"]
+    details["trend_5m_strength"] = trend_5m["trend_strength"]
+    details["momentum_5m"] = trend_5m["momentum_5m"]
+    details["ptb_position"] = trend_5m["ptb_position"]
 
-    # 15m趋势与1m方向的一致性调整
-    trend_15m_bonus = 0
-    if trend_15m["trend_dir"]:
-        if trend_15m["trend_dir"] == direction:
-            # 共振：15m趋势和1m方向一致 → 加分
-            trend_15m_bonus = 10
+    # 5m趋势与1m方向的一致性调整
+    trend_5m_bonus = 0
+    if trend_5m["trend_dir"]:
+        if trend_5m["trend_dir"] == direction:
+            # 共振：5m趋势和1m方向一致 → 加分
+            trend_5m_bonus = 10
             details["trend_15m_alignment"] = "confirming"
         else:
-            # 矛盾：15m趋势反向 → 减分
-            trend_15m_bonus = -15
+            # 矛盾：5m趋势反向 → 减分
+            trend_5m_bonus = -15
             details["trend_15m_alignment"] = "conflicting"
     else:
         details["trend_15m_alignment"] = "neutral"
 
-    momentum_bonus += trend_15m_bonus
-    details["trend_15m_bonus"] = trend_15m_bonus
+    momentum_bonus += trend_5m_bonus
+    details["trend_5m_bonus"] = trend_5m_bonus
 
     # ═══════════════════════════════════════
     # 辅助指标：成交量（放量=趋势延续）

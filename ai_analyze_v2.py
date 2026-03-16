@@ -270,22 +270,22 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         MIN_EV = float(os.environ.get("EARLY_MIN_EV", "0.03"))
         MIN_CONFIDENCE = float(os.environ.get("EARLY_MIN_CONFIDENCE", "0.40"))
 
-    # ── 15分钟趋势过滤 ──
-    # 弱信号(1.5-2.0ATR) + 15m反向趋势 → 直接跳过
-    # 强信号(>2.5ATR) + 15m反向趋势 → 置信度降低但仍可下注
-    trend_15m_align = details.get("trend_15m_alignment", "neutral")
-    if trend_15m_align == "conflicting":
+    # ── 5分钟趋势过滤（与市场周期同频） ──
+    # 弱信号(1.5-2.0ATR) + 5m反向趋势 → 直接跳过
+    # 强信号(>2.5ATR) + 5m反向趋势 → 置信度降低但仍可下注
+    trend_5m_align = details.get("trend_15m_alignment", "neutral")
+    if trend_5m_align == "conflicting":
         if diff_in_atr < 2.0:
-            # 弱信号 + 15m逆势 → 大概率是1m假突破
+            # 弱信号 + 5m逆势 → 大概率是1m假突破
             details["trend_15m_filter"] = "blocked"
-            print(f"  🚫 15m趋势过滤: 1m信号弱({diff_in_atr:.1f}ATR<2.0) + 15m反向 → 跳过")
+            print(f"  🚫 5m趋势过滤: 1m信号弱({diff_in_atr:.1f}ATR<2.0) + 5m反向 → 跳过")
         elif diff_in_atr < 2.5:
             confidence *= 0.7  # 中等信号 → 降30%置信度
             details["trend_15m_filter"] = "reduced_30"
         else:
             confidence *= 0.85  # 强信号 → 降15%置信度
             details["trend_15m_filter"] = "reduced_15"
-    elif trend_15m_align == "confirming":
+    elif trend_5m_align == "confirming":
         details["trend_15m_filter"] = "boosted"
 
     # ── 等比EV门槛：昂贵token的EV天花板天然更低，按利润空间等比缩放 ──
@@ -308,7 +308,7 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["liquidity"] = liq_label
     details["discount_threshold"] = discount_threshold
     early_label = " [早期窗口]" if is_early else ""
-    trend_label = f" 15m:{trend_15m_align}" if trend_15m_align != "neutral" else ""
+    trend_label = f" 5m:{trend_5m_align}" if trend_5m_align != "neutral" else ""
     filter_label = f" [{details.get('trend_15m_filter', '')}]" if details.get("trend_15m_filter") else ""
     details["bet_reason"] = (
         f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
