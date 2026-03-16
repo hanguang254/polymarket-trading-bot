@@ -344,6 +344,10 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
         else:
             bal = int(size * 1e6) if size > 0 else 0
 
+        # 价值过小的不领取（gas费不划算）
+        if bal < 100_000:  # < 0.1 USDC
+            continue
+
         redeemable.append({
             "condition_id": cond_id,
             "token_id": token_id,
