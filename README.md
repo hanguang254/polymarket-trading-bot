@@ -232,8 +232,8 @@ See `.env.example` for all configurable parameters:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `EOA_WALLET` | Yes | EOA wallet address for signing |
-| `PROXY_WALLET` | Yes | Polymarket proxy wallet (holds positions) |
-| `SIGNATURE_TYPE` | Yes | Signature type (`eoa` or `gnosis-safe`) |
+| `PROXY_WALLET` | Yes | Polymarket proxy wallet (holds positions, see Settings on polymarket.com) |
+| `CLOB_SIGNATURE_TYPE` | No | `0` = EOA direct (default), `1` = Polymarket Gnosis Safe proxy |
 | `PRIVATE_KEY` | Yes | Private key for SDK signing + on-chain settlement |
 | `POLYGON_RPC_URL` | No | Polygon RPC endpoint (default: public) |
 | `TELEGRAM_BOT_TOKEN` | No | Telegram bot token for notifications |

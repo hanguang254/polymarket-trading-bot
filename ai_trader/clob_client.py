@@ -33,14 +33,15 @@ def init_client():
     """启动时调用一次，初始化 ClobClient + API 凭证 + 预热"""
     global _client
     private_key = os.environ.get("PRIVATE_KEY", "")
-    # 资金在EOA主钱包时，funder=EOA；资金在Proxy时，funder=PROXY且需改signature_type=1
-    funder = os.environ.get("EOA_WALLET", "")
+    sig_type = int(os.environ.get("CLOB_SIGNATURE_TYPE", "0"))
+    # sig_type=0: EOA直签，funder=EOA；sig_type=1: Proxy模式，funder=PROXY
+    funder = os.environ.get("PROXY_WALLET", "") if sig_type == 1 else os.environ.get("EOA_WALLET", "")
 
     _client = ClobClient(
         "https://clob.polymarket.com",
         key=private_key,
         chain_id=137,
-        signature_type=0,  # EOA
+        signature_type=sig_type,
         funder=funder,
     )
     creds = _client.create_or_derive_api_creds()
