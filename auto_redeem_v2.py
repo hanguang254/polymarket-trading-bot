@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Polymarket 自动领取已结算收益脚本 v3.2
-- CLI 查持仓 + web3 EOA 直接链上结算（不走 Gnosis Safe）
+Polymarket 自动领取已结算收益脚本 v3.3
+- data-api REST 查持仓 + web3 EOA 直接链上结算（不走 Gnosis Safe）
 - EOA 直接调用 CTF.redeemPositions / NegRiskAdapter.redeemPositions
 - 支持 normal / neg-risk 自动切换重试
 - 链上 payoutDenominator 验证已结算 + balanceOf 检查余额
@@ -12,7 +12,6 @@ import sys
 import json
 import time
 import logging
-import subprocess
 from datetime import datetime, timezone
 
 import requests
@@ -32,8 +31,6 @@ PROXY_WALLET = os.environ.get("PROXY_WALLET", "").strip()
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "").strip()
 if not PROXY_WALLET or not PRIVATE_KEY:
     raise RuntimeError("PROXY_WALLET and PRIVATE_KEY must be set in .env")
-SIGNATURE_TYPE = os.environ.get("SIGNATURE_TYPE", "eoa").strip()
-
 RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com").strip()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -204,73 +201,62 @@ def init_web3():
     return w3, wallet, ctf_contract, usdc_contract
 
 # ==============================================================================
-# CLI 持仓获取
+# REST API 持仓获取
 # ==============================================================================
 
-def run_cli(args: list, timeout: int = 30) -> tuple:
-    """执行 polymarket CLI 命令，返回 (success, stdout, stderr)"""
-    cmd = ["polymarket"] + args
+DATA_API = "https://data-api.polymarket.com"
+
+
+def _fetch_positions_api(addr: str, label: str) -> list:
+    """通过 data-api 获取单个地址的活跃持仓"""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", "timeout"
+        resp = requests.get(
+            f"{DATA_API}/positions",
+            params={"user": addr, "limit": 200, "sizeThreshold": 0},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        positions = data if isinstance(data, list) else []
+        if positions:
+            log.info(f"  {label} 地址: {len(positions)} 个持仓")
+        return positions
     except Exception as e:
-        return False, "", str(e)
-
-
-def _parse_cli_json(stdout: str) -> list:
-    """解析 CLI JSON 输出为列表"""
-    if not stdout.strip():
+        log.warning(f"  {label} 持仓查询失败: {str(e)[:100]}")
         return []
+
+
+def _fetch_closed_positions_api(addr: str) -> list:
+    """通过 data-api 获取已关闭持仓"""
     try:
-        data = json.loads(stdout)
-        if isinstance(data, dict):
-            return data.get("positions", data.get("data", []))
-        elif isinstance(data, list):
-            return data
-        return []
-    except json.JSONDecodeError:
+        resp = requests.get(
+            f"{DATA_API}/closed-positions",
+            params={"user": addr, "limit": 50},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        positions = data if isinstance(data, list) else []
+        if positions:
+            log.info(f"  已关闭持仓: {len(positions)} 个")
+        return positions
+    except Exception as e:
+        log.warning(f"  已关闭持仓查询失败: {str(e)[:100]}")
         return []
 
 
-def fetch_positions_cli() -> list:
-    """通过 polymarket CLI 获取钱包持仓"""
+def fetch_positions() -> list:
+    """通过 Polymarket data-api 获取钱包持仓（活跃+已关闭）"""
     all_positions = []
 
     for addr, label in [(PROXY_WALLET, "proxy"), (EOA_WALLET, "eoa")]:
         if not addr:
             continue
-        success, stdout, stderr = run_cli([
-            "data", "positions", addr,
-            "--signature-type", SIGNATURE_TYPE,
-            "--limit", "100",
-            "-o", "json",
-        ], timeout=20)
-
-        if success:
-            positions = _parse_cli_json(stdout)
-            if positions:
-                log.info(f"  {label} 地址: {len(positions)} 个持仓")
-                all_positions.extend(positions)
-        else:
-            err = stderr[:100] if stderr else "unknown"
-            log.warning(f"  {label} 地址查询失败: {err}")
+        all_positions.extend(_fetch_positions_api(addr, label))
 
     # 也查 closed-positions
     if PROXY_WALLET:
-        success, stdout, _ = run_cli([
-            "data", "closed-positions", PROXY_WALLET,
-            "--signature-type", SIGNATURE_TYPE,
-            "--limit", "50",
-            "-o", "json",
-        ], timeout=20)
-
-        if success:
-            closed = _parse_cli_json(stdout)
-            if closed:
-                log.info(f"  已关闭持仓: {len(closed)} 个")
-                all_positions.extend(closed)
+        all_positions.extend(_fetch_closed_positions_api(PROXY_WALLET))
 
     return all_positions
 
@@ -293,28 +279,28 @@ def check_resolved_onchain(w3: Web3, cond_id: str) -> bool:
 
 
 def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
-    """CLI 获取持仓 -> API 字段预筛 -> 链上验证已结算 + 余额 > 0"""
+    """data-api 获取持仓 -> 字段预筛 -> 链上验证已结算 + 余额 > 0"""
     eoa_cs = Web3.to_checksum_address(wallet.address)
     # 检查余额的地址列表：EOA 优先，proxy 备选
     check_addrs = [eoa_cs]
     if PROXY_WALLET and PROXY_WALLET.lower() != wallet.address.lower():
         check_addrs.append(Web3.to_checksum_address(PROXY_WALLET))
 
-    # 1. CLI 获取持仓
-    positions = fetch_positions_cli()
+    # 1. data-api 获取持仓
+    positions = fetch_positions()
     if not positions:
         return []
 
-    # 2. API 字段预筛已结算的（减少链上调用）
+    # 2. 字段预筛已结算的（减少链上调用）
     redeemable = []
     seen_conditions = set()
 
     for p in positions:
-        cond_id = p.get("condition_id") or p.get("conditionId", "")
+        cond_id = p.get("conditionId") or p.get("condition_id", "")
         token_id = p.get("asset") or p.get("token_id", "")
         title = p.get("title", p.get("slug", p.get("market_slug", cond_id[:16])))
-        neg_risk = p.get("neg_risk", p.get("negRisk", False))
-        cur_value = float(p.get("current_value", p.get("value", 0)) or 0)
+        neg_risk = p.get("negativeRisk", p.get("neg_risk", p.get("negRisk", False)))
+        cur_value = float(p.get("currentValue", p.get("current_value", p.get("value", 0))) or 0)
         size = float(p.get("size", 0) or 0)
 
         if not cond_id or cond_id in seen_conditions:
@@ -600,7 +586,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
 
 def main() -> None:
     log.info("=" * 55)
-    log.info("🔄 Polymarket 链上自动结算 v3.2 启动 (CLI查仓+EOA直接结算)")
+    log.info("🔄 Polymarket 链上自动结算 v3.3 启动 (REST API查仓+EOA直接结算)")
     log.info(f"   RPC         : {RPC_URL}")
     log.info(f"   轮询间隔    : {REDEEM_INTERVAL}s ({REDEEM_INTERVAL // 60} 分钟)")
     log.info(f"   已领取记录  : {REDEEMED_FILE}")

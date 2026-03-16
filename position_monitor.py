@@ -367,6 +367,14 @@ def market_sell_immediate(token_id, size, price=None):
         # FOK失败
         print(f"    ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
         err = info.get("error", "") or info.get("raw", "")
+
+        # 网络超时/异常 → 回查链上余额，检测幽灵成交（订单实际已成交但响应丢失）
+        if "not enough balance" not in err.lower() and info.get("status") == "ERROR":
+            recheck = _check_and_adjust_size(token_id, size)
+            if recheck == 0:
+                print(f"    ⚡ 网络超时但链上余额已清零，订单实际已成交（幽灵成交）")
+                return True, sell_price
+
         if "not enough balance" in err.lower():
             # 链上确认有余额 → 可能是allowance不足，刷新后重试原始size
             if adjusted and adjusted > 0:
@@ -401,6 +409,18 @@ def market_sell_immediate(token_id, size, price=None):
                 actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
                 print(f"    ⚡ 地板价成交: Taking=${info2['taking']:.4f} | 实际价=${actual_price:.4f} | {info2.get('elapsed_ms', 0):.0f}ms")
                 return True, actual_price
+            # 地板价也报余额/授权不足 → 刷allowance重试
+            err2 = info2.get("error", "") or info2.get("raw", "")
+            if "not enough balance" in err2.lower():
+                if adjusted and adjusted > 0:
+                    print(f"    🔄 链上有余额但授权不足，刷新allowance后重试")
+                    clob_client.update_token_allowance(token_id)
+                    info_a = clob_client.place_fok_order(token_id, SELL, 0.01, size)
+                    if info_a["matched"]:
+                        ap = round(info_a["taking"] / size, 4) if size > 0 and info_a["taking"] > 0 else 0.01
+                        print(f"    ⚡ allowance刷新后成交: 实际价=${ap:.4f} | {info_a.get('elapsed_ms', 0):.0f}ms")
+                        return True, ap
+                return False, "NO_BALANCE"
             print(f"    ❌ 地板价也无买方")
 
         return False, None
