@@ -419,6 +419,10 @@ def sell_position(token_id, size, price, max_retries=3):
             actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
             print(f"    📊 成交确认: Status={info['status']} | Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
             return True, info["raw"], actual_price
+        # 余额/授权不足 → 立即停止，不降价重试
+        err = info.get("error", "") or info.get("raw", "")
+        if "not enough balance" in err.lower():
+            return False, "NO_BALANCE", None
         print(f"    ⏳ FOK未成交 | 尝试{attempt+1}/{max_retries} | {info.get('elapsed_ms', 0):.0f}ms")
         if attempt < max_retries - 1:
             price = round(max(price - 0.01, 0.01), 2)  # 降价重试
@@ -892,10 +896,12 @@ def try_sell_with_multiple_prices(token_id, size, best_bid, current_price, entry
         success, output, actual_price = sell_position(token_id, size, price, max_retries=2)
         if success:
             return True, actual_price or price, output
+        if output == "NO_BALANCE":
+            return False, None, "NO_BALANCE"
         # 前几次失败后等待，让市场稳定
         if i < len(valid_prices) - 1:
             time.sleep(1)
-    
+
     return False, None, "所有价格尝试均失败"
 
 # 预挂单状态追踪（持久化到文件，进程重启不丢失）
@@ -1251,9 +1257,15 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
         if info["matched"]:
             actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
             return True, actual_price
+        # 余额/授权不足 → 返回 NO_BALANCE 停止重试
+        err = info.get("error", "") or info.get("raw", "")
+        if "not enough balance" in err.lower():
+            return False, "NO_BALANCE"
         return False, "FOK未成交"
     except Exception as e:
         print(f"    [SELL] exception: {str(e)[:200]}")
+        if "not enough balance" in str(e).lower():
+            return False, "NO_BALANCE"
         return False, str(e)
 
 def sell_in_batches(token_id, total_size, base_price):
@@ -1281,9 +1293,11 @@ def sell_in_batches(token_id, total_size, base_price):
             sold_total += batch_size
             sold_prices.append(real_price)
             print(f"    ✅ 分批 {batch_size}份 @ ${real_price:.2f}")
-            
+
             msg = f"📦 <b>分批平仓</b>\n\n已卖出 {batch_size}份 @ ${real_price:.2f}\n累计: {sold_total}/{total_size}份"
             send_telegram(msg)
+        elif output == "NO_BALANCE":
+            break  # 余额为零，不再继续分批
         else:
             print(f"    ❌ 分批失败 {batch_size}份 @ ${batch_price:.2f}，降价重试")
             for retry_price in [batch_price * 0.90, batch_price * 0.80, 0.10, 0.05, 0.01]:
@@ -1599,6 +1613,12 @@ def monitor():
                                 sold_price = actual_price or best_bid_early
                                 self_notify(pos, sold_price, coin, direction, size, "信号不足早期退出")
                                 close_position(pos, sold_price)
+                                close_attempts.pop(attempt_key, None)
+                                stop_loss_attempts.pop(attempt_key, None)
+                                continue
+                            elif output == "NO_BALANCE":
+                                print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                close_position(pos, current_price or 0)
                                 close_attempts.pop(attempt_key, None)
                                 stop_loss_attempts.pop(attempt_key, None)
                                 continue
