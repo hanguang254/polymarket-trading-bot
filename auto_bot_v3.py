@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 # --- 日志配置结束 ---
 
 from ai_trader.polymarket_api import get_current_markets
+from ai_trader import clob_client
 from ai_analyze_v2 import analyze_and_decide
 from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result
 
@@ -178,7 +179,7 @@ def get_token_ids(slug):
 
 
 def get_realtime_odds(up_token, down_token):
-    """从 CLOB 订单簿获取实时数据: midpoint, best_bid, best_ask"""
+    """从 CLOB 订单簿获取实时数据（SDK直连）"""
     result = {
         "up_mid": None, "down_mid": None,
         "up_bid": None, "down_bid": None,
@@ -187,10 +188,11 @@ def get_realtime_odds(up_token, down_token):
     for token_id, label in [(up_token, "UP"), (down_token, "DOWN")]:
         prefix = "up" if label == "UP" else "down"
         try:
-            resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
-            if resp.status_code == 200:
-                book = resp.json()
-                bids, asks = normalize_orderbook(book.get("bids", []), book.get("asks", []))
+            book = clob_client.get_orderbook(token_id)
+            if book:
+                raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
+                raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
+                bids, asks = normalize_orderbook(raw_bids, raw_asks)
                 if bids:
                     result[f"{prefix}_bid"] = round(float(bids[0]["price"]), 4)
                 if asks:
@@ -249,82 +251,53 @@ def send_close_notification(coin, direction, entry_price, exit_price, size, pnl)
 
 def close_position(token_id, size=5, time_remaining=None):
     """
-    改进的平仓函数 v2
-    - 分级策略：根据剩余时间自动切换模式
-    - 多次重试：每个模式多次尝试不同价格
-    - 动态订单簿：每次重试前重新获取最新数据
+    FOK平仓 — SDK直连，逐级降价
     """
-    import subprocess
-    
-    # 自动判断模式
-    if time_remaining is not None:
-        if time_remaining < 20:
-            mode = "emergency"
-            max_retries = 8
-            retry_delay = 1
-        elif time_remaining < 45:
-            mode = "urgent"
-            max_retries = 5
-            retry_delay = 2
-        else:
-            mode = "normal"
-            max_retries = 3
-            retry_delay = 3
+    from py_clob_client.order_builder.constants import SELL
+
+    # 根据剩余时间决定重试次数
+    if time_remaining is not None and time_remaining < 20:
+        mode = "emergency"
+        max_retries = 4
+    elif time_remaining is not None and time_remaining < 45:
+        mode = "urgent"
+        max_retries = 3
     else:
         mode = "normal"
-        max_retries = 3
-        retry_delay = 3
-    
-    print(f"  🔔 平仓模式: {mode} | 剩余: {time_remaining}s | 重试: {max_retries}次")
-    
-    for attempt in range(max_retries):
-        # 获取最新订单簿
+        max_retries = 2
+
+    print(f"  🔔 FOK平仓: {mode} | 剩余: {time_remaining}s | 重试: {max_retries}次")
+
+    for _attempt in range(max_retries):
+        # SDK获取最新best_bid
+        best_bid = None
         try:
-            resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
-            if resp.status_code == 200:
-                book = resp.json()
-                bids, _ = normalize_orderbook(book.get('bids', []), book.get('asks', []))
+            book = clob_client.get_orderbook(token_id)
+            if book and book.bids:
+                raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
+                bids, _ = normalize_orderbook(raw_bids, [])
                 best_bid = float(bids[0]['price']) if bids else None
-            else:
-                best_bid = None
         except:
-            best_bid = None
-        
-        # 根据模式选择价格策略
-        if mode == "emergency":
-            prices = [best_bid * 0.95, best_bid * 0.90, best_bid * 0.80, 0.05, 0.01] if best_bid and best_bid >= 0.05 else [0.05, 0.01]
-        elif mode == "urgent":
-            prices = [best_bid * 0.98, best_bid * 0.95, best_bid * 0.90, 0.10, 0.05] if best_bid and best_bid >= 0.10 else [0.10, 0.05]
-        else:
-            prices = [best_bid * 0.99, best_bid * 0.97, best_bid * 0.95] if best_bid and best_bid >= 0.20 else [0.20, 0.15]
-        
-        # 过滤有效价格
-        valid_prices = [round(p, 3) for p in prices if p and p >= 0.01]
-        
-        # 尝试每个价格
-        for price in valid_prices:
-            cmd = [
-                "polymarket", "clob", "create-order",
-                "--signature-type", "eoa",
-                "--token", token_id,
-                "--side", "sell",
-                "--price", str(price),
-                "--size", str(size),
-            ]
-            
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-                if result.returncode == 0:
-                    print(f"  ✅ 成交！价格: ${price:.3f}")
-                    return True, price, result.stdout
-            except:
-                pass
-        
-        # 重试前等待
-        if attempt < max_retries - 1:
-            time.sleep(retry_delay)
-    
-    return False, None, f"Failed after {max_retries} attempts"
+            pass
+
+        # FOK卖价：best_bid减滑点，确保吃到单
+        sell_price = round(max(best_bid * 0.95, 0.01), 2) if best_bid else 0.01
+
+        info = clob_client.place_fok_order(token_id, SELL, sell_price, size)
+        if info["matched"]:
+            actual = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
+            print(f"  ✅ FOK成交！${actual:.3f} | {info.get('elapsed_ms', 0):.0f}ms")
+            return True, actual, info["raw"]
+
+        # 未成交 → 降到地板价重试
+        if sell_price > 0.02:
+            info2 = clob_client.place_fok_order(token_id, SELL, 0.01, size)
+            if info2["matched"]:
+                actual = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
+                print(f"  ✅ 地板价成交！${actual:.3f} | {info2.get('elapsed_ms', 0):.0f}ms")
+                return True, actual, info2["raw"]
+
+    return False, None, f"FOK failed after {max_retries} attempts"
 
 
 class Position:
@@ -356,8 +329,13 @@ class MarketTracker:
         """更新市场列表"""
         if not circuit_breaker_check():
             return []
-        markets = get_current_markets()
-        circuit_breaker_record(bool(markets))
+        try:
+            markets = get_current_markets()
+            # 空列表是正常的（市场间歇期），不算API失败
+            circuit_breaker_record(True)
+        except Exception:
+            circuit_breaker_record(False)
+            markets = []
         now = datetime.now(timezone.utc)
         
         for market in markets:
@@ -421,10 +399,10 @@ class MarketTracker:
                         else:
                             atr_val = None
                         self.bayesian_updaters[slug] = BayesianUpdater(
-                            prior_up=market["up_odds"],
+                            prior_up=0.50,
                             atr_val=atr_val
                         )
-                        logger.info(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s | 贝叶斯先验UP={market['up_odds']:.3f} ATR={atr_val}")
+                        logger.info(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s | 贝叶斯先验UP=0.500(无偏) ATR={atr_val}")
                     except Exception as e:
                         logger.warning(f"\n🔥 预热开始(无贝叶斯): {market['coin']} | {slug} | {e}")
 
@@ -550,7 +528,7 @@ class MarketTracker:
             return "数据不足", {}
 
         # 检查是否穿越零轴（价格在PTB两侧反复横跳）
-        signs = [1 if g > 0 else -1 for g in gaps]
+        signs = [1 if g >= 0 else -1 for g in gaps]
         sign_changes = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1])
         if sign_changes >= 2:
             return "穿越", {"sign_changes": sign_changes, "gaps": gaps}
@@ -805,14 +783,15 @@ class MarketTracker:
 
 
 def main():
-    print("🤖 Polymarket 全自动交易机器人 v3.3 启动")
+    print("🤖 Polymarket 全自动交易机器人 v3.4 启动")
     print("   策略: PTB预获取 → 贝叶斯预热 → 趋势确认下注")
-    print("   新增: 贝叶斯序贯更新 | LMSR流动性评估 | 修正Kelly公式")
+    print("   新增: SDK直连下单(延迟<50ms) | FOK即时平仓 | LMSR流动性评估")
     print("   时间线: 2-40s获取PTB → 20-100s贝叶斯预热 → 100-160s下注")
-    print("   趋势确认: 强/中趋势正常阈值，震荡提高到15%")
-    print("   容错: 自动捕获异常，避免EPIPE崩溃")
     print()
-    
+
+    # 初始化 CLOB SDK 客户端（全局单例，全程复用）
+    clob_client.init_client()
+
     tracker = MarketTracker()
     error_count = 0
     max_errors = 100

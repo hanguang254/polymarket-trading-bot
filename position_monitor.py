@@ -13,6 +13,8 @@ import time
 from datetime import datetime, timezone
 import requests
 from ai_trader.polymarket_api import normalize_orderbook
+from ai_trader import clob_client
+from py_clob_client.order_builder.constants import BUY, SELL
 
 # ═══ 日志：print 同时写入 logs/monitor.log ═══
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -97,56 +99,44 @@ def get_open_positions():
                         pass
     return positions
 
-def get_market_price(token_id):
-    """获取当前市场价格 — 多源融合，防止宽价差导致虚假中间价
+def _get_orderbook_bids_asks(token_id):
+    """SDK获取订单簿，返回已规范化的 (bids, asks)"""
+    try:
+        book = clob_client.get_orderbook(token_id)
+        if book and book.bids is not None and book.asks is not None:
+            # OrderSummary有price/size属性，转为dict供normalize_orderbook使用
+            raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
+            raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
+            return normalize_orderbook(raw_bids, raw_asks)
+    except:
+        pass
+    return [], []
 
-    5分钟市场临近结束时，bid/ask 可能极端分散（如 $0.01/$0.99），
-    此时 midpoint=$0.50 完全不代表真实价值。
-    策略：
-      1. 订单簿价差合理（<50%）→ 用 midpoint
-      2. 价差过大 → 用 midpoint API（服务端计算，通常更准）
-      3. 都失败 → 返回 None
-    """
+def get_market_price(token_id):
+    """获取当前市场价格 — 多源融合（SDK直连）"""
     best_bid = None
     best_ask = None
-    # 方案1：从订单簿获取 bid/ask
+    # 方案1：SDK订单簿
     try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/book?token_id={token_id}",
-            timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            bids, asks = normalize_orderbook(data.get('bids', []), data.get('asks', []))
-            best_bid = float(bids[0]['price']) if bids else None
-            best_ask = float(asks[0]['price']) if asks else None
-            if best_bid and best_ask:
-                spread = best_ask - best_bid
-                mid = (best_bid + best_ask) / 2
-                # 价差合理（<50% of mid）→ 信任 midpoint
-                if mid > 0 and spread / mid < 0.50:
-                    return round(mid, 4)
-                # 价差过大 → 不信任订单簿 midpoint，回退
+        bids, asks = _get_orderbook_bids_asks(token_id)
+        best_bid = float(bids[0]['price']) if bids else None
+        best_ask = float(asks[0]['price']) if asks else None
+        if best_bid and best_ask:
+            spread = best_ask - best_bid
+            mid = (best_bid + best_ask) / 2
+            if mid > 0 and spread / mid < 0.50:
+                return round(mid, 4)
     except:
         pass
-    # 方案2：midpoint API（服务端计算，5分钟市场通常更准）
-    try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/midpoint?token_id={token_id}",
-            timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            mid = data.get("mid")
-            if mid:
-                return float(mid)
-    except:
-        pass
-    # 方案3：last-trade-price（空簿时的真实市场价）
+    # 方案2：SDK midpoint
+    mid = clob_client.get_midpoint(token_id)
+    if mid and mid > 0:
+        return mid
+    # 方案3：SDK last-trade-price
     ltp = get_last_trade_price(token_id)
     if ltp:
         return ltp
-    # 方案4：只有 bid 或 ask，返回有的那个
+    # 方案4：只有 bid 或 ask
     if best_bid and best_ask:
         return round((best_bid + best_ask) / 2, 4)
     if best_bid:
@@ -156,22 +146,15 @@ def get_market_price(token_id):
     return None
 
 def get_best_bid_raw(token_id):
-    """获取原始最佳买价（止损专用，不打折扣，追求最快成交）"""
+    """获取原始最佳买价（止损专用，SDK直连）"""
     try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/book?token_id={token_id}",
-            timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            bids, _ = normalize_orderbook(data.get('bids', []), data.get('asks', []))
-            if bids and len(bids) > 0:
-                best_bid = float(bids[0]['price'])
-                if best_bid > 0.02:
-                    return best_bid
+        bids, _ = _get_orderbook_bids_asks(token_id)
+        if bids:
+            best_bid = float(bids[0]['price'])
+            if best_bid > 0.02:
+                return best_bid
     except:
         pass
-    # 回退：last-trade-price（不减SLIPPAGE，止损不留余地）
     ltp = get_last_trade_price(token_id)
     if ltp:
         print(f"    📡 get_best_bid_raw空簿回退: last_trade=${ltp:.3f}")
@@ -180,23 +163,15 @@ def get_best_bid_raw(token_id):
 
 
 def get_best_bid(token_id):
-    """获取最佳买价（用于卖出）- 从订单簿获取，空簿回退last-trade-price"""
+    """获取最佳买价（用于卖出，SDK直连）"""
     try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/book?token_id={token_id}",
-            timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            bids, _ = normalize_orderbook(data.get('bids', []), data.get('asks', []))
-            if bids and len(bids) > 0:
-                best_bid = float(bids[0]['price'])
-                if best_bid > 0.02:  # 正常市场
-                    return best_bid * 0.99
-                # 空簿: bid≤0.02，回退last-trade-price
+        bids, _ = _get_orderbook_bids_asks(token_id)
+        if bids:
+            best_bid = float(bids[0]['price'])
+            if best_bid > 0.02:
+                return best_bid * 0.99
     except:
         pass
-    # 回退：last-trade-price - SLIPPAGE
     ltp = get_last_trade_price(token_id)
     if ltp:
         fallback = max(round(ltp - SLIPPAGE, 2), 0.01)
@@ -205,23 +180,15 @@ def get_best_bid(token_id):
     return None
 
 def get_best_ask(token_id):
-    """获取最佳卖价（用于买入对冲）- 从订单簿获取，空簿回退last-trade-price"""
+    """获取最佳卖价（用于买入对冲，SDK直连）"""
     try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/book?token_id={token_id}",
-            timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            _, asks = normalize_orderbook(data.get('bids', []), data.get('asks', []))
-            if asks and len(asks) > 0:
-                ask = float(asks[0]['price'])
-                if ask < 0.95:  # 正常市场
-                    return ask
-                # 空簿: ask≥0.95，回退last-trade-price
+        _, asks = _get_orderbook_bids_asks(token_id)
+        if asks:
+            ask = float(asks[0]['price'])
+            if ask < 0.95:
+                return ask
     except:
         pass
-    # 回退：last-trade-price + SLIPPAGE
     ltp = get_last_trade_price(token_id)
     if ltp:
         fallback = min(round(ltp + SLIPPAGE, 2), 0.99)
@@ -230,66 +197,34 @@ def get_best_ask(token_id):
     return None
 
 def get_last_trade_price(token_id):
-    """获取最近成交价（空簿时的真实市场价参考）"""
-    try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/last-trade-price?token_id={token_id}",
-            timeout=5
-        )
-        if resp.status_code == 200:
-            price = float(resp.json().get('price', 0))
-            if 0.01 < price < 0.99:
-                return price
-    except:
-        pass
+    """获取最近成交价（SDK直连）"""
+    price = clob_client.get_last_trade_price(token_id)
+    if price and 0.01 < price < 0.99:
+        return price
     return None
 
 def buy_opposite_token(token_id, size, price, max_retries=2):
-    """买入对冲token（BUY订单）
+    """买入对冲token（FOK即时成交）
     返回: (success, output, actual_price)
     """
     price = round(price, 2)
     for attempt in range(max_retries):
-        cmd = [
-            "polymarket", "clob", "create-order",
-            "--signature-type", "eoa",
-            "--token", token_id,
-            "--side", "buy",
-            "--price", str(price),
-            "--size", str(size)
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                info = parse_order_output(result.stdout)
-                if info["matched"]:
-                    actual_price = round(info["making"] / size, 4) if size > 0 and info["making"] > 0 else price
-                    print(f"    📊 对冲成交: Status={info['status']} | 实际价=${actual_price:.4f}")
-                    return True, result.stdout, actual_price
-                else:
-                    # 避免多次重试叠加挂单
-                    cancel_all_orders(token_id)
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-                    continue
-            if attempt < max_retries - 1:
-                time.sleep(2)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2)
-            else:
-                return False, str(e), None
+        info = clob_client.place_fok_order(token_id, BUY, price, size)
+        if info["matched"]:
+            actual_price = round(info["making"] / size, 4) if size > 0 and info["making"] > 0 else price
+            print(f"    📊 对冲成交: Status={info['status']} | 实际价=${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
+            return True, info["raw"], actual_price
+        if info.get("status") == "ERROR":
+            return False, info.get("error", ""), None
+        # FOK未成交，降价重试
+        if attempt < max_retries - 1:
+            price = round(price + 0.01, 2)  # 提高出价
     return False, "All retries failed", None
 
 def analyze_liquidity(token_id, target_size):
-    """分析订单簿流动性"""
+    """分析订单簿流动性（SDK直连）"""
     try:
-        resp = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=3)
-        if resp.status_code != 200:
-            return None
-
-        book = resp.json()
-        bids, _ = normalize_orderbook(book.get('bids', []), book.get('asks', []))
+        bids, _ = _get_orderbook_bids_asks(token_id)
         if not bids:
             return None
         
@@ -412,100 +347,60 @@ def market_sell_immediate(token_id, size, price=None):
     # 确定卖价：止损优先成交，用传入价格减滑点
     sell_price = None
     if price and price > 0.01:
-        # 传入的是best_bid原始值，减滑点确保能吃到bid
         sell_price = round(max(price - SLIPPAGE, 0.01), 2)
     if not sell_price:
         ltp = get_last_trade_price(token_id)
         if ltp:
             sell_price = round(max(ltp - SLIPPAGE, 0.01), 2)
     if not sell_price:
-        sell_price = 0.01  # 地板价：CLOB会按最高bid撮合
+        sell_price = 0.01
 
-    print(f"    ⚡ 市价止损: 卖价=${sell_price:.2f}")
-
-    def _try_sell(p):
-        cmd = [
-            "polymarket", "clob", "create-order",
-            "--signature-type", "eoa",
-            "--token", token_id,
-            "--side", "sell",
-            "--price", str(round(p, 2)),
-            "--size", str(size)
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return result
+    print(f"    ⚡ FOK止损: 卖价=${sell_price:.2f}")
 
     try:
-        result = _try_sell(sell_price)
-        if result.returncode == 0:
-            info = parse_order_output(result.stdout)
-            if info["matched"]:
-                actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
-                print(f"    ⚡ 市价成交: Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f}")
+        # FOK: 全部即时成交或取消，不留挂单
+        info = clob_client.place_fok_order(token_id, SELL, sell_price, size)
+        if info["matched"]:
+            actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
+            print(f"    ⚡ 市价成交: Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
+            return True, actual_price
+
+        # FOK失败
+        print(f"    ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
+        err = info.get("error", "") or info.get("raw", "")
+        if "not enough balance" in err.lower():
+            for retry_size in [round(size * 0.98, 2), round(size * 0.95, 2), round(size * 0.90, 2)]:
+                if retry_size < 1:
+                    break
+                print(f"    🔄 余额不足，减量重试: {retry_size}份")
+                info_r = clob_client.place_fok_order(token_id, SELL, sell_price, retry_size)
+                if info_r["matched"]:
+                    ap = round(info_r["taking"] / retry_size, 4) if retry_size > 0 and info_r["taking"] > 0 else sell_price
+                    print(f"    ⚡ 减量成交: {retry_size}份 | 实际价=${ap:.4f} | {info_r.get('elapsed_ms', 0):.0f}ms")
+                    return True, ap
+                err_r = info_r.get("error", "") or info_r.get("raw", "")
+                if "not enough balance" not in err_r.lower():
+                    break
+            print(f"    ⚠️ 减量重试均失败，余额可能为零")
+            return False, "NO_BALANCE"
+
+        # 降到$0.01地板价重试
+        if sell_price > 0.02:
+            print(f"    🔄 降价重试: $0.01地板价")
+            info2 = clob_client.place_fok_order(token_id, SELL, 0.01, size)
+            if info2["matched"]:
+                actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
+                print(f"    ⚡ 地板价成交: Taking=${info2['taking']:.4f} | 实际价=${actual_price:.4f} | {info2.get('elapsed_ms', 0):.0f}ms")
                 return True, actual_price
-            else:
-                print(f"    ❌ 市价卖出无买方(Status={info['status']})，取消挂单")
-                cancel_all_orders(token_id)
-                return False, None
-        else:
-            err = result.stderr.strip()
-            print(f"    ❌ 止损被拒(卖价${sell_price:.2f}): {err[:200]}")
+            print(f"    ❌ 地板价也无买方")
 
-            # "not enough balance" → 减量重试（size精度不匹配链上余额）
-            if "not enough balance" in err.lower():
-                for retry_size in [round(size * 0.98, 2), round(size * 0.95, 2), round(size * 0.90, 2)]:
-                    if retry_size < 1:
-                        break
-                    print(f"    🔄 余额不足，减量重试: {retry_size}份")
-                    cmd_retry = [
-                        "polymarket", "clob", "create-order",
-                        "--signature-type", "eoa",
-                        "--token", token_id,
-                        "--side", "sell",
-                        "--price", str(sell_price),
-                        "--size", str(retry_size)
-                    ]
-                    try:
-                        r = subprocess.run(cmd_retry, capture_output=True, text=True, timeout=15)
-                        if r.returncode == 0:
-                            info_r = parse_order_output(r.stdout)
-                            if info_r["matched"]:
-                                ap = round(info_r["taking"] / retry_size, 4) if retry_size > 0 and info_r["taking"] > 0 else sell_price
-                                print(f"    ⚡ 减量成交: {retry_size}份 | 实际价=${ap:.4f}")
-                                return True, ap
-                            else:
-                                cancel_all_orders(token_id)
-                                return False, None
-                        elif "not enough balance" not in r.stderr.lower():
-                            break  # 其他错误不再减量
-                    except Exception:
-                        break
-                print(f"    ⚠️ 减量重试均失败，余额可能为零")
-                return False, "NO_BALANCE"
-
-            # 其他400错误：降到$0.01地板价重试（CLOB按最高bid撮合）
-            if sell_price > 0.02:
-                print(f"    🔄 降价重试: $0.01地板价")
-                result2 = _try_sell(0.01)
-                if result2.returncode == 0:
-                    info2 = parse_order_output(result2.stdout)
-                    if info2["matched"]:
-                        actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
-                        print(f"    ⚡ 地板价成交: Taking=${info2['taking']:.4f} | 实际价=${actual_price:.4f}")
-                        return True, actual_price
-                    else:
-                        cancel_all_orders(token_id)
-                        print(f"    ❌ 地板价也无买方")
-                else:
-                    print(f"    ❌ 地板价也被拒: {result2.stderr.strip()[:150]}")
-
-            return False, None
+        return False, None
     except Exception as e:
         print(f"    ❌ 市价卖出异常: {str(e)[:80]}")
         return False, None
 
 def sell_position(token_id, size, price, max_retries=3):
-    """卖出持仓（带重试+成交确认）
+    """卖出持仓（FOK即时成交 + 降价重试）
     返回: (success, output, actual_price)
       - success: True仅当Status=MATCHED
       - actual_price: 实际成交价（Taking/Size），None表示未知
@@ -520,39 +415,16 @@ def sell_position(token_id, size, price, max_retries=3):
     price = round(price, 2)
 
     for attempt in range(max_retries):
-        cmd = [
-            "polymarket", "clob", "create-order",
-            "--signature-type", "eoa",
-            "--token", token_id,
-            "--side", "sell",
-            "--price", str(price),
-            "--size", str(size)
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                info = parse_order_output(result.stdout)
-                if info["matched"]:
-                    actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
-                    print(f"    📊 成交确认: Status={info['status']} | Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f}")
-                    return True, result.stdout, actual_price
-                else:
-                    # LIVE=挂单未成交，不算成功
-                    print(f"    ⏳ 挂单未成交: Status={info['status']} | 尝试{attempt+1}/{max_retries}")
-                    # 避免多次重试叠加挂单
-                    cancel_all_orders(token_id)
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-                    continue
-            if attempt < max_retries - 1:
-                time.sleep(2)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2)
-            else:
-                return False, str(e), None
+        info = clob_client.place_fok_order(token_id, SELL, price, size)
+        if info["matched"]:
+            actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
+            print(f"    📊 成交确认: Status={info['status']} | Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
+            return True, info["raw"], actual_price
+        print(f"    ⏳ FOK未成交 | 尝试{attempt+1}/{max_retries} | {info.get('elapsed_ms', 0):.0f}ms")
+        if attempt < max_retries - 1:
+            price = round(max(price - 0.01, 0.01), 2)  # 降价重试
 
-    return False, result.stderr if 'result' in locals() else "All retries failed", None
+    return False, "All FOK retries failed", None
 
 def close_position(position, exit_price):
     """标记持仓为已关闭"""
@@ -1163,13 +1035,8 @@ def has_pre_order(slug):
     return slug in _pre_orders
 
 def cancel_all_orders(token_id):
-    """取消所有活跃订单"""
-    try:
-        cmd = ["polymarket", "clob", "cancel-all", "--token", token_id, "--signature-type", "eoa"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return result.returncode == 0
-    except:
-        return False
+    """取消所有活跃订单（SDK直连）"""
+    return clob_client.cancel_all(token_id)
 
 def reconcile_pending_orders():
     """Promote LIVE buy orders to positions when they fill; cancel stale ones."""
@@ -1440,24 +1307,8 @@ def _parse_token_balance_from_output(output, token_id):
     return None
 
 def get_token_balance(token_id):
-    """查询钱包中指定 conditional token 余额"""
-    try:
-        cmd = [
-            "polymarket", "clob", "balance",
-            "--asset-type", "conditional",
-            "--token", str(token_id),
-            "--signature-type", "eoa",
-            "--output", "json",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            bal = data.get("balance")
-            if bal is not None:
-                return float(bal)
-    except Exception:
-        pass
-    return None
+    """查询钱包中指定 conditional token 余额（SDK直连）"""
+    return clob_client.get_token_balance(token_id)
 
 def check_balance_changed(token_id, expected_size):
     """通过查询token余额判断是否成交（余额减少=卖出成功）"""
@@ -1471,7 +1322,7 @@ def check_balance_changed(token_id, expected_size):
     return False
 
 def sell_and_confirm(token_id, size, price, timeout_sec=5):
-    """挂单并确认成交，未成交则取消
+    """FOK卖出（即时成交或取消，无需等待确认）
     返回: (success, msg_or_actual_price)
     """
     # 校验链上真实余额
@@ -1482,43 +1333,16 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
         size = adjusted
 
     price = round(price, 2)
-    cmd = [
-        "polymarket", "clob", "create-order",
-        "--signature-type", "eoa",
-        "--token", token_id,
-        "--side", "sell",
-        "--price", str(price),
-        "--size", str(size)
-    ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            print(f"    [SELL] create-order failed: rc={result.returncode} stderr={result.stderr.strip()[:200]} stdout={result.stdout.strip()[:200]}")
-            return False, result.stderr.strip() or "下单失败"
-
-        info = parse_order_output(result.stdout)
+        info = clob_client.place_fok_order(token_id, SELL, price, size)
         print(
             f"    [SELL] status={info['status']} matched={info['matched']} "
-            f"making={info['making']:.4f} taking={info['taking']:.4f} order_id={info.get('order_id')}"
+            f"making={info['making']:.4f} taking={info['taking']:.4f} | {info.get('elapsed_ms', 0):.0f}ms"
         )
         if info["matched"]:
             actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
             return True, actual_price
-        else:
-            raw = (result.stdout or "").strip()
-            if raw:
-                print(f"    [SELL] raw_output={raw[:400]}")
-
-        # LIVE挂单：等待一小段时间确认成交
-        start = time.time()
-        while time.time() - start < timeout_sec:
-            if check_balance_changed(token_id, size):
-                return True, price
-            time.sleep(1)
-
-        cancel_all_orders(token_id)
-        print(f"    [SELL] not matched after {timeout_sec}s, order cancelled")
-        return False, "未成交已取消"
+        return False, "FOK未成交"
     except Exception as e:
         print(f"    [SELL] exception: {str(e)[:200]}")
         return False, str(e)
@@ -2156,4 +1980,5 @@ def self_notify(pos, sell_price, coin, direction, size, label):
 
 
 if __name__ == "__main__":
+    clob_client.init_client()
     monitor()

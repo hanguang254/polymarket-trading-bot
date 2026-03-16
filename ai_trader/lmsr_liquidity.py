@@ -15,6 +15,7 @@ CLOB 不是 LMSR AMM，但 LMSR 理论价格可作为"公允价格"参考线，
 import math
 import requests
 from ai_trader.polymarket_api import normalize_orderbook
+from ai_trader import clob_client
 
 
 # ═══════════════════════════════════════════════════════════
@@ -156,15 +157,12 @@ def lmsr_fair_price(token_id, timeout=3):
         } or None
     """
     try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/book?token_id={token_id}",
-            timeout=timeout
-        )
-        if resp.status_code != 200:
+        book = clob_client.get_orderbook(token_id)
+        if not book or not book.bids or not book.asks:
             return None
-
-        book = resp.json()
-        bids, asks = normalize_orderbook(book.get("bids", []), book.get("asks", []))
+        raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
+        raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
+        bids, asks = normalize_orderbook(raw_bids, raw_asks)
 
         if not bids or not asks:
             return None
@@ -236,17 +234,13 @@ def estimate_lmsr_b(token_id, timeout=3):
         }
     """
     try:
-        resp = requests.get(
-            f"https://clob.polymarket.com/book?token_id={token_id}",
-            timeout=timeout
-        )
-        if resp.status_code != 200:
-            print(f"  📡 CLOB订单簿请求失败: status={resp.status_code} token={token_id[:16]}...")
+        book = clob_client.get_orderbook(token_id)
+        if not book:
+            print(f"  📡 SDK订单簿请求失败: token={str(token_id)[:16]}...")
             return _default_result()
 
-        book = resp.json()
-        raw_bids = book.get("bids", [])
-        raw_asks = book.get("asks", [])
+        raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
+        raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
         bids, asks = normalize_orderbook(raw_bids, raw_asks)
 
         # 调试日志: 打印规范化后的订单簿数据

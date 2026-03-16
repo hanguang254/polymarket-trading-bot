@@ -115,8 +115,8 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
     details["diff_in_atr"] = round(diff_in_atr, 2)
     details["atr"] = round(atr_val, 2)
 
-    # 方向：价格>PTB → UP领先，价格<PTB → DOWN领先
-    if price_diff > 0:
+    # 方向：价格>=PTB → UP领先，价格<PTB → DOWN领先（零值不偏向DOWN）
+    if price_diff >= 0:
         direction = "UP"
         leading_odds = up_odds      # 领先方的赔率（我们要买的）
         trailing_odds = down_odds
@@ -178,7 +178,7 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
 
         # 动量方向与偏离方向一致 = 偏离在扩大 = 更好
         momentum_dir = 1 if recent_change > 0 else -1
-        position_dir = 1 if price_diff > 0 else -1
+        position_dir = 1 if price_diff >= 0 else -1
 
         if momentum_dir == position_dir:
             # 动量确认偏离方向，加分
