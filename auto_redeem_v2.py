@@ -503,6 +503,11 @@ def get_usdc_balance(wallet, usdc_contract) -> float:
 def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     """执行一轮领取，返回实际 USDC 收益"""
 
+    # 0. 当前余额
+    usdc_now = get_usdc_balance(wallet, usdc_contract)
+    if usdc_now >= 0:
+        log.info(f"💰 当前余额: ${usdc_now:.2f} USDC")
+
     # 1. 获取可 redeem 的持仓
     redeemable = find_redeemable(w3, wallet, ctf_contract)
 
