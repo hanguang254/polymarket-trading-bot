@@ -293,6 +293,28 @@ def get_last_trade_price(token_id):
         return None
 
 
+# ── 订单查询 ──
+
+def get_order(order_id):
+    """查询单个订单状态（用于挂单对账）"""
+    try:
+        return _client.get_order(str(order_id))
+    except Exception as e:
+        logger.warning(f"查询订单失败: {e}")
+        return None
+
+
+def get_orders(asset_id=None):
+    """查询所有订单（可按 asset_id 过滤）"""
+    try:
+        from py_clob_client.clob_types import OpenOrderParams
+        params = OpenOrderParams(asset_id=str(asset_id)) if asset_id else None
+        return _client.get_orders(params)
+    except Exception as e:
+        logger.warning(f"查询订单列表失败: {e}")
+        return []
+
+
 # ── 内部工具 ──
 
 def _parse_response(resp):

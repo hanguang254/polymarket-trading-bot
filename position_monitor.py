@@ -6,7 +6,6 @@
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 import time
@@ -908,7 +907,6 @@ PENDING_ORDER_TTL = int(os.environ.get("PENDING_ORDER_TTL", "30"))
 PENDING_AUTO_CANCEL = os.environ.get("PENDING_AUTO_CANCEL", "0") == "1"
 PENDING_MIN_FILL = float(os.environ.get("PENDING_MIN_FILL", "0.5"))
 
-_pending_positions_cache = {"ts": 0, "data": {}}
 
 def _append_pending_update(entry):
     try:
@@ -939,58 +937,6 @@ def _load_pending_orders():
         pass
     return orders
 
-def _get_wallet_address():
-    return os.environ.get("PROXY_WALLET") or os.environ.get("EOA_WALLET") or ""
-
-def _coerce_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-def _extract_positions_snapshot(obj, out):
-    if isinstance(obj, dict):
-        token_id = obj.get("token_id") or obj.get("tokenId") or obj.get("id")
-        size = _coerce_float(
-            obj.get("size") or obj.get("amount") or obj.get("shares") or obj.get("position")
-            or obj.get("qty") or obj.get("quantity")
-        )
-        if token_id and size is not None:
-            avg_price = _coerce_float(
-                obj.get("avg_price") or obj.get("avgPrice") or obj.get("averagePrice")
-                or obj.get("average_price") or obj.get("entryPrice") or obj.get("price")
-            )
-            out[str(token_id)] = {"size": size, "avg_price": avg_price}
-        for v in obj.values():
-            _extract_positions_snapshot(v, out)
-    elif isinstance(obj, list):
-        for item in obj:
-            _extract_positions_snapshot(item, out)
-
-def _fetch_positions_snapshot():
-    wallet = _get_wallet_address()
-    if not wallet:
-        return {}
-    try:
-        cmd = ["polymarket", "data", "positions", wallet, "-o", "json"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if result.returncode != 0:
-            return {}
-        data = json.loads(result.stdout or "{}")
-        out = {}
-        _extract_positions_snapshot(data, out)
-        return {k: v for k, v in out.items() if v.get("size", 0) > 0}
-    except Exception:
-        return {}
-
-def _get_positions_snapshot_cached(ttl=3):
-    now = time.time()
-    if now - _pending_positions_cache["ts"] < ttl:
-        return _pending_positions_cache["data"]
-    data = _fetch_positions_snapshot()
-    _pending_positions_cache["ts"] = now
-    _pending_positions_cache["data"] = data
-    return data
 
 def _load_pre_orders():
     """从文件加载预挂单状态"""
@@ -1051,13 +997,6 @@ def reconcile_pending_orders():
 
     print(f"  🔄 reconcile: 检查 {len(active)} 笔挂单...")
 
-    # 先尝试 positions snapshot，失败不影响后续 balance 查询
-    positions_snapshot = {}
-    try:
-        positions_snapshot = _get_positions_snapshot_cached()
-    except Exception as e:
-        print(f"  ⚠️ reconcile: positions snapshot 失败: {e}")
-
     open_positions = get_open_positions()
     open_keys = {(p.get("slug"), p.get("token_id")) for p in open_positions}
 
@@ -1090,23 +1029,49 @@ def reconcile_pending_orders():
             except Exception:
                 age = None
 
-        # 检测成交：先查 positions snapshot，再 fallback 到 token balance
-        snapshot = positions_snapshot.get(str(token_id))
-        filled_size = snapshot.get("size") if snapshot else None
+        # 检测成交：1. SDK查询订单状态 → 2. fallback到token余额
+        filled_size = None
+        avg_price = None  # SDK get_order may populate this
+        order_id = order.get("order_id")
 
+        # 方法1：SDK get_order — 直接查订单状态，最准确
+        if order_id:
+            try:
+                order_info = clob_client.get_order(order_id)
+                if order_info:
+                    order_status = (order_info.get("status") or "").upper()
+                    if order_status == "MATCHED":
+                        # 订单已成交
+                        size_matched = float(order_info.get("size_matched", 0) or 0)
+                        original_size = float(order_info.get("original_size", 0) or order.get("requested_size", 0))
+                        filled_size = size_matched if size_matched > 0 else original_size
+                        avg_price = float(order_info.get("price", 0) or 0)
+                        print(f"  📡 reconcile: SDK订单状态=MATCHED size={filled_size} price={avg_price}")
+                    elif order_status in ("CANCELLED", "CANCELED"):
+                        print(f"  ❌ reconcile: 订单已取消 {slug}")
+                        _append_pending_update({
+                            "order_id": order_id, "slug": slug, "token_id": token_id,
+                            "status": "CANCELLED", "resolved_at": now.isoformat(),
+                        })
+                        continue
+                    else:
+                        print(f"  ⏳ reconcile: SDK订单状态={order_status} {slug}")
+            except Exception as e:
+                print(f"  ⚠️ reconcile: SDK get_order 失败: {e}")
+
+        # 方法2：fallback — 查 token 余额
         if not filled_size:
             try:
                 balance = get_token_balance(token_id)
                 print(f"  📊 reconcile: {slug} token balance={balance}")
                 if balance is not None and balance > 0:
                     filled_size = balance
-                    snapshot = {"size": balance, "avg_price": None}
             except Exception as e:
                 print(f"  ⚠️ reconcile: get_token_balance 失败: {e}")
 
         if filled_size and filled_size >= PENDING_MIN_FILL:
             print(f"  ✅ reconcile 成交入仓: {slug} token={str(token_id)[:10]}... size={filled_size}")
-            avg_price = snapshot.get("avg_price") if snapshot else None
+            # avg_price may have been set by SDK get_order above; otherwise None
             entry_price = order.get("limit_price")
             price_source = "limit_price"
             if avg_price and 0.01 < avg_price < 0.99:
@@ -1249,62 +1214,6 @@ def reconcile_pending_orders():
             except Exception:
                 pass
 
-def _looks_like_token_balance_listing(output):
-    if not output:
-        return False
-    lower = output.lower()
-    return "balance" in lower and ("token" in lower or "token_id" in lower or "tokenid" in lower)
-
-def _parse_token_balance_from_output(output, token_id):
-    if not output:
-        return None
-
-    def _coerce(value):
-        try:
-            return float(value)
-        except Exception:
-            return None
-
-    def _extract_from_obj(obj):
-        if isinstance(obj, dict):
-            for key in ("token_id", "tokenId", "id"):
-                if obj.get(key) == token_id:
-                    for bal_key in ("balance", "amount", "size", "quantity", "qty"):
-                        if bal_key in obj:
-                            return _coerce(obj[bal_key])
-            if token_id in obj:
-                return _coerce(obj[token_id])
-            for container_key in ("balances", "tokens", "data", "results"):
-                if container_key in obj:
-                    found = _extract_from_obj(obj[container_key])
-                    if found is not None:
-                        return found
-        elif isinstance(obj, list):
-            for item in obj:
-                found = _extract_from_obj(item)
-                if found is not None:
-                    return found
-        return None
-
-    try:
-        data = json.loads(output)
-        found = _extract_from_obj(data)
-        if found is not None:
-            return found
-    except Exception:
-        pass
-
-    for line in output.splitlines():
-        if token_id not in line:
-            continue
-        m = re.search(r"(balance|amount|size|qty)\s*[:=]\s*([0-9]*\.?[0-9]+)", line, re.IGNORECASE)
-        if m:
-            return _coerce(m.group(2))
-        after = line.split(token_id, 1)[1]
-        m = re.search(r"([0-9]*\.?[0-9]+)", after)
-        if m:
-            return _coerce(m.group(1))
-    return None
 
 def get_token_balance(token_id):
     """查询钱包中指定 conditional token 余额（SDK直连）"""
