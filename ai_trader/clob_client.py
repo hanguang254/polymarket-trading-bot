@@ -51,6 +51,24 @@ def init_client():
     # 原理：首次签名+HTTPS请求很慢（~200ms），预热后复用连接只需 ~26ms
     _warmup()
 
+    # 启动连接保活守护线程：每30s发GET防止HTTP/2连接超时断开
+    _start_keepalive()
+
+
+def _start_keepalive():
+    """后台守护线程，定期 ping 保持 HTTP/2 连接活跃"""
+    def _keepalive_loop():
+        while True:
+            time.sleep(30)
+            try:
+                with _client_lock:
+                    _client.get_server_time()
+            except Exception:
+                pass
+    t = threading.Thread(target=_keepalive_loop, daemon=True)
+    t.start()
+    logger.info("🔗 HTTP/2 连接保活已启动 (30s间隔)")
+
 
 def get_client() -> ClobClient:
     """获取已初始化的客户端（调试/高级用途）"""
@@ -169,12 +187,7 @@ def _warmup():
 def place_order(token_id, side, price, size, order_type=OrderType.GTC):
     """GTC 限价单 — 用于入场
 
-    Args:
-        token_id: 代币ID
-        side: BUY 或 SELL
-        price: 限价 (0.01~0.99)
-        size: 份数
-        order_type: 订单类型，默认GTC
+    拆分 create_order（本地签名）+ post_order（网络），签名不加锁。
 
     Returns:
         dict: {success, matched, order_id, status, making, taking, raw}
@@ -183,23 +196,28 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
     token_id = str(token_id)
     cached = _token_cache.get(token_id, {})
     neg_risk = cached.get("neg_risk", None)
-    # neg_risk=None 时 SDK 内部查缓存（precache_token 已填充）；True 直接跳过查询
     try:
+        # 1. 签名（纯本地计算，不加锁）
+        order = _client.create_order(
+            OrderArgs(
+                token_id=token_id,
+                price=float(price),
+                size=float(size),
+                side=side,
+            ),
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
+        )
+        t_sign = time.time()
+        # 2. 发送（网络IO，加锁）
         with _client_lock:
-            resp = _client.create_and_post_order(
-                OrderArgs(
-                    token_id=token_id,
-                    price=float(price),
-                    size=float(size),
-                    side=side,
-                ),
-                options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
-            )
+            resp = _client.post_order(order)
         elapsed = (time.time() - t0) * 1000
+        sign_ms = (t_sign - t0) * 1000
+        net_ms = elapsed - sign_ms
         invalidate_book_cache(token_id)
         result = _parse_response(resp)
         result["elapsed_ms"] = round(elapsed, 1)
-        logger.info(f"📡 SDK下单 {side} {size}@{price} | {result['status']} | {elapsed:.0f}ms")
+        logger.info(f"📡 SDK下单 {side} {size}@{price} | {result['status']} | sign={sign_ms:.0f}ms net={net_ms:.0f}ms total={elapsed:.0f}ms")
         return result
     except Exception as e:
         elapsed = (time.time() - t0) * 1000
@@ -212,14 +230,7 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
 def place_fok_order(token_id, side, price, size):
     """FOK 即时成交单 — 用于止损/止盈平仓
 
-    FOK = Fill-or-Kill: 要么全部立即成交，要么整单取消。
-    不会留下挂单。
-
-    Args:
-        token_id: 代币ID
-        side: BUY 或 SELL
-        price: 最差可接受价格（滑点保护）
-        size: 份数
+    拆分 create_market_order（本地签名）+ post_order（网络），签名不加锁。
 
     Returns:
         dict: 同 place_order
@@ -229,28 +240,32 @@ def place_fok_order(token_id, side, price, size):
     cached = _token_cache.get(token_id, {})
     neg_risk = cached.get("neg_risk", None)
     try:
-        # MarketOrderArgs 的 amount 对 SELL 是份数，对 BUY 是美元金额
+        # 1. 签名（纯本地计算，不加锁）
         amount = float(price) * float(size) if side == BUY else float(size)
+        order = _client.create_market_order(
+            MarketOrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=side,
+                price=float(price),
+                fee_rate_bps=0,
+                nonce=0,
+                taker="0x0000000000000000000000000000000000000000",
+                order_type=OrderType.FOK,
+            ),
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
+        )
+        t_sign = time.time()
+        # 2. 发送（网络IO，加锁）
         with _client_lock:
-            order = _client.create_market_order(
-                MarketOrderArgs(
-                    token_id=token_id,
-                    amount=amount,
-                    side=side,
-                    price=float(price),
-                    fee_rate_bps=0,
-                    nonce=0,
-                    taker="0x0000000000000000000000000000000000000000",
-                    order_type=OrderType.FOK,
-                ),
-                options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
-            )
             resp = _client.post_order(order, OrderType.FOK)
         elapsed = (time.time() - t0) * 1000
+        sign_ms = (t_sign - t0) * 1000
+        net_ms = elapsed - sign_ms
         invalidate_book_cache(token_id)
         result = _parse_response(resp)
         result["elapsed_ms"] = round(elapsed, 1)
-        logger.info(f"⚡ FOK {side} {size}@{price} | {result['status']} | {elapsed:.0f}ms")
+        logger.info(f"⚡ FOK {side} {size}@{price} | {result['status']} | sign={sign_ms:.0f}ms net={net_ms:.0f}ms total={elapsed:.0f}ms")
         return result
     except Exception as e:
         elapsed = (time.time() - t0) * 1000
