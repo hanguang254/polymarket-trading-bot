@@ -246,11 +246,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
             discount = estimated_value - exec_price
             details["exec_discount"] = round(discount, 4)
 
-    # ── EV 计算：扣除双向 spread 成本 ──
-    # 裸 EV = p_win - price，但实际需要买入(ask) + 卖出(bid) 双向滑点
-    spread_cost = liquidity_info["spread"] if liquidity_info and liquidity_info.get("spread") else 0.02
+    # ── EV 计算：按提前平仓概率折算 spread 成本 ──
+    # 持有到期结算(0或1)不付spread，只有提前平仓才付bid-ask差价
+    EARLY_EXIT_RATIO = float(os.environ.get("EARLY_EXIT_RATIO", "0.3"))  # 提前平仓概率
+    raw_spread = liquidity_info["spread"] if liquidity_info and liquidity_info.get("spread") else 0.02
+    spread_cost = raw_spread * EARLY_EXIT_RATIO
     ev_gross = p_win - target_odds
-    ev = ev_gross - spread_cost  # 扣除做市商spread后的净EV
+    ev = ev_gross - spread_cost  # 按提前退出概率折算后的净EV
     details["expected_value"] = round(ev, 4)
     details["ev_gross"] = round(ev_gross, 4)
     details["spread_cost"] = round(spread_cost, 4)
