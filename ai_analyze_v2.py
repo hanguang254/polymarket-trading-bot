@@ -8,8 +8,11 @@ import sys
 import os
 import json
 import math
+import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
 
 
 from ai_trader.ai_model_v2 import analyze_market
@@ -376,18 +379,20 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
     """
     MIN_BET = int(os.environ.get("MIN_BET_SIZE", "5"))
     MAX_BET = int(os.environ.get("MAX_BET_SIZE", "10"))
+    P_CAP = float(os.environ.get("P_WIN_CAP", "0.92"))
 
     if ev <= 0:
+        logger.info(f"  📊 Kelly仓位: EV={ev:.3f}≤0 → 最小仓位{MIN_BET}份")
         return MIN_BET
 
     # 胜率估计优先级: p_win > p_hat > confidence映射
     if p_win and p_win > 0.5:
-        p = min(p_win, 0.85)
+        p = min(p_win, P_CAP)
     elif p_hat and p_hat > 0.5:
-        p = min(p_hat, 0.85)
+        p = min(p_hat, P_CAP)
     else:
         p = 0.5 + (confidence * 0.3)
-        p = max(0.5, min(0.80, p))
+        p = max(0.5, min(P_CAP, p))
 
     # 买入价格
     price = target_price if target_price and 0.01 < target_price < 0.99 else 0.50
@@ -396,6 +401,7 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
     kelly_full = (p - price) / (1 - price) if price < 1.0 else 0
 
     if kelly_full <= 0:
+        logger.info(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f}≤0 → 最小仓位{MIN_BET}份")
         return MIN_BET
 
     # 1/4 Kelly + 缩减因子
@@ -414,7 +420,7 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
     if exit_bid_depth and exit_bid_depth > 0:
         max_by_liquidity = max(MIN_BET, int(exit_bid_depth * 0.5))
         if size > max_by_liquidity:
-            print(f"  📊 P3流动性上限: bid_depth={exit_bid_depth:.1f} → max={max_by_liquidity}份")
+            logger.info(f"  📊 P3流动性上限: bid_depth={exit_bid_depth:.1f} → max={max_by_liquidity}份")
             size = min(size, max_by_liquidity)
 
     # ENV 上下限
@@ -422,7 +428,7 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
 
     red_label = f" red={kelly_reduction}" if kelly_reduction < 1.0 else ""
     liq_label = f" liq_cap={exit_bid_depth:.0f}" if exit_bid_depth else ""
-    print(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f} ${dollar_amount:.1f}{red_label}{liq_label} → {size}份")
+    logger.info(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f} ${dollar_amount:.1f}{red_label}{liq_label} → {size}份")
 
     return size
 

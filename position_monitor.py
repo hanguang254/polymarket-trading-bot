@@ -1300,8 +1300,10 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
         if info["matched"]:
             actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
             return True, actual_price
-        # 余额/授权不足 → 尝试刷新allowance重试一次
+
         err = info.get("error", "") or info.get("raw", "")
+
+        # 余额/授权不足 → 刷新allowance重试
         if "not enough balance" in err.lower():
             if adjusted and adjusted > 0:
                 print(f"    🔄 链上有余额但授权不足，刷新allowance后重试")
@@ -1310,7 +1312,26 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
                 if info2["matched"]:
                     actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else price
                     return True, actual_price
-            return False, "NO_BALANCE"
+                err2 = info2.get("error", "") or info2.get("raw", "")
+                if "not enough balance" in err2.lower():
+                    return False, "NO_BALANCE"
+                # allowance已修复但原价没人买 → 降价重试
+            else:
+                return False, "NO_BALANCE"
+
+        # 原价无人买 → $0.01地板价兜底（接受任何买方出价）
+        if price > 0.02:
+            print(f"    🔄 原价无买方，降至$0.01地板价重试")
+            info3 = clob_client.place_fok_order(token_id, SELL, 0.01, size)
+            if info3["matched"]:
+                actual_price = round(info3["taking"] / size, 4) if size > 0 and info3["taking"] > 0 else 0.01
+                print(f"    ⚡ 地板价成交: Taking=${info3['taking']:.4f} | 实际价=${actual_price:.4f} | {info3.get('elapsed_ms', 0):.0f}ms")
+                return True, actual_price
+            err3 = info3.get("error", "") or info3.get("raw", "")
+            if "not enough balance" in err3.lower():
+                return False, "NO_BALANCE"
+            print(f"    ❌ 地板价也无买方")
+
         return False, "FOK未成交"
     except Exception as e:
         print(f"    [SELL] exception: {str(e)[:200]}")
