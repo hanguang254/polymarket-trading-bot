@@ -559,7 +559,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         pending_entry = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "order_id": info.get("order_id"),
-            "status": info.get("status") or "LIVE",
+            "status": (info.get("status") or "LIVE").upper(),
             "slug": slug,
             "direction": direction,
             "token_id": token_id,

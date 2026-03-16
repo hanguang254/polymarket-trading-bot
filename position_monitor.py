@@ -997,7 +997,13 @@ def reconcile_pending_orders():
         return
 
     active_status = {"LIVE", "PENDING", "ACCEPTED"}
-    active = {k: v for k, v in orders.items() if v.get("status") in active_status}
+    # Normalize status to uppercase so "live"/"pending" are treated as active
+    active = {}
+    for k, v in orders.items():
+        status = (v.get("status") or "").upper()
+        if status in active_status:
+            v["status"] = status
+            active[k] = v
     if not active:
         return
 
