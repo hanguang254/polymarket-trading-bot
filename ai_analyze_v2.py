@@ -362,6 +362,9 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
 
     论文注释: "NEVER full Kelly on 5min markets!" → 1/4 Kelly
 
+    仓位跟余额挂钩：Kelly 比例 × 余额 / 价格 → 份数，
+    通过 MIN_BET_SIZE / MAX_BET_SIZE 环境变量控制上下限。
+
     Args:
         confidence: 置信度（用于 fallback）
         ev: 期望值
@@ -371,8 +374,11 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
         p_win: 严格概率估计（来自 base_rate + 贝叶斯融合，优先级最高）
         kelly_reduction: 缩减因子（base_rate < 0.55 → 0.5, 相关性 → 0.5）
     """
+    MIN_BET = int(os.environ.get("MIN_BET_SIZE", "5"))
+    MAX_BET = int(os.environ.get("MAX_BET_SIZE", "10"))
+
     if ev <= 0:
-        return 5
+        return MIN_BET
 
     # 胜率估计优先级: p_win > p_hat > confidence映射
     if p_win and p_win > 0.5:
@@ -390,46 +396,33 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
     kelly_full = (p - price) / (1 - price) if price < 1.0 else 0
 
     if kelly_full <= 0:
-        return 5
+        return MIN_BET
 
     # 1/4 Kelly + 缩减因子
     kelly_quarter = kelly_full * 0.25 * kelly_reduction
     kelly_quarter = max(0, min(0.25, kelly_quarter))
 
-    # 转换为份数
-    if kelly_quarter <= 0.05:
-        size = 5
-    elif kelly_quarter < 0.10:
-        size = 5
-    elif kelly_quarter < 0.15:
-        size = 7
-    elif kelly_quarter < 0.20:
-        size = 8
-    else:
-        size = 10
+    # Kelly 比例换算为份数：dollar_amount / price
+    dollar_amount = balance * kelly_quarter
+    size = int(dollar_amount / price) if price > 0 else MIN_BET
 
-    # 余额约束
-    if balance < 20:
-        max_by_balance = 10
-    elif balance < 50:
-        max_by_balance = max(5, int(balance * 0.20))
-    else:
-        max_by_balance = max(5, int(balance * 0.10))
+    # 余额约束：单笔不超过余额 20%（安全网）
+    max_by_balance = max(MIN_BET, int(balance * 0.20 / price))
     size = min(size, max_by_balance)
 
     # P3: 流动性上限 — 不超过退出流动性的50%
     if exit_bid_depth and exit_bid_depth > 0:
-        max_by_liquidity = max(5, int(exit_bid_depth * 0.5))
+        max_by_liquidity = max(MIN_BET, int(exit_bid_depth * 0.5))
         if size > max_by_liquidity:
             print(f"  📊 P3流动性上限: bid_depth={exit_bid_depth:.1f} → max={max_by_liquidity}份")
             size = min(size, max_by_liquidity)
 
-    # 硬约束: 5-10份
-    size = max(5, min(10, size))
+    # ENV 上下限
+    size = max(MIN_BET, min(MAX_BET, size))
 
     red_label = f" red={kelly_reduction}" if kelly_reduction < 1.0 else ""
     liq_label = f" liq_cap={exit_bid_depth:.0f}" if exit_bid_depth else ""
-    print(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f}{red_label}{liq_label} → {size}份")
+    print(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f} ${dollar_amount:.1f}{red_label}{liq_label} → {size}份")
 
     return size
 
