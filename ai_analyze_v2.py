@@ -563,6 +563,16 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         actual_price = price
         if not accepted:
             print(f"  ❌ 下单失败: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
+            # 回查链上余额：SDK异常不代表订单未执行，可能已部分/全部成交
+            try:
+                from position_monitor import get_token_balance
+                ghost_balance = get_token_balance(token_id)
+                if ghost_balance is not None and ghost_balance >= 1.0:
+                    print(f"  ⚡ 幽灵成交检测: 链上余额={ghost_balance:.2f}份，订单实际已成交")
+                    success = True
+                    actual_size = round(ghost_balance, 4)
+            except Exception as e_ghost:
+                print(f"  ⚠️ 幽灵成交检测失败: {e_ghost}")
 
     if pending:
         # returncode=0 但未 MATCHED（LIVE 挂单）
