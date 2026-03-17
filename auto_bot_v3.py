@@ -27,7 +27,7 @@ import subprocess
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from ai_trader.polymarket_api import normalize_orderbook
+from ai_trader.polymarket_api import normalize_orderbook, extract_coin_from_slug
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -382,23 +382,72 @@ class MarketTracker:
     def check_analysis_trigger(self):
         """预热观察 + 趋势确认下注（优化版）"""
         now = datetime.now(timezone.utc)
-        
+
+        # === PTB 并行获取：收集所有需要 PTB 的 slug，一次性并行获取 ===
+        ptb_needed = []
+        for slug, market in list(self.tracked.items()):
+            end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
+            start_dt = end_dt - timedelta(minutes=5)
+            elapsed = (now - start_dt).total_seconds()
+            if 2 <= elapsed < 40 and slug not in self.ptb_cache:
+                ptb_needed.append((slug, market))
+
+        if ptb_needed:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            logger.info(f"\n💰 并行获取 PTB: {', '.join(m['coin'] for _, m in ptb_needed)}")
+            with ThreadPoolExecutor(max_workers=len(ptb_needed)) as executor:
+                future_map = {
+                    executor.submit(get_ptb_multi_strategy, slug): (slug, market)
+                    for slug, market in ptb_needed
+                }
+                for future in as_completed(future_map):
+                    slug, market = future_map[future]
+                    try:
+                        ptb = future.result()
+                        if ptb:
+                            self.ptb_cache[slug] = ptb
+                            logger.info(f"   ✅ {market['coin']} PTB: ${ptb:,.2f}")
+                        else:
+                            logger.warning(f"   ⚠️ {market['coin']} PTB 获取失败")
+                    except Exception as e:
+                        logger.warning(f"   ⚠️ {market['coin']} PTB 异常: {e}")
+
+        # === 预热采样并行：收集所有需要采样的 slug，并行查 Binance 价格 ===
+        sample_needed = []  # (slug, market, symbol, elapsed)
+        for slug, market in list(self.tracked.items()):
+            end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
+            start_dt = end_dt - timedelta(minutes=5)
+            elapsed = (now - start_dt).total_seconds()
+            LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
+            if 20 <= elapsed <= LATE_BET_END and slug not in self.analyzed:
+                samples = self.warmup_data.get(slug, [])
+                sample_interval = 3 if elapsed >= 80 else 5
+                if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
+                    sample_needed.append((slug, market, f"{market['coin']}USDT", elapsed))
+
+        # 并行获取 Binance 价格
+        price_results = {}  # slug → price
+        if sample_needed:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from ai_trader.binance_api import get_current_price
+            with ThreadPoolExecutor(max_workers=len(sample_needed)) as executor:
+                future_map = {
+                    executor.submit(get_current_price, symbol): slug
+                    for slug, _, symbol, _ in sample_needed
+                }
+                for future in as_completed(future_map):
+                    s = future_map[future]
+                    try:
+                        price_results[s] = future.result()
+                    except Exception:
+                        price_results[s] = None
+
         for slug, market in list(self.tracked.items()):
             end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
             start_dt = end_dt - timedelta(minutes=5)
             elapsed = (now - start_dt).total_seconds()
             remaining = (end_dt - now).total_seconds()
-            
-            # === PTB 获取期：2s-40s（尽早获取） ===
-            if 2 <= elapsed < 40 and slug not in self.ptb_cache:
-                logger.info(f"\n💰 获取 PTB: {market['coin']} | {slug}")
-                ptb = get_ptb_multi_strategy(slug)
-                if ptb:
-                    self.ptb_cache[slug] = ptb
-                    logger.info(f"   PTB: ${ptb:,.2f}")
-                else:
-                    logger.warning(f"   ⚠️ PTB 获取失败")
-            
+
             # === 预热期：20s-160s（PTB获取后立即开始贝叶斯采样，延续到晚期窗口） ===
             LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
             if 20 <= elapsed <= LATE_BET_END and slug not in self.analyzed:
@@ -438,33 +487,26 @@ class MarketTracker:
                     except Exception:
                         pass
 
-                # 每5秒采集一次，有PTB时才做贝叶斯更新
-                ptb_now = self.ptb_cache.get(slug)
-                samples = self.warmup_data.get(slug, [])
-                # 采样间隔: 前60秒每5秒，临近下注窗口(80s+)每3秒
-                sample_interval = 3 if elapsed >= 80 else 5
-                if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
-                    try:
-                        from ai_trader.binance_api import get_current_price
-                        symbol = f"{market['coin']}USDT"
-                        price = get_current_price(symbol)
-                        if price and ptb_now:
-                            gap = round(price - ptb_now, 2)
-                            samples.append({"price": price, "gap": gap, "ts": time.time()})
-                            self.warmup_data[slug] = samples
+                # 使用并行获取的价格结果做贝叶斯更新
+                if slug in price_results:
+                    ptb_now = self.ptb_cache.get(slug)
+                    samples = self.warmup_data.get(slug, [])
+                    price = price_results[slug]
+                    if price and ptb_now:
+                        gap = round(price - ptb_now, 2)
+                        samples.append({"price": price, "gap": gap, "ts": time.time()})
+                        self.warmup_data[slug] = samples
 
-                            # 贝叶斯更新
-                            updater = self.bayesian_updaters.get(slug)
-                            if updater:
-                                updater.update(price, ptb_now)
-                                direction, p_hat, conf = updater.get_direction_and_confidence()
-                                logger.info(f"  📍 采样#{len(samples)}: price={price:.2f} gap={gap} | 贝叶斯: {direction} p̂={p_hat:.4f} conf={conf:.3f}")
-                            else:
-                                logger.info(f"  📍 采样#{len(samples)}: price={price:.2f} gap={gap}")
-                        elif price and not ptb_now:
-                            logger.info(f"  ⏳ 等待PTB... price={price:.2f}")
-                    except Exception as e:
-                        logger.warning(f"  ⚠️ 预热采样失败: {e}")
+                        # 贝叶斯更新
+                        updater = self.bayesian_updaters.get(slug)
+                        if updater:
+                            updater.update(price, ptb_now)
+                            direction, p_hat, conf = updater.get_direction_and_confidence()
+                            logger.info(f"  📍 采样#{len(samples)}: {market['coin']} price={price:.2f} gap={gap} | 贝叶斯: {direction} p̂={p_hat:.4f} conf={conf:.3f}")
+                        else:
+                            logger.info(f"  📍 采样#{len(samples)}: {market['coin']} price={price:.2f} gap={gap}")
+                    elif price and not ptb_now:
+                        logger.info(f"  ⏳ {market['coin']} 等待PTB... price={price:.2f}")
             
             # === 早期下注窗口：90-95s（API 在前60-80s返回425 Too Early） ===
             EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "90"))
@@ -799,7 +841,7 @@ class MarketTracker:
             print(f"  {'📈' if pnl > 0 else '📉'} 盈亏: ${pnl:+.2f}")
             
             # 发送Telegram通知
-            coin = "BTC" if "btc" in slug.lower() else "ETH"
+            coin = extract_coin_from_slug(slug)
             send_close_notification(coin, position.direction, position.entry_price, exit_price, position.size, pnl)
             
             # 记录到日志

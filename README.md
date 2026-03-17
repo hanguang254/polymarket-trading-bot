@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v8.3
+# Polymarket Trading Bot v8.4
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -255,6 +255,7 @@ See `.env.example` for all configurable parameters:
 | `EARLY_MIN_CONFIDENCE` | No | Min confidence for early window (default: 0.60) |
 | `LATE_BET_START` | No | Late bet window start (default: 100) |
 | `LATE_BET_END` | No | Late bet window end (default: 160) |
+| `TRADING_COINS` | No | Comma-separated coin list (default: `BTC,ETH`). Add `BNB` etc. to trade more markets |
 | `SLIPPAGE` | No | Empty book fallback slippage for last-trade-price ± (default: 0.02) |
 | `P0_BASE_PROFIT` | No | P0 take-profit base threshold (default: 0.20) |
 | `PROFIT_THRESHOLD` | No | General profit threshold (default: 0.15) |
@@ -310,6 +311,7 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 
 ## Version History
 
+- **v8.4**: Configurable coins + parallel PTB/warmup — `TRADING_COINS` env var (default `BTC,ETH`) replaces hardcoded coin list; add `BNB` or any new coin without code changes. PTB fetched in parallel via `ThreadPoolExecutor` (N coins in ~1x time instead of Nx). Warmup Binance price sampling parallelized across all coins. `extract_coin_from_slug()` replaces all hardcoded `"BTC" if "btc" in slug else "ETH"` patterns (supports arbitrary coins).
 - **v8.3**: Balance unit fix + ghost fill detection fix — `get_balance()` and `get_token_balance()` now divide API response by 1e6 (Polymarket returns atomic USDC/token units with 6 decimals). Previously raw balance ~57M fed into Kelly produced `$1.7M dollar_amount` → always clamped to MAX_BET. Kelly sizing now works correctly with real dollar balance. Stop-loss ghost fill detection no longer bypassed on "not enough balance / allowance" errors — all FOK ERROR status now triggers on-chain balance recheck (~100ms, saves 3-4s of useless retries when tokens already sold). Added logging for allowance-refresh retry failures. Added post-reduction-loop final balance recheck as ghost fill safety net.
 - **v8.2**: Kelly P_WIN_CAP unification + sell_and_confirm floor price fallback + Kelly logger — Kelly `calculate_kelly_size` now reads `P_WIN_CAP` env (default 0.92) instead of hardcoded 0.85 cap; fixes Kelly always returning MIN_BET when entry price ≥ 0.85. All Kelly `print()` calls converted to `logger.info()` so sizing calculations are visible in server logs (including early-return paths for EV≤0 and kelly≤0). `sell_and_confirm` (used by P0 take-profit) now retries at $0.01 floor price when original price has no buyers — prevents profitable positions from being abandoned as "FOK未成交". Allowance-refresh retry in `sell_and_confirm` now distinguishes "no balance" vs "no buyer" instead of always returning NO_BALANCE.
 - **v8.1**: Ghost fill detection + 425 retry + dynamic Kelly sizing + auto_redeem REST migration — Kelly sizing now scales with balance: `balance × kelly_quarter / price` → shares, clamped by `MIN_BET_SIZE` / `MAX_BET_SIZE` env vars (default 5/10, backward compatible). Raise `MAX_BET_SIZE` to scale up. — Stop-loss FOK timeout: re-check on-chain balance to detect phantom fills (order executed but response lost). Floor-price retry now handles "not enough balance" errors (refresh allowance + retry, or return NO_BALANCE). `place_order` auto-retries on HTTP 425 "Too Early" (0.5s/1.0s/1.5s backoff, up to 3 attempts) — no longer loses bets when CLOB service is momentarily not ready. auto_redeem_v2 migrated from Polymarket CLI subprocess to data-api REST (`/positions` + `/closed-positions`), eliminating `[WinError 2]`; skips positions < 0.1 USDC to save gas.
