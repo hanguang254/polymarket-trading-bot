@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 import requests
-from ai_trader.polymarket_api import normalize_orderbook, extract_coin_from_slug
+from ai_trader.polymarket_api import normalize_orderbook
 from ai_trader import clob_client
 from py_clob_client.order_builder.constants import BUY, SELL
 
@@ -1138,7 +1138,7 @@ def reconcile_pending_orders():
 
             size = filled_size if filled_size else order.get("requested_size") or order.get("size") or 0
 
-            coin = extract_coin_from_slug(slug)
+            coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
             confidence = order.get("confidence") or 0
             ev = order.get("ev") or 0
 
@@ -1236,7 +1236,7 @@ def reconcile_pending_orders():
                     "resolved_at": now.isoformat(),
                 })
                 try:
-                    coin = extract_coin_from_slug(slug)
+                    coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
                     msg = (
                         f"🛡️ <b>挂单价格保护取消</b>\n\n"
                         f"币种: {coin}\n"
@@ -1262,7 +1262,7 @@ def reconcile_pending_orders():
             })
             # 过期取消通知
             try:
-                coin = extract_coin_from_slug(slug)
+                coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
                 msg = (
                     f"⌛ <b>挂单过期取消</b>\n\n"
                     f"币种: {coin}\n"
@@ -1440,7 +1440,7 @@ def monitor():
                 slug = pos.get("slug", "unknown")
                 entry_time = pos.get("entry_time", "")
                 attempt_key = (slug, entry_time)
-                coin = extract_coin_from_slug(slug)
+                coin = "BTC" if "btc" in slug else "ETH"
                 direction = pos.get("direction", "UP")
 
                 # 预缓存 neg_risk/fee_rate，避免平仓时额外HTTP查询

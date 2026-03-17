@@ -2,7 +2,13 @@
 Polymarket 数据采集模块 - 使用浏览器方案
 """
 import json
-import os
+import requests
+from datetime import datetime, timezone
+
+"""
+Polymarket 数据采集模块
+"""
+import json
 import re
 import requests
 from datetime import datetime, timezone
@@ -17,13 +23,6 @@ def normalize_orderbook(bids, asks):
     sorted_bids = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
     sorted_asks = sorted(asks, key=lambda x: float(x["price"]))
     return sorted_bids, sorted_asks
-
-
-def extract_coin_from_slug(slug):
-    """从 slug 提取币种名称，如 'btc-updown-5m-xxx' → 'BTC'"""
-    if not slug:
-        return "UNKNOWN"
-    return slug.split('-')[0].upper()
 
 
 def get_price_to_beat_browser(slug):
@@ -47,16 +46,12 @@ def get_current_markets():
     """获取当前进行中的 5分钟市场"""
     now_ts = int(datetime.now(timezone.utc).timestamp())
     base_5m = (now_ts // 300) * 300
-
-    # 从 ENV 读取币种列表，默认 BTC,ETH
-    coins_str = os.environ.get("TRADING_COINS", "BTC,ETH")
-    coins = [c.strip().upper() for c in coins_str.split(",") if c.strip()]
-
+    
     markets = []
-    for coin in coins:
-        prefix = f"{coin.lower()}-updown-5m"
+    for prefix in ['btc-updown-5m', 'eth-updown-5m']:
         slug = f"{prefix}-{base_5m}"
-
+        coin = 'BTC' if 'btc' in prefix else 'ETH'
+        
         try:
             resp = requests.get(
                 f"https://gamma-api.polymarket.com/events?slug={slug}",
@@ -67,12 +62,12 @@ def get_current_markets():
                 if events and not events[0].get('closed'):
                     event = events[0]
                     market = event['markets'][0]
-
+                    
                     # 获取 Price to Beat
                     ptb = get_price_to_beat_browser(slug)
-
+                    
                     prices = json.loads(market['outcomePrices'])
-
+                    
                     markets.append({
                         'slug': slug,
                         'coin': coin,
