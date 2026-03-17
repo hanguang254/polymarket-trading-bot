@@ -23,6 +23,7 @@ import sys
 import time
 import json
 import os
+import subprocess
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -115,17 +116,38 @@ def circuit_breaker_record(success):
             _api_failures = 0
 
 def get_ptb_multi_strategy(slug):
-    """多层获取 PTB — 智能降级，网络不通时跳过 Playwright"""
+    """多层获取 PTB — 智能降级，超时保护防卡死"""
     global _playwright_failures
 
-    # 1. Playwright（最准确，但网络不通时跳过避免浪费12秒）
+    # 1. Playwright（subprocess隔离，超时可杀进程，防止卡死主流程）
     if _playwright_failures < 3:
         try:
-            from ai_trader.playwright_ptb import get_price_to_beat_playwright
-            ptb = get_price_to_beat_playwright(slug, timeout_ms=6000)  # 缩短到6秒
-            if ptb:
-                _playwright_failures = 0
-                return ptb
+            ptb_script = os.path.join(os.path.dirname(__file__), "ai_trader", "playwright_ptb.py")
+            t0 = time.time()
+            result = subprocess.run(
+                [sys.executable, ptb_script, slug],
+                capture_output=True, text=True, timeout=15
+            )
+            elapsed = time.time() - t0
+            if result.returncode == 0 and result.stdout:
+                # 从 stdout 解析 PTB 值（格式：PTB=75282.89 或 ✅ PTB=75282.89）
+                import re
+                m = re.search(r'PTB=([\d.]+)', result.stdout)
+                if m:
+                    ptb = float(m.group(1))
+                    if 100 < ptb < 10_000_000:
+                        _playwright_failures = 0
+                        print(f"✅ PTB={ptb:.2f} (Playwright, {elapsed:.1f}s)")
+                        return ptb
+            # 进程返回但没拿到PTB
+            _playwright_failures += 1
+            if _playwright_failures >= 3:
+                logger.warning(f"   Playwright 连续{_playwright_failures}次失败，后续跳过")
+            else:
+                logger.warning(f"   Playwright PTB 无结果({_playwright_failures}/3) | {elapsed:.1f}s")
+        except subprocess.TimeoutExpired:
+            _playwright_failures += 1
+            logger.warning(f"   Playwright PTB 超时(15s)({_playwright_failures}/3)")
         except Exception as e:
             _playwright_failures += 1
             err_msg = str(e)[:80]
