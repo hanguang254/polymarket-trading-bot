@@ -56,21 +56,19 @@ class _TeeWriter:
 sys.stdout = _TeeWriter(sys.stdout)
 sys.stderr = _TeeWriter(sys.stderr)
 
+# .env 必须在读取任何环境变量之前加载
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
-PROFIT_THRESHOLD = 0.15  # 15% 止盈
+PROFIT_THRESHOLD = float(os.environ.get("PROFIT_THRESHOLD", "0.15"))
 SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))  # 空簿回退滑点（env可配置）
 
 # P0 双曲贴现止盈参数（可通过 .env 覆盖）
-P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", "0.15"))      # 基础止盈阈值
-P0_HYPERBOLIC_K = float(os.environ.get("P0_HYPERBOLIC_K", "0.15"))    # 双曲贴现系数
+P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", str(PROFIT_THRESHOLD)))
+P0_HYPERBOLIC_K = float(os.environ.get("P0_HYPERBOLIC_K", "0.15"))
 
 # Telegram 通知配置
-# Normalize thresholds to keep P0 base consistent with PROFIT_THRESHOLD.
-PROFIT_THRESHOLD = float(os.environ.get("PROFIT_THRESHOLD", str(PROFIT_THRESHOLD)))
-P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", str(PROFIT_THRESHOLD)))
-
-from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -1551,12 +1549,12 @@ def monitor():
                         # 首次达标：检查是否满足跳过条件
                         atr_val_tp = pos.get("atr_val") or get_atr_from_binance(coin)
                         _, _, diff_atr_tp = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val_tp, entry_price)
-                        if direction_correct and diff_atr_tp and diff_atr_tp >= 2.0 and remaining > 60:
+                        if direction_correct and diff_atr_tp and diff_atr_tp >= 3.0 and remaining > 90:
                             tp_state[attempt_key] = "FIRST_TOUCH"
                             atr_str_tp = f"{diff_atr_tp:.1f}ATR" if diff_atr_tp else ""
                             print(
                                 f"  [P0] 首次达标跳过: {profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% "
-                                f"| 方向✅ {atr_str_tp}≥2.0 | 等$1结算 | 剩余{remaining:.0f}s"
+                                f"| 方向✅ {atr_str_tp}≥3.0 | 等$1结算 | 剩余{remaining:.0f}s"
                             )
                             should_skip_tp = True
                     elif cur_tp_state == "FIRST_TOUCH":
@@ -1916,7 +1914,7 @@ def monitor():
                                         self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
                                         close_position(pos, current_price or 0)
                                         close_attempts.pop(attempt_key, None)
-                                        sold = True
+                                        continue
                                     elif ok:
                                         if actual_price >= min_price:
                                             sold = True
@@ -1936,7 +1934,7 @@ def monitor():
                                     self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
                                     close_position(pos, current_price or 0)
                                     close_attempts.pop(attempt_key, None)
-                                    sold = True
+                                    continue
                                 elif ok:
                                     sold = True
                                     sold_price = actual_price
@@ -1967,7 +1965,7 @@ def monitor():
                             self_notify(pos, current_price or 0, coin, direction, size, "阶段4(余额已清)")
                             close_position(pos, current_price or 0)
                             close_attempts.pop(attempt_key, None)
-                            sold = True
+                            continue
                         elif ok:
                             sold = True
                             sold_price = actual_price
