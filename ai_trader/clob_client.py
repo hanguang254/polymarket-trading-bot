@@ -241,7 +241,7 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
 
 
 def place_fok_order(token_id, side, price, size):
-    """FOK 即时成交单 — 用于止损/止盈平仓
+    """FOK 即时成交单 — 用于入场/止损/止盈
 
     拆分 create_market_order（本地签名）+ post_order（网络），签名不加锁。
 
@@ -269,9 +269,21 @@ def place_fok_order(token_id, side, price, size):
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
         )
         t_sign = time.time()
-        # 2. 发送（网络IO，加锁）
-        with _client_lock:
-            resp = _client.post_order(order, OrderType.FOK)
+        # 2. 发送（网络IO，加锁）— 425 Too Early 自动重试
+        resp = None
+        for attempt in range(3):
+            try:
+                with _client_lock:
+                    resp = _client.post_order(order, OrderType.FOK)
+                break
+            except Exception as ex:
+                if "425" in str(ex) or "not ready" in str(ex).lower():
+                    logger.warning(f"⏳ FOK 425 Too Early，{0.5*(attempt+1):.1f}s后重试 ({attempt+1}/3)")
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        if resp is None:
+            raise Exception("425 Too Early: FOK重试3次仍未就绪")
         elapsed = (time.time() - t0) * 1000
         sign_ms = (t_sign - t0) * 1000
         net_ms = elapsed - sign_ms

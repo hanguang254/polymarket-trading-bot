@@ -542,15 +542,13 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         exit_bid_depth=bid_depth
     )
     
-    print(f"  💸 SDK下单: BUY {size}@{price} token={token_id[:16]}...")
-    info = clob_client.place_order(token_id, BUY, price, size)
+    print(f"  💸 SDK下单: FOK BUY {size}@{price} token={token_id[:16]}...")
+    info = clob_client.place_fok_order(token_id, BUY, price, size)
     output = info.get("raw", "")
 
-    # 仅 MATCHED 视为成功（LIVE=挂单未成交，进入 pending）
-    accepted = info.get("success", False)
-    matched = info.get("matched", False)
-    success = accepted and matched
-    pending = accepted and not matched
+    # FOK: matched=True 即全部成交，否则全部未成交（不会产生挂单）
+    success = info.get("matched", False)
+    pending = False
 
     # 计算实际成交价和实际份数
     actual_size = size
@@ -558,12 +556,12 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         actual_price = round(info["making"] / size, 4)
         if info.get("taking", 0) > 0:
             actual_size = round(info["taking"], 4)
-        print(f"  📊 成交确认: Status={info['status']} | Making=${info['making']:.4f} | Taking={actual_size} | 实际价=${actual_price:.4f} (限价=${price}) | {info.get('elapsed_ms', 0):.0f}ms")
+        print(f"  📊 FOK成交: Making=${info['making']:.4f} | Taking={actual_size} | 实际价=${actual_price:.4f} (限价=${price}) | {info.get('elapsed_ms', 0):.0f}ms")
     else:
         actual_price = price
-        if not accepted:
-            print(f"  ❌ 下单失败: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
-            # 回查链上余额：SDK异常不代表订单未执行，可能已部分/全部成交
+        if not success:
+            print(f"  ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
+            # 回查链上余额：网络超时不代表订单未执行（幽灵成交）
             try:
                 from position_monitor import get_token_balance
                 ghost_balance = get_token_balance(token_id)
@@ -573,25 +571,6 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                     actual_size = round(ghost_balance, 4)
             except Exception as e_ghost:
                 print(f"  ⚠️ 幽灵成交检测失败: {e_ghost}")
-
-    if pending:
-        # returncode=0 但未 MATCHED（LIVE 挂单）
-        print(f"  ⏳ 挂单未成交: Status={info.get('status')} | 已记录待成交 | {info.get('elapsed_ms', 0):.0f}ms")
-
-        pending_entry = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "order_id": info.get("order_id"),
-            "status": (info.get("status") or "LIVE").upper(),
-            "slug": slug,
-            "direction": direction,
-            "token_id": token_id,
-            "limit_price": price,
-            "requested_size": size,
-            "confidence": confidence,
-            "ev": ev,
-            "entry_details": entry_details,
-        }
-        _append_pending_order(pending_entry)
 
     # 记录下注结果（使用实际成交价）
     log_entry = {
@@ -605,8 +584,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         "requested_size": size,
         "amount": actual_price * actual_size,
         "success": success,
-        "pending": pending,
-        "accepted": accepted,
+        "pending": False,
         "order_id": info.get("order_id"),
         "status": info.get("status"),
         "output": output[:200],  # 截断输出
