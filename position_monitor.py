@@ -343,18 +343,10 @@ def market_sell_immediate(token_id, size, price=None):
     if adjusted is not None:
         size = adjusted
 
-    # 确定卖价：止损优先成交，用传入价格减滑点
-    sell_price = None
-    if price and price > 0.01:
-        sell_price = round(max(price - SLIPPAGE, 0.01), 2)
-    if not sell_price:
-        ltp = get_last_trade_price(token_id)
-        if ltp:
-            sell_price = round(max(ltp - SLIPPAGE, 0.01), 2)
-    if not sell_price:
-        sell_price = 0.01
+    # 止损直接地板价：CLOB按最高bid撮合，$0.01=市价卖出，省掉试探延迟
+    sell_price = 0.01
 
-    print(f"    ⚡ FOK止损: 卖价=${sell_price:.2f}")
+    print(f"    ⚡ FOK止损: 地板价${sell_price:.2f}(按最高bid撮合)")
 
     try:
         # FOK: 全部即时成交或取消，不留挂单
@@ -411,28 +403,6 @@ def market_sell_immediate(token_id, size, price=None):
                 return True, sell_price
             print(f"    ⚠️ 减量重试均失败，余额可能为零")
             return False, "NO_BALANCE"
-
-        # 降到$0.01地板价重试
-        if sell_price > 0.02:
-            print(f"    🔄 降价重试: $0.01地板价")
-            info2 = clob_client.place_fok_order(token_id, SELL, 0.01, size)
-            if info2["matched"]:
-                actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
-                print(f"    ⚡ 地板价成交: Taking=${info2['taking']:.4f} | 实际价=${actual_price:.4f} | {info2.get('elapsed_ms', 0):.0f}ms")
-                return True, actual_price
-            # 地板价也报余额/授权不足 → 刷allowance重试
-            err2 = info2.get("error", "") or info2.get("raw", "")
-            if "not enough balance" in err2.lower():
-                if adjusted and adjusted > 0:
-                    print(f"    🔄 链上有余额但授权不足，刷新allowance后重试")
-                    clob_client.update_token_allowance(token_id)
-                    info_a = clob_client.place_fok_order(token_id, SELL, 0.01, size)
-                    if info_a["matched"]:
-                        ap = round(info_a["taking"] / size, 4) if size > 0 and info_a["taking"] > 0 else 0.01
-                        print(f"    ⚡ allowance刷新后成交: 实际价=${ap:.4f} | {info_a.get('elapsed_ms', 0):.0f}ms")
-                        return True, ap
-                return False, "NO_BALANCE"
-            print(f"    ❌ 地板价也无买方")
 
         return False, None
     except Exception as e:
