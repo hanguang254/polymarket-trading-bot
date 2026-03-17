@@ -434,7 +434,7 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
 
 
 def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
-                 p_hat=None, entry_details=None, kelly_reduction=1.0):
+                 p_hat=None, entry_details=None, kelly_reduction=1.0, pre_balance=None):
     """执行下注（通过 Polymarket CLI）
 
     Args:
@@ -447,14 +447,20 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         p_hat: 贝叶斯后验概率
         entry_details: 完整分析详情（用于持仓记录丰富字段）
         kelly_reduction: Kelly 缩减因子（base_rate/相关性）
+        pre_balance: 预取的余额（调用方提前获取，省~250ms）
     """
-    # ── 并行获取: 余额 + 订单簿(best_ask + bid_depth) ──
-    # 三个独立HTTP请求并行执行，省~0.5s
-    fut_balance = _bet_executor.submit(clob_client.get_balance)
-    fut_book = _bet_executor.submit(clob_client.get_orderbook, token_id, 0)  # max_age=0 强制刷新
-
-    balance = fut_balance.result(timeout=5)
-    book = fut_book.result(timeout=5)
+    # ── 余额 + 订单簿 ──
+    # 余额：优先用调用方预取的结果，省一次HTTP
+    if pre_balance is not None:
+        balance = pre_balance
+        # 只需获取 orderbook（复用1s内缓存，分析阶段刚拉过）
+        book = clob_client.get_orderbook(token_id, max_age=1)
+    else:
+        # fallback：并行获取余额+订单簿
+        fut_balance = _bet_executor.submit(clob_client.get_balance)
+        fut_book = _bet_executor.submit(clob_client.get_orderbook, token_id, 1)  # 1s内复用缓存
+        balance = fut_balance.result(timeout=5)
+        book = fut_book.result(timeout=5)
 
     # 余额不足时直接跳过，不记录为失败
     MIN_BALANCE = float(os.environ.get("MIN_BALANCE", "5.0"))
@@ -626,14 +632,15 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             # P1: 反向token_id（供对冲使用）
             if "opposite_token_id" in entry_details:
                 position["opposite_token_id"] = entry_details["opposite_token_id"]
-        # 买入后立即查链上真实余额 + 刷新allowance（确保后续卖出不因授权不足失败）
+        # 买入后查链上真实余额（同步，写入position供monitor用）
         try:
             real_balance = clob_client.get_token_balance(token_id)
             if real_balance and real_balance > 0:
                 position["token_balance"] = real_balance
-            clob_client.update_token_allowance(token_id)
         except Exception:
             pass
+        # allowance刷新异步执行（不阻塞主流程，省~270ms）
+        _bet_executor.submit(clob_client.update_token_allowance, token_id)
 
         with open("logs/positions.jsonl", "a") as f:
             f.write(json.dumps(position) + "\n")

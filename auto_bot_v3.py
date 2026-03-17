@@ -634,6 +634,10 @@ class MarketTracker:
             # 并行预缓存 neg_risk/fee_rate/tick_size（预热已缓存则跳过）
             clob_client.precache_tokens([up_token, down_token])
 
+            # 预取余额（与CLOB查询并行，分析完直接用，省~250ms）
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _pre_balance_fut = _TPE(max_workers=1).submit(clob_client.get_balance)
+
             # CLOB 订单簿数据：mid 供参考，best_ask 在 analyze_and_decide 中用于执行价校准
             # Gamma 赔率用于方向/概率判断，CLOB best_ask 用于 EV/折价的执行价校准(C1)
             clob = get_realtime_odds(up_token, down_token)
@@ -718,6 +722,13 @@ class MarketTracker:
         # P1: 记录反向token_id，供对冲使用
         details["opposite_token_id"] = down_token if direction == "UP" else up_token
 
+        # 取回预取的余额（分析期间已并行获取，此时应已完成）
+        _balance = None
+        try:
+            _balance = _pre_balance_fut.result(timeout=3)
+        except Exception:
+            pass  # fallback: execute_bet内部自行获取
+
         success, entry_price, bet_size, output = execute_bet(
             slug, direction, token_id,
             confidence=confidence,
@@ -725,6 +736,7 @@ class MarketTracker:
             p_hat=p_hat,
             entry_details=details,
             kelly_reduction=kelly_reduction,
+            pre_balance=_balance,
         )
         
         if success:
