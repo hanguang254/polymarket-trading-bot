@@ -368,11 +368,11 @@ def market_sell_immediate(token_id, size, price=None):
         print(f"    ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
         err = info.get("error", "") or info.get("raw", "")
 
-        # 网络超时/异常 → 回查链上余额，检测幽灵成交（订单实际已成交但响应丢失）
-        if "not enough balance" not in err.lower() and info.get("status") == "ERROR":
+        # 所有ERROR状态 → 回查链上余额，检测幽灵成交（订单实际已成交但响应丢失/400）
+        if info.get("status") == "ERROR":
             recheck = _check_and_adjust_size(token_id, size)
             if recheck == 0:
-                print(f"    ⚡ 网络超时但链上余额已清零，订单实际已成交（幽灵成交）")
+                print(f"    ⚡ 链上余额已清零，订单实际已成交（幽灵成交）")
                 return True, sell_price
 
         if "not enough balance" in err.lower():
@@ -385,6 +385,12 @@ def market_sell_immediate(token_id, size, price=None):
                     ap = round(info_a["taking"] / size, 4) if size > 0 and info_a["taking"] > 0 else sell_price
                     print(f"    ⚡ allowance刷新后成交: 实际价=${ap:.4f} | {info_a.get('elapsed_ms', 0):.0f}ms")
                     return True, ap
+                print(f"    ❌ allowance刷新后仍未成交: Status={info_a.get('status')} | {info_a.get('elapsed_ms', 0):.0f}ms")
+                # allowance刷新后再查一次余额，检测幽灵成交
+                recheck_a = _check_and_adjust_size(token_id, size)
+                if recheck_a == 0:
+                    print(f"    ⚡ 链上余额已清零，订单实际已成交（幽灵成交）")
+                    return True, sell_price
             # allowance刷新无效或链上余额不确定 → 减量重试
             for retry_size in [round(size * 0.98, 2), round(size * 0.95, 2), round(size * 0.90, 2)]:
                 if retry_size < 1:
@@ -398,6 +404,11 @@ def market_sell_immediate(token_id, size, price=None):
                 err_r = info_r.get("error", "") or info_r.get("raw", "")
                 if "not enough balance" not in err_r.lower():
                     break
+            # 减量全部失败 → 最终余额回查，兜底检测幽灵成交
+            final_check = _check_and_adjust_size(token_id, size)
+            if final_check == 0:
+                print(f"    ⚡ 减量重试后链上余额已清零（幽灵成交）")
+                return True, sell_price
             print(f"    ⚠️ 减量重试均失败，余额可能为零")
             return False, "NO_BALANCE"
 

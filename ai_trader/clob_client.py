@@ -310,7 +310,7 @@ def cancel_all(token_id=None):
 # ── 余额 ──
 
 def get_balance():
-    """获取 USDC 余额（collateral）"""
+    """获取 USDC 余额（collateral），返回美元单位"""
     try:
         with _client_lock:
             resp = _client.get_balance_allowance(
@@ -320,17 +320,17 @@ def get_balance():
                     signature_type=0,
                 )
             )
-        # resp 可能是 dict 或对象
+        # API 返回原子单位（USDC 6位小数），需除以 1e6 转美元
         if isinstance(resp, dict):
-            return float(resp.get("balance", 0))
-        return float(getattr(resp, "balance", 0))
+            return float(resp.get("balance", 0)) / 1e6
+        return float(getattr(resp, "balance", 0)) / 1e6
     except Exception as e:
         logger.warning(f"获取余额失败: {e}")
         return 0
 
 
 def get_token_balance(token_id):
-    """获取 conditional token 余额"""
+    """获取 conditional token 余额（份数单位）"""
     try:
         with _client_lock:
             resp = _client.get_balance_allowance(
@@ -340,9 +340,10 @@ def get_token_balance(token_id):
                     signature_type=0,
                 )
             )
+        # API 返回原子单位（6位小数），需除以 1e6 转份数
         if isinstance(resp, dict):
-            return float(resp.get("balance", 0))
-        return float(getattr(resp, "balance", 0))
+            return float(resp.get("balance", 0)) / 1e6
+        return float(getattr(resp, "balance", 0)) / 1e6
     except Exception as e:
         logger.warning(f"获取token余额失败: {e}")
         return None
