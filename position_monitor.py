@@ -1628,11 +1628,11 @@ def monitor():
                             else:
                                 print(f"  [P0] Triggered but no executable price | remaining {remaining:.0f}s")
                 # ═══ Token 暴跌熔断：市场共识压倒方向信号 ═══
-                TOKEN_CRASH_THRESHOLD = 0.50  # 跌幅超过 50%
-                TOKEN_CRASH_ABS = 0.10        # 且绝对价格低于 $0.10
+                TOKEN_CRASH_THRESHOLD = 0.60  # 跌幅超过 40%（保留60%）
+                TOKEN_CRASH_ABS_RATIO = 0.50  # 且绝对价格低于入场价的50%
                 if (current_price is not None and entry_price > 0
                         and current_price < entry_price * TOKEN_CRASH_THRESHOLD
-                        and current_price < TOKEN_CRASH_ABS):
+                        and current_price < entry_price * TOKEN_CRASH_ABS_RATIO):
                     if direction_correct:
                         print(f"  🚨 Token熔断: ${entry_price:.2f}→${current_price:.2f}"
                               f" ({profit_rate*100:+.1f}%)，覆盖方向信号 | 剩余{remaining:.0f}s")
