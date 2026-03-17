@@ -1657,6 +1657,17 @@ def monitor():
                                 print(f"  [P0] Triggered but book too thin for size | remaining {remaining:.0f}s")
                             else:
                                 print(f"  [P0] Triggered but no executable price | remaining {remaining:.0f}s")
+                # ═══ Token 暴跌熔断：市场共识压倒方向信号 ═══
+                TOKEN_CRASH_THRESHOLD = 0.50  # 跌幅超过 50%
+                TOKEN_CRASH_ABS = 0.10        # 且绝对价格低于 $0.10
+                if (current_price is not None and entry_price > 0
+                        and current_price < entry_price * TOKEN_CRASH_THRESHOLD
+                        and current_price < TOKEN_CRASH_ABS):
+                    if direction_correct:
+                        print(f"  🚨 Token熔断: ${entry_price:.2f}→${current_price:.2f}"
+                              f" ({profit_rate*100:+.1f}%)，覆盖方向信号 | 剩余{remaining:.0f}s")
+                        direction_correct = False
+
                 if direction_correct and remaining > 0:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                     _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
