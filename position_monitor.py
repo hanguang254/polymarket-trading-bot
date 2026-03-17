@@ -434,6 +434,12 @@ def sell_position(token_id, size, price, max_retries=3):
         err = info.get("error", "") or info.get("raw", "")
         if "not enough balance" in err.lower():
             return False, "NO_BALANCE", None
+        # FOK超时/异常 → 查链上余额检测幽灵成交
+        if info.get("status") == "ERROR":
+            recheck = _check_and_adjust_size(token_id, size)
+            if recheck == 0:
+                print(f"    ⚡ 链上余额已清零，订单实际已成交（幽灵成交）")
+                return True, "GHOST_FILL", price
         print(f"    ⏳ FOK未成交 | 尝试{attempt+1}/{max_retries} | {info.get('elapsed_ms', 0):.0f}ms")
         if attempt < max_retries - 1:
             price = round(max(price - 0.01, 0.01), 2)  # 降价重试
@@ -1612,6 +1618,7 @@ def monitor():
                                     continue
                                 elif actual == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                    self_notify(pos, current_price or 0, coin, direction, size, "P0止盈(余额已清)")
                                     close_position(pos, current_price or 0)
                                     close_attempts.pop(attempt_key, None)
                                     stop_loss_attempts.pop(attempt_key, None)
@@ -1637,6 +1644,28 @@ def monitor():
                         print(f"  🚨 Token熔断: ${entry_price:.2f}→${current_price:.2f}"
                               f" ({profit_rate*100:+.1f}%)，覆盖方向信号 | 剩余{remaining:.0f}s")
                         direction_correct = False
+
+                # ═══ 时间门槛亏损熔断：后半段 + 大亏 + 方向错 → 立刻止损 ═══
+                # 前期(>120s)流动性薄，价格不可靠；后期价格反映真实市场共识
+                LATE_LOSS_THRESHOLD = float(os.environ.get("LATE_LOSS_THRESHOLD", "0.30"))
+                if (remaining <= 120 and not direction_correct
+                        and current_price is not None and entry_price > 0
+                        and profit_rate < -LATE_LOSS_THRESHOLD):
+                    print(f"  🚨 亏损熔断: {profit_rate*100:+.1f}%超过-{LATE_LOSS_THRESHOLD*100:.0f}% + 方向❌ + ≤120s → 强制止损 | 剩余{remaining:.0f}s")
+                    attempted_stop_loss = True
+                    cancel_all_orders(token_id)
+                    ok, actual_price = market_sell_immediate(token_id, size)
+                    if ok:
+                        sold = True
+                        sold_price = actual_price
+                        self_notify(pos, sold_price, coin, direction, size, "亏损熔断止损")
+                    elif actual_price == "NO_BALANCE":
+                        print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                        self_notify(pos, current_price or 0, coin, direction, size, "亏损熔断(余额已清)")
+                        close_position(pos, current_price or 0)
+                        close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
+                        continue
 
                 if direction_correct and remaining > 0:
                     atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
@@ -1680,6 +1709,7 @@ def monitor():
                                 continue
                             elif output == "NO_BALANCE":
                                 print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                self_notify(pos, current_price or 0, coin, direction, size, "早期退出(余额已清)")
                                 close_position(pos, current_price or 0)
                                 close_attempts.pop(attempt_key, None)
                                 stop_loss_attempts.pop(attempt_key, None)
@@ -1761,6 +1791,7 @@ def monitor():
                     elif actual_price == "NO_BALANCE":
                         # 余额为零=token已不在钱包，标记关闭不再重试
                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                        self_notify(pos, current_price or 0, coin, direction, size, "止损(余额已清)")
                         close_position(pos, current_price or 0)
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
@@ -1803,6 +1834,7 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "阶段2平仓")
                         elif actual == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                            self_notify(pos, current_price or 0, coin, direction, size, "阶段2(余额已清)")
                             close_position(pos, current_price or 0)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
@@ -1881,6 +1913,7 @@ def monitor():
                                     ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
                                     if actual_price == "NO_BALANCE":
                                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                        self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
                                         close_position(pos, current_price or 0)
                                         close_attempts.pop(attempt_key, None)
                                         sold = True
@@ -1900,6 +1933,7 @@ def monitor():
                                 ok, actual_price = market_sell_immediate(token_id, size)
                                 if actual_price == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                                    self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
                                     close_position(pos, current_price or 0)
                                     close_attempts.pop(attempt_key, None)
                                     sold = True
@@ -1930,6 +1964,7 @@ def monitor():
                         ok, actual_price = market_sell_immediate(token_id, size)
                         if actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
+                            self_notify(pos, current_price or 0, coin, direction, size, "阶段4(余额已清)")
                             close_position(pos, current_price or 0)
                             close_attempts.pop(attempt_key, None)
                             sold = True

@@ -48,6 +48,13 @@ def init_client():
     _client.set_api_creds(creds)
     logger.info(f"✅ CLOB SDK 初始化完成 | funder={funder[:10]}...")
 
+    # 缩短 httpx 超时（默认5s太长，止损时每秒都在亏钱）
+    import httpx
+    from py_clob_client.http_helpers import helpers as _h
+    fok_timeout = float(os.environ.get("FOK_TIMEOUT", "3"))
+    _h._http_client = httpx.Client(http2=True, timeout=httpx.Timeout(fok_timeout))
+    logger.info(f"⏱️ HTTP超时设置为 {fok_timeout}s")
+
     # 预热：用假单预加载 coincurve 签名库 + TLS 连接池
     # 原理：首次签名+HTTPS请求很慢（~200ms），预热后复用连接只需 ~26ms
     _warmup()
