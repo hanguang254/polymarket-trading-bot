@@ -384,7 +384,7 @@ def _send_tx(w3: Web3, wallet, target: str, call_data: bytes) -> str | None:
             "data": call_data,
             "gas": gas_estimate + 50_000,
             "gasPrice": w3.eth.gas_price,
-            "nonce": w3.eth.get_transaction_count(wallet.address),
+            "nonce": w3.eth.get_transaction_count(wallet.address, "pending"),
             "chainId": 137,
         },
         PRIVATE_KEY,
