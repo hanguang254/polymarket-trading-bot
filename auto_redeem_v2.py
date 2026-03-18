@@ -369,6 +369,7 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
 def _send_tx(w3: Web3, wallet, target: str, call_data: bytes) -> str | None:
     """
     EOA 直接发送交易到目标合约
+    gasPrice 加 1.3x 倍率应对 Polygon 拥堵；超时后回查 receipt 兜底。
 
     Returns: tx_hash hex string on success, None on failure
     """
@@ -383,7 +384,7 @@ def _send_tx(w3: Web3, wallet, target: str, call_data: bytes) -> str | None:
             "to": target_cs,
             "data": call_data,
             "gas": gas_estimate + 50_000,
-            "gasPrice": w3.eth.gas_price,
+            "gasPrice": int(w3.eth.gas_price * 1.3),
             "nonce": w3.eth.get_transaction_count(wallet.address, "pending"),
             "chainId": 137,
         },
@@ -391,7 +392,19 @@ def _send_tx(w3: Web3, wallet, target: str, call_data: bytes) -> str | None:
     )
 
     tx_hash = w3.eth.send_raw_transaction(tx.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    try:
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    except Exception:
+        # 超时：交易可能还在 mempool，回查一次 receipt
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+            if receipt and receipt.status == 1:
+                log.info(f"  ✅ 超时但交易已上链: {tx_hash.hex()}")
+                return tx_hash.hex()
+        except Exception:
+            pass
+        # 真的没上链，抛出带 tx_hash 的异常供上层判断
+        raise TimeoutError(f"tx_pending:{tx_hash.hex()}")
 
     if receipt.status == 1:
         return tx_hash.hex()
@@ -465,6 +478,11 @@ def redeem_position(w3: Web3, wallet, cond_id: str,
             return tx
     except Exception as e:
         err_msg = str(e).lower()
+        if "tx_pending:" in err_msg:
+            # 交易还在 mempool pending，不要发新交易避免 nonce 冲突
+            pending_hash = str(e).split("tx_pending:")[-1]
+            log.warning(f"  ⚠️ {label1}交易pending中: {pending_hash[:18]}... | 等下一轮重查")
+            return None
         if "execution reverted" in err_msg:
             log.info(f"  🔄 {label1}方式 revert，切换重试: {cond_id[:18]}...")
         else:
@@ -481,6 +499,11 @@ def redeem_position(w3: Web3, wallet, cond_id: str,
             log.info(f"  ✅ redeem 成功({label2}): {cond_id[:18]}... | tx: {tx}")
             return tx
     except Exception as e:
+        err_msg = str(e).lower()
+        if "tx_pending:" in err_msg:
+            pending_hash = str(e).split("tx_pending:")[-1]
+            log.warning(f"  ⚠️ {label2}交易pending中: {pending_hash[:18]}... | 等下一轮重查")
+            return None
         log.warning(f"  ❌ {label2}也失败: {cond_id[:18]}... | {str(e)[:120]}")
 
     return None
