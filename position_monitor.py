@@ -523,6 +523,11 @@ def update_position(position, new_size=None, partial_exit=None):
                                     history.append(partial_exit)
                                     pos["partial_exits"] = history
                                     pos["last_partial_exit"] = partial_exit
+                                # 同步调用方修改的字段（如抄底后的entry_price/original_size等）
+                                for sync_key in ("entry_price", "original_entry_price", "original_size",
+                                                 "dip_buy_price", "dip_buy_size"):
+                                    if sync_key in position:
+                                        pos[sync_key] = position[sync_key]
                                 pos["updated_time"] = datetime.now(timezone.utc).isoformat()
                                 updated = True
                             all_positions.append(pos)
@@ -1765,8 +1770,10 @@ def monitor():
                             total_cost = entry_price * size + buy_price * bought_size
                             new_avg_price = total_cost / new_size
                             pos["original_size"] = pos.get("original_size") or size
+                            pos["original_entry_price"] = pos.get("original_entry_price") or entry_price
                             pos["dip_buy_price"] = buy_price
                             pos["dip_buy_size"] = bought_size
+                            pos["entry_price"] = new_avg_price
                             update_position(pos, new_size=new_size)
                             pos["size"] = new_size
                             size = new_size
@@ -1789,8 +1796,8 @@ def monitor():
                         cancel_all_orders(token_id)
                         # 用best_bid卖出（token此时还有价值，不用地板价）
                         best_bid_sl = get_best_bid_raw(token_id)
-                        if best_bid_sl and best_bid_sl < 0.05:
-                            # bid极低，用地板价市价卖
+                        if not best_bid_sl or best_bid_sl < 0.05:
+                            # bid极低或无买方，用地板价市价卖
                             ok, actual_price = market_sell_immediate(token_id, size)
                         else:
                             ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl)
@@ -1819,6 +1826,7 @@ def monitor():
                     else:
                         # 🟡 观望区: ATR 1.0-2.0 → 不加仓也不割肉，继续监控
                         print(f"  🟡 观望: 跌{profit_rate*100:+.1f}% | {atr_str} | 等ATR变化 | 剩余{remaining:.0f}s")
+                        continue
 
                 # --- 4. 跌幅 < 触发线: 方向正确+信号好 → 持有 ---
                 elif direction_correct and remaining > 0:
