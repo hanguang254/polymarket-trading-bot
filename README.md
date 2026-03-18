@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.1
+# Polymarket Trading Bot v9.2
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -95,6 +95,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 
 ### Infrastructure
 - **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used by warmup sampling, analysis, and position monitoring. Auto-reconnect with 2s backoff + 30s ping keepalive.
+- **Polymarket WebSocket Orderbook Stream**: `PolymarketOrderbookStream` singleton in `polymarket_ws.py` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` for real-time orderbook data. Handles `best_bid_ask`, `book`, and `price_change` events. FOK entry uses WS `best_ask` (0ms) instead of REST orderbook query (100-300ms), significantly reducing price staleness between read and order placement. Position monitor's `get_best_bid/get_best_ask/get_market_price` all use WS-first with REST fallback. Lazy connection: WS connects only on first `subscribe()` call (Polymarket requires immediate subscription after connect). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect with 2s backoff.
 - **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
 - **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
@@ -122,6 +123,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | `position_monitor.py` | EV-driven exit + 4-stage closing + pending order reconciliation + outcome recording |
 | `auto_redeem_v2.py` | Auto claim settled positions (REST API + on-chain redeem) |
 | `ai_trader/binance_api.py` | Binance market data: WebSocket real-time price stream + REST klines/stats |
+| `ai_trader/polymarket_ws.py` | Polymarket Market Channel WebSocket: real-time orderbook/best_bid_ask stream |
 | `ai_trader/indicators.py` | Technical indicators (EMA, RSI, ATR, Bollinger Bands) |
 | `ai_trader/polymarket_api.py` | Polymarket API + PTB HTML scraper |
 | `ai_trader/playwright_ptb.py` | PTB extraction via headless Chromium |
@@ -331,6 +333,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.2**: Polymarket WebSocket real-time orderbook — FOK entry now uses WS `best_ask` (0ms delay) instead of REST orderbook query (100-300ms), eliminating price staleness between read and order placement. New `polymarket_ws.py` singleton connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`, handles `best_bid_ask`/`book`/`price_change` events. Position monitor's `get_best_bid/get_best_ask/get_market_price` all WS-first with REST fallback. Lazy connection design: WS only connects on first `subscribe()` (Polymarket requires immediate subscription after connect, otherwise disconnects). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect. FOK retry logic (+1tick/+2tick/80% size) now operates on fresher prices, expected to significantly improve fill rate.
 
 - **v9.1**: Binance WebSocket real-time price stream + 3 bug fixes — Price data for warmup sampling, analysis, and position monitoring now uses WebSocket (`wss://stream.binance.com` @trade stream, ~10ms push) instead of REST polling (100-300ms per call). Shared `BinancePriceStream` singleton in `binance_api.py` with auto-reconnect and REST fallback. Eliminates ~215 REST calls/cycle. Bug fixes: (1) ATR<1.0 stop-loss now requires `direction_correct=False` — direction correct + ATR dip no longer triggers false stop-loss. (2) P0 take-profit consecutive failure cap: after 3 failed sell attempts with direction correct, stops retrying and waits for $1.00 settlement (orderbook has no buyers near expiry). (3) `_check_and_adjust_size` syncs `positions.jsonl` when on-chain balance < recorded size, preventing repeated size mismatch warnings. Monitor status line now shows crypto price and data source (WS/REST).
 
