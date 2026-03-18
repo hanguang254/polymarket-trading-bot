@@ -1860,7 +1860,7 @@ def monitor():
                         if opposite_token:
                             opposite_ask = get_best_ask(opposite_token)
                             if opposite_ask and opposite_ask < (1.00 - entry_price - 0.02):
-                                print(f"  🔄 P1对冲: bid=${best_bid:.3f}<$0.05 | 买反向token @ ${opposite_ask:.3f} | 剩余{remaining:.0f}s")
+                                print(f"  🔄 P1对冲: bid=${best_bid or 0:.3f}<$0.05 | 买反向token @ ${opposite_ask:.3f} | 剩余{remaining:.0f}s")
                                 h_success, h_output, h_actual = buy_opposite_token(opposite_token, size, opposite_ask)
                                 if h_success:
                                     hedge_price = h_actual or opposite_ask
@@ -1881,7 +1881,7 @@ def monitor():
                                     print(f"  🔴 对冲不划算: ask={ask_str} ≥ ${1.00 - entry_price - 0.02:.3f}，等过期结算 | 剩余{remaining:.0f}s")
                         else:
                             if attempts == 0:
-                                print(f"  🔴 方向错误但无买方(bid=${best_bid:.3f})且无对冲token，等过期结算 | 剩余{remaining:.0f}s")
+                                print(f"  🔴 方向错误但无买方(bid=${best_bid or 0:.3f})且无对冲token，等过期结算 | 剩余{remaining:.0f}s")
                         attempted_stop_loss = True
                         stop_loss_attempt_recorded = True
                         stop_loss_attempts[attempt_key] = attempts + 1
