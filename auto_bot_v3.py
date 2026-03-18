@@ -440,6 +440,9 @@ class MarketTracker:
                         if up_t and down_t:
                             self.token_cache[slug] = (up_t, down_t)
                             clob_client.precache_tokens([up_t, down_t])
+                            # 订阅 Polymarket WS 实时 orderbook
+                            from ai_trader.polymarket_ws import poly_ws
+                            poly_ws.subscribe([up_t, down_t])
                     except Exception:
                         pass
 
@@ -838,10 +841,16 @@ class MarketTracker:
         for slug in list(self.tracked.keys()):
             end_dt = datetime.fromisoformat(self.tracked[slug]["end_time"].replace("Z", "+00:00"))
             if (now - end_dt).total_seconds() > 120:
+                # 退订 Polymarket WS
+                tokens = self.token_cache.get(slug)
+                if tokens:
+                    from ai_trader.polymarket_ws import poly_ws
+                    poly_ws.unsubscribe(list(tokens))
                 del self.tracked[slug]
                 self.ptb_cache.pop(slug, None)
                 self.positions.pop(slug, None)
                 self.bayesian_updaters.pop(slug, None)
+                self.token_cache.pop(slug, None)
 
 
 def main():
@@ -857,6 +866,10 @@ def main():
     # 启动 Binance WebSocket 实时价格流（预热+分析共用）
     from ai_trader.binance_api import price_stream
     price_stream.start()
+
+    # 启动 Polymarket WebSocket 实时 orderbook 流
+    from ai_trader.polymarket_ws import poly_ws
+    poly_ws.start()
 
     tracker = MarketTracker()
     error_count = 0

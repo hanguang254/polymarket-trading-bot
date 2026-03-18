@@ -14,6 +14,7 @@ import requests
 from ai_trader.polymarket_api import normalize_orderbook
 from ai_trader import clob_client
 from ai_trader.binance_api import price_stream as _price_stream
+from ai_trader.polymarket_ws import poly_ws as _poly_ws
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ═══ 日志：print 同时写入 logs/monitor.log ═══
@@ -120,14 +121,26 @@ def _get_orderbook_bids_asks(token_id):
     return [], []
 
 def get_market_price(token_id):
-    """获取当前市场价格 — 多源融合（SDK直连）"""
+    """获取当前市场价格 — 多源融合（WS优先 → SDK回退）"""
     best_bid = None
     best_ask = None
+    # 方案0：Polymarket WebSocket 实时推送（0ms延迟）
+    try:
+        ws_bid, ws_ask = _poly_ws.get_best_bid_ask(token_id)
+        if ws_bid is not None and ws_ask is not None:
+            spread = ws_ask - ws_bid
+            mid = (ws_bid + ws_ask) / 2
+            if mid > 0 and spread / mid < 0.50:
+                return round(mid, 4)
+        best_bid = ws_bid
+        best_ask = ws_ask
+    except Exception:
+        pass
     # 方案1：SDK订单簿
     try:
         bids, asks = _get_orderbook_bids_asks(token_id)
-        best_bid = float(bids[0]['price']) if bids else None
-        best_ask = float(asks[0]['price']) if asks else None
+        best_bid = float(bids[0]['price']) if bids else best_bid
+        best_ask = float(asks[0]['price']) if asks else best_ask
         if best_bid and best_ask:
             spread = best_ask - best_bid
             mid = (best_bid + best_ask) / 2
@@ -151,7 +164,12 @@ def get_market_price(token_id):
     return None
 
 def get_best_bid_raw(token_id):
-    """获取原始最佳买价（止损专用，SDK直连）"""
+    """获取原始最佳买价（止损专用，WS优先 → SDK回退）"""
+    # WS 实时推送
+    ws_bid = _poly_ws.get_best_bid(token_id)
+    if ws_bid is not None and ws_bid > 0.02:
+        return ws_bid
+    # SDK REST 回退
     try:
         bids, _ = _get_orderbook_bids_asks(token_id)
         if bids:
@@ -168,7 +186,12 @@ def get_best_bid_raw(token_id):
 
 
 def get_best_bid(token_id):
-    """获取最佳买价（用于卖出，SDK直连）"""
+    """获取最佳买价（用于卖出，WS优先 → SDK回退）"""
+    # WS 实时推送
+    ws_bid = _poly_ws.get_best_bid(token_id)
+    if ws_bid is not None and ws_bid > 0.02:
+        return ws_bid * 0.99
+    # SDK REST 回退
     try:
         bids, _ = _get_orderbook_bids_asks(token_id)
         if bids:
@@ -185,7 +208,12 @@ def get_best_bid(token_id):
     return None
 
 def get_best_ask(token_id):
-    """获取最佳卖价（用于买入对冲，SDK直连）"""
+    """获取最佳卖价（用于买入对冲，WS优先 → SDK回退）"""
+    # WS 实时推送
+    ws_ask = _poly_ws.get_best_ask(token_id)
+    if ws_ask is not None and ws_ask < 0.95:
+        return ws_ask
+    # SDK REST 回退
     try:
         _, asks = _get_orderbook_bids_asks(token_id)
         if asks:
@@ -1408,7 +1436,10 @@ def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
     # 启动 Binance WebSocket 实时价格流
     _price_stream.start()
-    print("🔍 持仓监控 v8 启动（ATR三层决策 + 抄底 + 硬止损 + 方向翻转退出）...")
+    # 启动 Polymarket WebSocket 实时 orderbook 流
+    _poly_ws.start()
+    _ws_subscribed = set()  # 已订阅的 token_ids
+    print("🔍 持仓监控 v9 启动（ATR三层决策 + 抄底 + 硬止损 + 方向翻转退出 + WS实时orderbook）...")
     print("   Exit Protocol: P0双曲止盈 | -25%硬止损 | 方向翻转清仓 | ATR≥2抄底 | ATR<1止损")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
 
@@ -1435,6 +1466,18 @@ def monitor():
             dip_bought = {k: v for k, v in dip_bought.items() if k in open_keys}
             prev_direction_correct = {k: v for k, v in prev_direction_correct.items() if k in open_keys}
             tp_fail_count = {k: v for k, v in tp_fail_count.items() if k in open_keys}
+
+            # 退订已关闭持仓的 token_ids
+            active_token_ids = set()
+            for p in positions:
+                active_token_ids.add(p.get("token_id", ""))
+                ot = p.get("opposite_token_id")
+                if ot:
+                    active_token_ids.add(ot)
+            stale_ids = _ws_subscribed - active_token_ids
+            if stale_ids:
+                _poly_ws.unsubscribe(list(stale_ids))
+                _ws_subscribed -= stale_ids
             
             for pos in positions:
                 token_id = pos["token_id"]
@@ -1451,6 +1494,14 @@ def monitor():
                 opposite_token = pos.get("opposite_token_id")
                 if opposite_token:
                     clob_client.precache_token(opposite_token)
+
+                # 自动订阅 Polymarket WS（首次见到的 token_id）
+                if token_id not in _ws_subscribed:
+                    sub_ids = [token_id]
+                    if opposite_token:
+                        sub_ids.append(opposite_token)
+                    _poly_ws.subscribe(sub_ids)
+                    _ws_subscribed.update(sub_ids)
 
                 # 获取当前token价格
                 current_price = get_market_price(token_id)

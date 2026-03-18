@@ -469,34 +469,60 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         return False, 0, 0, "SKIP_NO_BALANCE"
 
     # 从已获取的orderbook提取best_ask和bid_depth（0次额外HTTP）
+    # P0优化: 优先用 Polymarket WebSocket 实时 best_ask（0ms延迟）
     SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))
     price = None
     price_source = "unknown"
     bid_depth = None
 
     sorted_asks_full = []  # 保留完整 asks 用于 FOK 深度感知滑点
-    if book:
+
+    # 优先尝试 WebSocket 实时 best_ask
+    try:
+        from ai_trader.polymarket_ws import poly_ws
+        ws_bid, ws_ask = poly_ws.get_best_bid_ask(token_id)
+        if ws_ask is not None and 0.01 < ws_ask < 0.99:
+            # 倒挂校验
+            if ws_bid is not None and ws_bid >= ws_ask:
+                print(f"  ⚠️ WS订单簿倒挂: bid=${ws_bid:.2f} >= ask=${ws_ask:.2f}，走REST回退")
+            else:
+                price = ws_ask
+                price_source = "ws_best_ask"
+                print(f"  📡 WS best_ask: ${ws_ask:.2f} (实时推送)")
+        # WS orderbook 用于 FOK 深度感知
+        ws_bids, ws_asks = poly_ws.get_book(token_id)
+        if ws_asks:
+            sorted_asks_full = ws_asks  # 已排序
+        if ws_bids:
+            bid_depth = sum(float(b.get("size", 0)) for b in ws_bids)
+    except Exception:
+        pass
+
+    # REST fallback: WS 未命中时用 SDK orderbook
+    if book and (price is None or not sorted_asks_full):
         # best_ask + 倒挂校验
         if book.asks:
             from ai_trader.polymarket_api import normalize_orderbook
             raw_bids_chk = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
             raw_asks_chk = [{"price": a.price, "size": a.size} for a in book.asks]
-            sorted_bids_chk, sorted_asks_full = normalize_orderbook(raw_bids_chk, raw_asks_chk)
+            sorted_bids_chk, sorted_asks_rest = normalize_orderbook(raw_bids_chk, raw_asks_chk)
             # 倒挂校验：best_bid >= best_ask 说明数据异常
-            if sorted_bids_chk and sorted_asks_full:
+            if sorted_bids_chk and sorted_asks_rest:
                 _chk_bid = float(sorted_bids_chk[0]["price"])
-                _chk_ask = float(sorted_asks_full[0]["price"])
+                _chk_ask = float(sorted_asks_rest[0]["price"])
                 if _chk_bid >= _chk_ask:
                     print(f"  ⚠️ 订单簿倒挂: bid=${_chk_bid:.2f} >= ask=${_chk_ask:.2f}，跳过best_ask")
-                    sorted_asks_full = []  # 清空，走 fallback
-            if sorted_asks_full:
-                best_ask = float(sorted_asks_full[0]["price"])
+                    sorted_asks_rest = []  # 清空，走 fallback
+            if not sorted_asks_full:
+                sorted_asks_full = sorted_asks_rest
+            if price is None and sorted_asks_rest:
+                best_ask = float(sorted_asks_rest[0]["price"])
                 if 0.01 < best_ask < 0.99:
                     price = best_ask
                     price_source = "best_ask"
-                    print(f"  📡 best_ask: ${best_ask:.2f} → 限价${price:.2f}")
+                    print(f"  📡 REST best_ask: ${best_ask:.2f} → 限价${price:.2f}")
         # bid_depth（从同一个book提取，不再额外HTTP）
-        if book.bids:
+        if bid_depth is None and book.bids:
             bid_depth = sum(float(b.size) for b in book.bids)
 
     # 2. last-trade-price + 滑点 回退
