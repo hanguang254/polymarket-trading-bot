@@ -9,8 +9,10 @@ import os
 import subprocess
 import sys
 import time
+import threading
 from datetime import datetime, timezone
 import requests
+import websocket
 from ai_trader.polymarket_api import normalize_orderbook
 from ai_trader import clob_client
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -80,6 +82,91 @@ DIP_BUY_MIN_REMAINING = float(os.environ.get("DIP_BUY_MIN_REMAINING", "60"))
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ═══ Binance WebSocket 实时价格流 ═══
+class BinancePriceStream:
+    """后台 WebSocket 持续接收 BTC/ETH 实时成交价，get_price() 零延迟读内存"""
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self.prices = {}       # {"BTC": 83521.50, "ETH": 1920.30}
+        self.last_update = {}  # {"BTC": time.time(), ...}
+        self._ws = None
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._connect, daemon=True)
+        self._thread.start()
+
+    def _connect(self):
+        while self._running:
+            try:
+                url = "wss://stream.binance.com:9443/ws/btcusdt@trade/ethusdt@trade"
+                self._ws = websocket.WebSocketApp(
+                    url,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                    on_open=self._on_open,
+                )
+                self._ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception as e:
+                print(f"  ⚠️ WebSocket 连接异常: {e}")
+            if self._running:
+                time.sleep(2)
+
+    def _on_open(self, ws):
+        print("  ✅ Binance WebSocket 已连接 (实时价格流)")
+
+    def _on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            symbol = data.get("s", "")
+            price = float(data["p"])
+            if symbol == "BTCUSDT":
+                self.prices["BTC"] = price
+                self.last_update["BTC"] = time.time()
+            elif symbol == "ETHUSDT":
+                self.prices["ETH"] = price
+                self.last_update["ETH"] = time.time()
+        except Exception:
+            pass
+
+    def _on_error(self, ws, error):
+        print(f"  ⚠️ WebSocket 错误: {error}")
+
+    def _on_close(self, ws, code, msg):
+        if self._running:
+            print(f"  ⚠️ WebSocket 断开(code={code})，2s后重连...")
+
+    def get_price(self, coin="BTC"):
+        """获取实时价格，数据超过5秒未更新则返回None（触发REST fallback）"""
+        price = self.prices.get(coin)
+        last = self.last_update.get(coin, 0)
+        if price and (time.time() - last) < 5:
+            return price
+        return None
+
+    def stop(self):
+        self._running = False
+        if self._ws:
+            self._ws.close()
+
+# 全局单例
+_price_stream = BinancePriceStream()
 
 def send_telegram(text):
     """发送 Telegram 通知"""
@@ -613,7 +700,12 @@ def get_market_outcome(slug, direction):
     return None
 
 def get_current_crypto_price(coin):
-    """获取BTC/ETH当前实时价格"""
+    """获取BTC/ETH当前实时价格 - 优先WebSocket(0ms)，fallback REST"""
+    # 优先从 WebSocket 内存读取
+    ws_price = _price_stream.get_price(coin)
+    if ws_price is not None:
+        return ws_price
+    # WebSocket 未就绪或超时，fallback REST
     try:
         symbol = "BTCUSDT" if coin == "BTC" else "ETHUSDT"
         resp = requests.get(
@@ -1394,6 +1486,8 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
+    # 启动 Binance WebSocket 实时价格流
+    _price_stream.start()
     print("🔍 持仓监控 v8 启动（ATR三层决策 + 抄底 + 硬止损 + 方向翻转退出）...")
     print("   Exit Protocol: P0双曲止盈 | -25%硬止损 | 方向翻转清仓 | ATR≥2抄底 | ATR<1止损")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")

@@ -2,3 +2,4 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 playwright>=1.40.0
 py-clob-client>=0.34.6
+websocket-client>=1.6.0
