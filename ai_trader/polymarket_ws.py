@@ -45,16 +45,17 @@ class PolymarketOrderbookStream:
         self._thread = None
         self._subscribed_ids = set()  # 当前已订阅的 asset_ids
         self._ping_thread = None
+        self._ready = False  # start() 标记就绪，subscribe() 触发连接
 
     def start(self):
+        """标记就绪，实际连接延迟到第一次 subscribe() 时建立
+        （Polymarket WS 要求连接后立即发送订阅消息，否则服务器会断开）
+        """
         if not _HAS_WEBSOCKET:
             print("  ⚠️ websocket-client 未安装，Polymarket WS 不可用")
             return
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._connect_loop, daemon=True)
-        self._thread.start()
+        self._ready = True
+        print("  📡 Polymarket WS 就绪 (等待首次订阅后建立连接)")
 
     def stop(self):
         self._running = False
@@ -67,14 +68,20 @@ class PolymarketOrderbookStream:
     # ── 订阅管理 ──
 
     def subscribe(self, asset_ids):
-        """订阅一组 asset_ids（可在连接建立前调用，会在 on_open 时自动发送）"""
+        """订阅一组 asset_ids — 首次调用时自动建立 WS 连接"""
         if isinstance(asset_ids, str):
             asset_ids = [asset_ids]
         new_ids = [aid for aid in asset_ids if aid not in self._subscribed_ids]
         if not new_ids:
             return
         self._subscribed_ids.update(new_ids)
-        # 如果 WS 已连接，动态追加订阅
+        # 首次订阅时才真正建立连接（确保 on_open 有 asset_ids 可发）
+        if not self._running and getattr(self, "_ready", False):
+            self._running = True
+            self._thread = threading.Thread(target=self._connect_loop, daemon=True)
+            self._thread.start()
+            return  # on_open 会发送 _subscribed_ids
+        # WS 已连接，动态追加订阅
         if self._ws and self._running:
             self._send_subscribe(new_ids)
 
