@@ -854,6 +854,10 @@ def main():
     # 初始化 CLOB SDK 客户端（全局单例，全程复用）
     clob_client.init_client()
 
+    # 启动 Binance WebSocket 实时价格流（预热+分析共用）
+    from ai_trader.binance_api import price_stream
+    price_stream.start()
+
     tracker = MarketTracker()
     error_count = 0
     max_errors = 100
