@@ -364,9 +364,10 @@ def find_optimal_price(liquidity, target_size):
     return best_bid * 0.95
 
 
-def _check_and_adjust_size(token_id, size):
+def _check_and_adjust_size(token_id, size, position=None):
     """校验链上真实余额，返回调整后的 size。
     返回: adjusted_size (>0正常, 0=余额为零, None=查询失败用原size)
+    如传入 position 且余额不一致，会同步更新 positions.jsonl
     """
     real_balance = get_token_balance(token_id)
     if real_balance is not None:
@@ -376,11 +377,15 @@ def _check_and_adjust_size(token_id, size):
         if real_balance < size:
             adjusted = math.floor(real_balance * 100) / 100.0
             print(f"    ⚠️ 链上余额({real_balance})< 记录size({size})，用真实余额卖出({adjusted})")
+            # 同步更新持仓记录，防止后续循环反复触发不一致
+            if position is not None:
+                position["token_balance"] = adjusted
+                update_position(position, new_size=adjusted)
             return adjusted if adjusted > 0 else 0
         return size
     return None
 
-def market_sell_immediate(token_id, size, price=None):
+def market_sell_immediate(token_id, size, price=None, position=None):
     """市价立即卖出（止损专用）
     价格策略（逐级降价，追求成交而非价格）：
       1. 外部传入 price（调用方已有 best_bid，避免重复查询）
@@ -394,8 +399,8 @@ def market_sell_immediate(token_id, size, price=None):
     # 先取消可能存在的旧挂单，释放被锁定的token余额
     cancel_all_orders(token_id)
 
-    # 校验链上真实余额
-    adjusted = _check_and_adjust_size(token_id, size)
+    # 校验链上真实余额（传入position以同步更新持仓记录）
+    adjusted = _check_and_adjust_size(token_id, size, position=position)
     if adjusted == 0:
         return False, "NO_BALANCE"
     if adjusted is not None:
@@ -1364,12 +1369,12 @@ def check_balance_changed(token_id, expected_size):
         pass
     return False
 
-def sell_and_confirm(token_id, size, price, timeout_sec=5):
+def sell_and_confirm(token_id, size, price, timeout_sec=5, position=None):
     """FOK卖出（即时成交或取消，无需等待确认）
     返回: (success, msg_or_actual_price)
     """
-    # 校验链上真实余额
-    adjusted = _check_and_adjust_size(token_id, size)
+    # 校验链上真实余额（传入position以同步更新持仓记录）
+    adjusted = _check_and_adjust_size(token_id, size, position=position)
     if adjusted == 0:
         return False, "NO_BALANCE"
     if adjusted is not None:
@@ -1497,6 +1502,7 @@ def monitor():
     tp_state = {}  # (slug, entry_time) -> "FIRST_TOUCH" | "PULLED_BACK"
     dip_bought = {}  # (slug, entry_time) -> True if already dip-bought
     prev_direction_correct = {}  # (slug, entry_time) -> last known direction_correct
+    tp_fail_count = {}  # (slug, entry_time) -> 连续止盈失败次数
     
     while True:
         try:
@@ -1513,6 +1519,7 @@ def monitor():
             tp_state = {k: v for k, v in tp_state.items() if k in open_keys}
             dip_bought = {k: v for k, v in dip_bought.items() if k in open_keys}
             prev_direction_correct = {k: v for k, v in prev_direction_correct.items() if k in open_keys}
+            tp_fail_count = {k: v for k, v in tp_fail_count.items() if k in open_keys}
             
             for pos in positions:
                 token_id = pos["token_id"]
@@ -1611,11 +1618,14 @@ def monitor():
 
                 status = "🟢赢" if is_winning else "🔴输" if is_losing else "⚪"
                 # 补充显示：用加密货币方向替代可能失真的 token 利润率
+                # 价格来源标记：WS=WebSocket, REST=REST API
+                price_source = "WS" if _price_stream.get_price(coin) is not None else "REST"
+                crypto_label = f" | {coin}=${crypto_price:,.2f}({price_source})" if crypto_price else ""
                 if direction_correct is not None:
                     dir_icon = "✅" if direction_correct else "❌"
-                    print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status} | 方向{dir_icon}")
+                    print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status} | 方向{dir_icon}{crypto_label}")
                 else:
-                    print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status}")
+                    print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status}{crypto_label}")
 
                 sold = False
                 sold_price = 0
@@ -1638,6 +1648,11 @@ def monitor():
                     print(f"  [P0] 回调检测: 利润{profit_rate*100:.1f}%跌破阈值{profit_threshold*100:.1f}%，标记PULLED_BACK | 剩余{remaining:.0f}s")
 
                 if profit_rate >= profit_threshold and remaining > 30:
+                    # 连续止盈失败3次+方向正确 → 放弃止盈，等$1结算（orderbook无买方）
+                    if tp_fail_count.get(attempt_key, 0) >= 3 and direction_correct:
+                        print(f"  💎 止盈连续失败{tp_fail_count[attempt_key]}次，方向正确等结算 | {ev_label_global} | 剩余{remaining:.0f}s")
+                        continue
+
                     # 判断是否应该跳过本次止盈（首次达标+强信号→等结算）
                     cur_tp_state = tp_state.get(attempt_key)
                     should_skip_tp = False
@@ -1701,7 +1716,7 @@ def monitor():
                                 )
                                 attempted_stop_loss = True
                                 cancel_all_orders(token_id)
-                                success, actual = sell_and_confirm(token_id, size, exec_price, timeout_sec=4)
+                                success, actual = sell_and_confirm(token_id, size, exec_price, timeout_sec=4, position=pos)
                                 if success:
                                     sold = True
                                     sold_price = actual or exec_price
@@ -1711,6 +1726,7 @@ def monitor():
                                     stop_loss_attempts.pop(attempt_key, None)
                                     tp_state.pop(attempt_key, None)
                                     dip_bought.pop(attempt_key, None)
+                                    tp_fail_count.pop(attempt_key, None)
                                     continue
                                 elif actual == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
@@ -1720,7 +1736,11 @@ def monitor():
                                     stop_loss_attempts.pop(attempt_key, None)
                                     tp_state.pop(attempt_key, None)
                                     dip_bought.pop(attempt_key, None)
+                                    tp_fail_count.pop(attempt_key, None)
                                     continue
+                                else:
+                                    # 止盈卖出失败，累计失败次数
+                                    tp_fail_count[attempt_key] = tp_fail_count.get(attempt_key, 0) + 1
                             else:
                                 print(
                                     f"  [P0] Exec below threshold: {exec_profit_rate*100:.1f}% < {profit_threshold*100:.1f}% "
@@ -1744,7 +1764,7 @@ def monitor():
                     print(f"  🚨 硬止损: {profit_rate*100:+.1f}%超过-{PRICE_DROP_HARD_STOP*100:.0f}% | {atr_str} | 剩余{remaining:.0f}s")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
-                    ok, actual_price = market_sell_immediate(token_id, size)
+                    ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                     if ok:
                         sold = True
                         sold_price = actual_price
@@ -1772,7 +1792,7 @@ def monitor():
                     print(f"  🚨 方向翻转: True→False | {atr_str} | 剩余{remaining:.0f}s → 紧急清仓")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
-                    ok, actual_price = market_sell_immediate(token_id, size)
+                    ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                     if ok:
                         sold = True
                         sold_price = actual_price
@@ -1829,18 +1849,19 @@ def monitor():
                             print(f"    ⚠️ 抄底未成交，方向安全继续持有 | {atr_str} | 剩余{remaining:.0f}s")
                         continue
 
-                    elif diff_atr is not None and diff_atr < ATR_DANGER_THRESHOLD:
-                        # 🔴 危险区: ATR < 1.0 → 立即止损
-                        print(f"  🔴 ATR止损: 跌{profit_rate*100:+.1f}% | {atr_str}<{ATR_DANGER_THRESHOLD} | 剩余{remaining:.0f}s")
+                    elif diff_atr is not None and diff_atr < ATR_DANGER_THRESHOLD and not direction_correct:
+                        # 🔴 危险区: ATR < 1.0 且方向错误 → 立即止损
+                        # 方向正确时 ATR 短暂降低属正常波动，不应止损
+                        print(f"  🔴 ATR止损: 跌{profit_rate*100:+.1f}% | {atr_str}<{ATR_DANGER_THRESHOLD} | 方向❌ | 剩余{remaining:.0f}s")
                         attempted_stop_loss = True
                         cancel_all_orders(token_id)
                         # 用best_bid卖出（token此时还有价值，不用地板价）
                         best_bid_sl = get_best_bid_raw(token_id)
                         if not best_bid_sl or best_bid_sl < 0.05:
                             # bid极低或无买方，用地板价市价卖
-                            ok, actual_price = market_sell_immediate(token_id, size)
+                            ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                         else:
-                            ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl)
+                            ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl, position=pos)
                         if ok:
                             sold = True
                             sold_price = actual_price
@@ -1940,7 +1961,7 @@ def monitor():
                     # 市价止损
                     print(f"  🛑 方向错误止损(市价): bid=${best_bid:.3f} | 剩余{remaining:.0f}s")
                     attempted_stop_loss = True
-                    ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
+                    ok, actual_price = market_sell_immediate(token_id, size, price=best_bid, position=pos)
                     if ok:
                         sold = True
                         sold_price = actual_price
@@ -1985,7 +2006,7 @@ def monitor():
                     if size <= 5:
                         price = round(best_bid * 0.97, 2)
                         attempted_close = True
-                        success, actual = sell_and_confirm(token_id, size, price, timeout_sec=4)
+                        success, actual = sell_and_confirm(token_id, size, price, timeout_sec=4, position=pos)
                         if success:
                             sold = True
                             sold_price = actual
@@ -2000,7 +2021,7 @@ def monitor():
                         else:
                             price2 = round(best_bid * 0.90, 2)
                             attempted_close = True
-                            success2, actual2 = sell_and_confirm(token_id, size, price2, timeout_sec=4)
+                            success2, actual2 = sell_and_confirm(token_id, size, price2, timeout_sec=4, position=pos)
                             if success2:
                                 sold = True
                                 sold_price = actual2
@@ -2068,7 +2089,7 @@ def monitor():
                                     print(f"  🛡️ 最佳买价${best_bid:.3f}<最低价${min_price:.2f}，跳过市价卖出")
                                 else:
                                     attempted_close = True
-                                    ok, actual_price = market_sell_immediate(token_id, size, price=best_bid)
+                                    ok, actual_price = market_sell_immediate(token_id, size, price=best_bid, position=pos)
                                     if actual_price == "NO_BALANCE":
                                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
                                         self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
@@ -2088,7 +2109,7 @@ def monitor():
                             else:
                                 # 无最低价保护，直接市价
                                 attempted_close = True
-                                ok, actual_price = market_sell_immediate(token_id, size)
+                                ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                                 if actual_price == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
                                     self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
@@ -2119,7 +2140,7 @@ def monitor():
                         # EV < 0 + 方向不对 + 还有10-30秒 → 尝试市价
                         print(f"  💀 阶段4：最后机会 ({ev_label})")
                         attempted_close = True
-                        ok, actual_price = market_sell_immediate(token_id, size)
+                        ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                         if actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
                             self_notify(pos, current_price or 0, coin, direction, size, "阶段4(余额已清)")
