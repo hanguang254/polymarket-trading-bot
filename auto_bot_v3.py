@@ -201,7 +201,10 @@ def get_token_ids(slug):
 
 
 def get_realtime_odds(up_token, down_token):
-    """从 CLOB 订单簿获取实时数据（SDK直连）"""
+    """从 WS 或 CLOB 订单簿获取实时数据
+    优先用 WS 实时推送（0ms内存读取），无数据时回退 REST。
+    """
+    from ai_trader.polymarket_ws import poly_ws
     result = {
         "up_mid": None, "down_mid": None,
         "up_bid": None, "down_bid": None,
@@ -209,6 +212,19 @@ def get_realtime_odds(up_token, down_token):
     }
     for token_id, label in [(up_token, "UP"), (down_token, "DOWN")]:
         prefix = "up" if label == "UP" else "down"
+
+        # 优先用 WS 实时数据（0ms）
+        ws_bid, ws_ask = poly_ws.get_best_bid_ask(token_id)
+        if ws_bid is not None and ws_ask is not None:
+            if ws_bid >= ws_ask:
+                logger.warning(f"  ⚠️ {label} WS订单簿倒挂: bid=${ws_bid:.2f} >= ask=${ws_ask:.2f}，丢弃")
+            elif ws_bid > 0 and ws_ask > 0:
+                result[f"{prefix}_bid"] = round(ws_bid, 4)
+                result[f"{prefix}_ask"] = round(ws_ask, 4)
+                result[f"{prefix}_mid"] = round((ws_bid + ws_ask) / 2, 4)
+            continue
+
+        # WS 无数据，回退 REST
         try:
             book = clob_client.get_orderbook(token_id)
             if book:
@@ -385,9 +401,12 @@ class MarketTracker:
         return markets
     
     def check_analysis_trigger(self):
-        """预热观察 + 趋势确认下注（优化版）"""
+        """预热观察 + 趋势确认下注（优化版）
+        多个市场同时触发下注时并行执行 analyze_and_trade，避免串行等待。
+        """
         now = datetime.now(timezone.utc)
-        
+        pending_trades = []  # [(slug, market, extra_info), ...]
+
         for slug, market in list(self.tracked.items()):
             end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
             start_dt = end_dt - timedelta(minutes=5)
@@ -502,7 +521,7 @@ class MarketTracker:
                             if updater.n_updates >= 3:
                                 extra_info["bayesian"] = updater.get_summary()
                             logger.info(f"\n⚡ 早期下注窗口: {market['coin']} elapsed={elapsed:.0f}s | 贝叶斯: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f}")
-                            self.analyze_and_trade(slug, market, extra_info)
+                            pending_trades.append((slug, market, extra_info))
 
             # === 晚期下注窗口：100s-160s（贝叶斯后验 + gap 趋势双重确认） ===
             LATE_BET_START = int(os.environ.get("LATE_BET_START", "100"))
@@ -550,8 +569,24 @@ class MarketTracker:
                 elif gap_trend == "震荡":
                     extra_info["min_discount"] = 0.15
 
-                self.analyze_and_trade(slug, market, extra_info)
-    
+                pending_trades.append((slug, market, extra_info))
+
+        # 并行执行所有待分析市场（BTC+ETH同时分析下注，而非串行等待）
+        if len(pending_trades) > 1:
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            with _TPE(max_workers=len(pending_trades)) as pool:
+                futures = {
+                    pool.submit(self.analyze_and_trade, s, m, e): s
+                    for s, m, e in pending_trades
+                }
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception as ex:
+                        logger.warning(f"  ❌ 并行分析异常({futures[fut]}): {ex}")
+        elif pending_trades:
+            self.analyze_and_trade(*pending_trades[0])
+
     def _calc_gap_trend(self, samples):
         """
         基于 (price - PTB) 的gap变化趋势，判断折价空间是扩大还是收缩。
