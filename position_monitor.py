@@ -1573,18 +1573,6 @@ def monitor():
                 attempted_stop_loss = False
                 stop_loss_attempt_recorded = False
 
-                # ═══ 方向信号：只用 crypto 价格判断，不用 token 价格降级 ═══
-                # 二元市场方向对=$1.00，token中途波动是CLOB流动性噪音不是方向信号
-                # crypto 边界保护：价格离 PTB 很近时标记弱方向，供阶段策略参考
-                weak_direction = False
-                if direction_correct and ptb_price and crypto_price and remaining > 60:
-                    atr_val_wd = pos.get("atr_val") or get_atr_from_binance(coin)
-                    if atr_val_wd and atr_val_wd > 0:
-                        gap_ratio = abs(crypto_price - ptb_price) / atr_val_wd
-                        if gap_ratio < 0.3:
-                            weak_direction = True
-                            print(f"  ⚠️ crypto离PTB很近({gap_ratio:.2f}ATR<0.3)，翻转风险高 | 剩余{remaining:.0f}s")
-
                 # ═══ EV 持续监控（Exit Protocol）═══
                 # 二元市场: token_price ≈ 市场隐含胜率 → EV = token_price - entry_price
                 # 这是最直接最准确的EV，不依赖理论模型
@@ -1787,6 +1775,8 @@ def monitor():
                                 f"剩余: {remaining:.0f}s"
                             )
                             send_telegram(msg)
+                        else:
+                            print(f"    ⚠️ 抄底未成交，方向安全继续持有 | {atr_str} | 剩余{remaining:.0f}s")
                         continue
 
                     elif diff_atr is not None and diff_atr < ATR_DANGER_THRESHOLD:
@@ -1864,8 +1854,8 @@ def monitor():
                     attempts = stop_loss_attempts.get(attempt_key, 0)
                     best_bid = get_best_bid_raw(token_id)
 
-                    # bid极低 → P1对冲
-                    if best_bid and best_bid < 0.05:
+                    # bid极低或无买方 → P1对冲
+                    if not best_bid or best_bid < 0.05:
                         opposite_token = pos.get("opposite_token_id")
                         if opposite_token:
                             opposite_ask = get_best_ask(opposite_token)
