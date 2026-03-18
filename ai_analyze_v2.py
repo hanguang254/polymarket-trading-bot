@@ -551,8 +551,9 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         exit_bid_depth=bid_depth
     )
 
-    # FOK 深度感知：遍历 asks 计算能覆盖 size 的限价，一次成交不重试
+    # FOK 深度感知：遍历 asks 计算能覆盖 size 的限价
     fok_price = price
+    original_size = size
     if sorted_asks_full and price_source == "best_ask" and size > 0:
         cumulative = 0.0
         cover_price = price
@@ -567,10 +568,14 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             if cumulative >= size:
                 break
         if cumulative >= size:
-            # 深度够：限价设到覆盖档位 + 1 tick 余量
+            # 深度够：限价始终 +1 tick（防止 best_ask 被抢导致 FOK 失败）
             fok_price = min(round(cover_price + 0.01, 2), MAX_PRICE - 0.01)
             if fok_price > price:
                 print(f"  📡 FOK深度滑点: 覆盖{size}份需到${cover_price:.2f}，限价${price:.2f}→${fok_price:.2f}")
+            else:
+                # 一档就够，仍然 +1 tick 确保成交
+                fok_price = min(round(price + 0.01, 2), MAX_PRICE - 0.01)
+                print(f"  📡 FOK限价+1tick安全余量: ${price:.2f}→${fok_price:.2f}")
         elif cumulative >= 5:
             # 深度不够但≥5份：缩减 size + 限价到最远档
             size = int(cumulative)
@@ -588,6 +593,47 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     success = info.get("matched", False)
     pending = False
 
+    # FOK 失败重试：提价 +2tick 重试，再失败则缩量 80% 重试
+    if not success:
+        print(f"  ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
+        # 回查链上余额：网络超时不代表订单未执行（幽灵成交）
+        ghost_filled = False
+        try:
+            from position_monitor import get_token_balance
+            ghost_balance = get_token_balance(token_id)
+            if ghost_balance is not None and ghost_balance >= 1.0:
+                print(f"  ⚡ 幽灵成交检测: 链上余额={ghost_balance:.2f}份，订单实际已成交")
+                success = True
+                size = round(ghost_balance, 4)
+                ghost_filled = True
+        except Exception as e_ghost:
+            print(f"  ⚠️ 幽灵成交检测失败: {e_ghost}")
+
+        if not ghost_filled:
+            # 重试1：提价 +2 tick
+            retry_price = min(round(fok_price + 0.02, 2), MAX_PRICE - 0.01)
+            print(f"  🔄 重试1: 提价${fok_price:.2f}→${retry_price:.2f} | {size}份")
+            info2 = clob_client.place_fok_order(token_id, BUY, retry_price, size)
+            if info2.get("matched", False):
+                info = info2
+                success = True
+                fok_price = retry_price
+                print(f"  ✅ 重试1成交 | {info2.get('elapsed_ms', 0):.0f}ms")
+            else:
+                # 重试2：缩量 80%
+                retry_size = max(int(original_size * 0.8), 5)
+                if retry_size < size:
+                    print(f"  🔄 重试2: 缩量{size}→{retry_size}份 @ ${retry_price:.2f}")
+                    info3 = clob_client.place_fok_order(token_id, BUY, retry_price, retry_size)
+                    if info3.get("matched", False):
+                        info = info3
+                        success = True
+                        size = retry_size
+                        fok_price = retry_price
+                        print(f"  ✅ 重试2成交 | {info3.get('elapsed_ms', 0):.0f}ms")
+                    else:
+                        print(f"  ❌ 重试2仍未成交 | {info3.get('elapsed_ms', 0):.0f}ms")
+
     # 计算实际成交价和实际份数
     actual_size = size
     if success and size > 0 and info.get("making", 0) > 0:
@@ -597,18 +643,6 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  📊 FOK成交: Making=${info['making']:.4f} | Taking={actual_size} | 实际价=${actual_price:.4f} (限价=${price}) | {info.get('elapsed_ms', 0):.0f}ms")
     else:
         actual_price = price
-        if not success:
-            print(f"  ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
-            # 回查链上余额：网络超时不代表订单未执行（幽灵成交）
-            try:
-                from position_monitor import get_token_balance
-                ghost_balance = get_token_balance(token_id)
-                if ghost_balance is not None and ghost_balance >= 1.0:
-                    print(f"  ⚡ 幽灵成交检测: 链上余额={ghost_balance:.2f}份，订单实际已成交")
-                    success = True
-                    actual_size = round(ghost_balance, 4)
-            except Exception as e_ghost:
-                print(f"  ⚠️ 幽灵成交检测失败: {e_ghost}")
 
     # 记录下注结果（使用实际成交价）
     log_entry = {
