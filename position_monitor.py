@@ -78,6 +78,11 @@ ATR_DANGER_THRESHOLD = float(os.environ.get("ATR_DANGER_THRESHOLD", "1.0"))
 DIP_BUY_SIZE_RATIO = float(os.environ.get("DIP_BUY_SIZE_RATIO", "0.50"))
 DIP_BUY_MIN_REMAINING = float(os.environ.get("DIP_BUY_MIN_REMAINING", "60"))
 
+# 链上余额预缓存（止损时避免临时查链增加延迟）
+# {token_id: (balance, timestamp)}
+_balance_cache = {}
+BALANCE_CACHE_TTL = 8  # 缓存有效期(秒)，观望区每轮刷新
+
 # Telegram 通知配置
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -307,12 +312,28 @@ def find_optimal_price(liquidity, target_size):
     return best_bid * 0.95
 
 
+def _prefetch_balance(token_id):
+    """预取链上余额并缓存，供止损时直接使用（避免临时查链增加延迟）"""
+    real_balance = get_token_balance(token_id)
+    if real_balance is not None:
+        _balance_cache[token_id] = (real_balance, time.time())
+    return real_balance
+
+
 def _check_and_adjust_size(token_id, size, position=None):
     """校验链上真实余额，返回调整后的 size。
     返回: adjusted_size (>0正常, 0=余额为零, None=查询失败用原size)
     如传入 position 且余额不一致，会同步更新 positions.jsonl
+    优先使用预缓存余额（TTL内），避免止损时额外网络延迟。
     """
-    real_balance = get_token_balance(token_id)
+    # 优先用缓存（观望区已预取）
+    cached = _balance_cache.get(token_id)
+    if cached and (time.time() - cached[1]) < BALANCE_CACHE_TTL:
+        real_balance = cached[0]
+    else:
+        real_balance = get_token_balance(token_id)
+        if real_balance is not None:
+            _balance_cache[token_id] = (real_balance, time.time())
     if real_balance is not None:
         if real_balance <= 0:
             print(f"    ⚠️ 链上余额为0，跳过卖出")
@@ -328,7 +349,7 @@ def _check_and_adjust_size(token_id, size, position=None):
         return size
     return None
 
-def market_sell_immediate(token_id, size, price=None, position=None):
+def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel=False):
     """市价立即卖出（止损专用）
     价格策略（逐级降价，追求成交而非价格）：
       1. 外部传入 price（调用方已有 best_bid，避免重复查询）
@@ -338,9 +359,11 @@ def market_sell_immediate(token_id, size, price=None, position=None):
       success=True: 成交
       success=False, actual_price=None: 正常失败
       success=False, actual_price="NO_BALANCE": token余额为零，不必再重试
+    skip_cancel: 调用方已执行cancel_all_orders时传True，避免重复网络调用
     """
     # 先取消可能存在的旧挂单，释放被锁定的token余额
-    cancel_all_orders(token_id)
+    if not skip_cancel:
+        cancel_all_orders(token_id)
 
     # 校验链上真实余额（传入position以同步更新持仓记录）
     adjusted = _check_and_adjust_size(token_id, size, position=position)
@@ -365,6 +388,9 @@ def market_sell_immediate(token_id, size, price=None, position=None):
         # FOK失败
         print(f"    ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
         err = info.get("error", "") or info.get("raw", "")
+
+        # FOK后余额可能已变，清除预缓存，后续回查必须用实时数据
+        _balance_cache.pop(token_id, None)
 
         # 所有ERROR状态 → 回查链上余额，检测幽灵成交（订单实际已成交但响应丢失/400）
         if info.get("status") == "ERROR":
@@ -1723,6 +1749,16 @@ def monitor():
                 _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
                 atr_str = f"{diff_atr:.1f}ATR" if diff_atr else "N/A"
 
+                # --- 方向降级：ATR趋零说明crypto逼近strike，方向随时可能翻转 ---
+                # direction_correct=True 但 ATR<0.3 且 token已大幅亏损 → 降级为False
+                # 让现有硬止损(-25%)和ATR危险区自然生效，避免方向"技术正确"时全程观望到归零
+                ATR_DOWNGRADE_THRESHOLD = 0.3
+                if (direction_correct is True
+                        and diff_atr is not None and diff_atr < ATR_DOWNGRADE_THRESHOLD
+                        and profit_rate <= -PRICE_DROP_HARD_STOP):
+                    print(f"  ⚠️ 方向降级: 方向✅但ATR={diff_atr:.2f}<{ATR_DOWNGRADE_THRESHOLD}(逼近strike) + 跌{profit_rate*100:+.1f}% → 视为方向❌")
+                    direction_correct = False
+
                 # --- 1. -25% 硬止损线（方向错误/未知时触发，方向正确交给ATR矩阵）---
                 if (current_price is not None and entry_price > 0
                         and profit_rate <= -PRICE_DROP_HARD_STOP
@@ -1730,7 +1766,7 @@ def monitor():
                     print(f"  🚨 硬止损: {profit_rate*100:+.1f}%超过-{PRICE_DROP_HARD_STOP*100:.0f}% | {atr_str} | 剩余{remaining:.0f}s")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
-                    ok, actual_price = market_sell_immediate(token_id, size, position=pos)
+                    ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
                     if ok:
                         sold = True
                         sold_price = actual_price
@@ -1758,7 +1794,7 @@ def monitor():
                     print(f"  🚨 方向翻转: True→False | {atr_str} | 剩余{remaining:.0f}s → 紧急清仓")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
-                    ok, actual_price = market_sell_immediate(token_id, size, position=pos)
+                    ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
                     if ok:
                         sold = True
                         sold_price = actual_price
@@ -1825,9 +1861,9 @@ def monitor():
                         best_bid_sl = get_best_bid_raw(token_id)
                         if not best_bid_sl or best_bid_sl < 0.05:
                             # bid极低或无买方，用地板价市价卖
-                            ok, actual_price = market_sell_immediate(token_id, size, position=pos)
+                            ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
                         else:
-                            ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl, position=pos)
+                            ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl, position=pos, skip_cancel=True)
                         if ok:
                             sold = True
                             sold_price = actual_price
@@ -1852,6 +1888,8 @@ def monitor():
 
                     else:
                         # 🟡 观望区: ATR 1.0-2.0 → 不加仓也不割肉，继续监控
+                        # 预缓存链上余额，万一下轮触发止损可直接用（省掉~300ms查链延迟）
+                        _prefetch_balance(token_id)
                         print(f"  🟡 观望: 跌{profit_rate*100:+.1f}% | {atr_str} | 等ATR变化 | 剩余{remaining:.0f}s")
                         continue
 
