@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.0
+# Polymarket Trading Bot v9.1
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -72,7 +72,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **ATR 3-Layer Decision Matrix**: When token drops ≥15% (`PRICE_DROP_TRIGGER`), action depends on ATR deviation (crypto distance from PTB in ATR units):
   - **ATR ≥ 2.0** (safe zone): 🟢 Dip-buy — adds 50% of original position at best_ask via FOK. Requires: direction correct, remaining > 60s, max 1 dip-buy per position. Averages down cost basis for higher profit if direction holds.
   - **ATR 1.0-2.0** (uncertain): 🟡 Hold — no action, continue monitoring. ATR rising → enters safe zone, ATR falling → enters danger zone.
-  - **ATR < 1.0** (danger zone): 🔴 Stop-loss — immediate sell at best_bid. Crypto is too close to PTB, direction likely to flip.
+  - **ATR < 1.0** (danger zone): 🔴 Stop-loss — immediate sell at best_bid, only when direction is wrong. Direction correct + ATR dip is normal volatility, not a stop signal.
 - **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.20) and `P0_HYPERBOLIC_K` (default 0.15). P0 sells at entry_price (guaranteed fill) instead of best_bid.
 - **Market-Price Immediate Stop-Loss**: `market_sell_immediate()` cancels existing orders first (prevents balance lock), then ladder sells at bid→95%→90%→80%→$0.05→$0.01 (~6s to clear). On "not enough balance / allowance" error with confirmed on-chain balance, auto-refreshes allowance and retries before falling back to reduced-size attempts.
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
@@ -94,6 +94,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
 
 ### Infrastructure
+- **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used by warmup sampling, analysis, and position monitoring. Auto-reconnect with 2s backoff + 30s ping keepalive.
 - **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
 - **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
@@ -120,7 +121,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | `ai_trader/lmsr_liquidity.py` | Orderbook liquidity: spread + depth + slippage → dynamic threshold |
 | `position_monitor.py` | EV-driven exit + 4-stage closing + pending order reconciliation + outcome recording |
 | `auto_redeem_v2.py` | Auto claim settled positions (REST API + on-chain redeem) |
-| `ai_trader/binance_api.py` | Binance market data (klines, price, 24h stats) |
+| `ai_trader/binance_api.py` | Binance market data: WebSocket real-time price stream + REST klines/stats |
 | `ai_trader/indicators.py` | Technical indicators (EMA, RSI, ATR, Bollinger Bands) |
 | `ai_trader/polymarket_api.py` | Polymarket API + PTB HTML scraper |
 | `ai_trader/playwright_ptb.py` | PTB extraction via headless Chromium |
@@ -223,6 +224,7 @@ All components now use SDK/REST API directly — no Polymarket CLI dependency.
 
 - Python 3.10+
 - [py-clob-client](https://github.com/Polymarket/py-clob-client) (`pip install py-clob-client`)
+- [websocket-client](https://pypi.org/project/websocket-client/) (`pip install websocket-client`) — Binance WebSocket price stream
 - Chromium browser (for Playwright PTB extraction)
 
 ### Installation
@@ -329,6 +331,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.1**: Binance WebSocket real-time price stream + 3 bug fixes — Price data for warmup sampling, analysis, and position monitoring now uses WebSocket (`wss://stream.binance.com` @trade stream, ~10ms push) instead of REST polling (100-300ms per call). Shared `BinancePriceStream` singleton in `binance_api.py` with auto-reconnect and REST fallback. Eliminates ~215 REST calls/cycle. Bug fixes: (1) ATR<1.0 stop-loss now requires `direction_correct=False` — direction correct + ATR dip no longer triggers false stop-loss. (2) P0 take-profit consecutive failure cap: after 3 failed sell attempts with direction correct, stops retrying and waits for $1.00 settlement (orderbook has no buyers near expiry). (3) `_check_and_adjust_size` syncs `positions.jsonl` when on-chain balance < recorded size, preventing repeated size mismatch warnings. Monitor status line now shows crypto price and data source (WS/REST).
 
 - **v9.0**: ATR 3-layer stop-loss redesign — Replaces old Token crash circuit breaker (60% drop) and late-loss circuit breaker (30%+wrong direction) with ATR-deviation-based decision matrix. When token drops ≥15% from entry: ATR≥2.0 (crypto far from PTB) → dip-buy 50% of original position at best_ask via FOK (max 1 per position, requires direction correct + >60s remaining); ATR 1.0-2.0 → hold and monitor; ATR<1.0 (crypto near PTB) → immediate stop-loss at best_bid. New -25% hard stop: unconditional market sell regardless of ATR or direction. New direction flip emergency exit: when `direction_correct` transitions True→False, immediately liquidates all holdings including dip-bought shares. All thresholds configurable via env (`PRICE_DROP_TRIGGER`, `PRICE_DROP_HARD_STOP`, `ATR_SAFE_THRESHOLD`, `ATR_DANGER_THRESHOLD`, `DIP_BUY_SIZE_RATIO`, `DIP_BUY_MIN_REMAINING`). Preserves P0 hyperbolic take-profit, early tolerance window, P1 hedge, and Stage 2/3/4 graduated exit.
 
