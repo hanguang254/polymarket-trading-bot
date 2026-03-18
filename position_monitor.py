@@ -1694,9 +1694,10 @@ def monitor():
                 _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
                 atr_str = f"{diff_atr:.1f}ATR" if diff_atr else "N/A"
 
-                # --- 1. -25% 硬止损线（最高优先级，无条件）---
+                # --- 1. -25% 硬止损线（方向错误/未知时触发，方向正确交给ATR矩阵）---
                 if (current_price is not None and entry_price > 0
-                        and profit_rate <= -PRICE_DROP_HARD_STOP):
+                        and profit_rate <= -PRICE_DROP_HARD_STOP
+                        and direction_correct is not True):
                     print(f"  🚨 硬止损: {profit_rate*100:+.1f}%超过-{PRICE_DROP_HARD_STOP*100:.0f}% | {atr_str} | 剩余{remaining:.0f}s")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
