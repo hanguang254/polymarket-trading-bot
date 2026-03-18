@@ -474,14 +474,23 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     price_source = "unknown"
     bid_depth = None
 
+    sorted_asks_full = []  # 保留完整 asks 用于 FOK 深度感知滑点
     if book:
-        # best_ask
+        # best_ask + 倒挂校验
         if book.asks:
             from ai_trader.polymarket_api import normalize_orderbook
-            raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
-            _, sorted_asks = normalize_orderbook([], raw_asks)
-            if sorted_asks:
-                best_ask = float(sorted_asks[0]["price"])
+            raw_bids_chk = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
+            raw_asks_chk = [{"price": a.price, "size": a.size} for a in book.asks]
+            sorted_bids_chk, sorted_asks_full = normalize_orderbook(raw_bids_chk, raw_asks_chk)
+            # 倒挂校验：best_bid >= best_ask 说明数据异常
+            if sorted_bids_chk and sorted_asks_full:
+                _chk_bid = float(sorted_bids_chk[0]["price"])
+                _chk_ask = float(sorted_asks_full[0]["price"])
+                if _chk_bid >= _chk_ask:
+                    print(f"  ⚠️ 订单簿倒挂: bid=${_chk_bid:.2f} >= ask=${_chk_ask:.2f}，跳过best_ask")
+                    sorted_asks_full = []  # 清空，走 fallback
+            if sorted_asks_full:
+                best_ask = float(sorted_asks_full[0]["price"])
                 if 0.01 < best_ask < 0.99:
                     price = best_ask
                     price_source = "best_ask"
@@ -541,9 +550,38 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         p_win=p_win_final, kelly_reduction=kelly_reduction,
         exit_bid_depth=bid_depth
     )
-    
-    print(f"  💸 SDK下单: FOK BUY {size}@{price} token={token_id[:16]}...")
-    info = clob_client.place_fok_order(token_id, BUY, price, size)
+
+    # FOK 深度感知：遍历 asks 计算能覆盖 size 的限价，一次成交不重试
+    fok_price = price
+    if sorted_asks_full and price_source == "best_ask" and size > 0:
+        cumulative = 0.0
+        cover_price = price
+        MAX_SLIPPAGE = 0.05  # 最多允许 5 tick 滑点
+        for level in sorted_asks_full:
+            lv_price = float(level["price"])
+            lv_size = float(level["size"])
+            if lv_price > price + MAX_SLIPPAGE:
+                break
+            cumulative += lv_size
+            cover_price = lv_price
+            if cumulative >= size:
+                break
+        if cumulative >= size:
+            # 深度够：限价设到覆盖档位 + 1 tick 余量
+            fok_price = min(round(cover_price + 0.01, 2), MAX_PRICE - 0.01)
+            if fok_price > price:
+                print(f"  📡 FOK深度滑点: 覆盖{size}份需到${cover_price:.2f}，限价${price:.2f}→${fok_price:.2f}")
+        elif cumulative >= 5:
+            # 深度不够但≥5份：缩减 size + 限价到最远档
+            size = int(cumulative)
+            fok_price = min(round(cover_price + 0.01, 2), MAX_PRICE - 0.01)
+            print(f"  ⚠️ ask深度不足: 缩减为{size}份，限价${price:.2f}→${fok_price:.2f}")
+        else:
+            print(f"  ⚠️ ask深度极低({cumulative:.1f}<5)，跳过下注")
+            return False, 0, 0, "SKIP_NO_ASK_DEPTH"
+
+    print(f"  💸 SDK下单: FOK BUY {size}@{fok_price} token={token_id[:16]}...")
+    info = clob_client.place_fok_order(token_id, BUY, fok_price, size)
     output = info.get("raw", "")
 
     # FOK: matched=True 即全部成交，否则全部未成交（不会产生挂单）

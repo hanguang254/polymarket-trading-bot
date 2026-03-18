@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v8.3
+# Polymarket Trading Bot v9.0
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -20,6 +20,9 @@ The bot uses Bayesian sequential updating to detect directional signals, enters 
 100s  Late bet window opens (standard thresholds)
 160s  Late bet window closes → Real-time EV monitoring starts
       ── Exit Protocol ──
+>30s  -25% hard stop: unconditional market sell
+>30s  Direction flip (True→False): emergency liquidation
+>30s  Token drop ≥15%: ATR ≥2.0 → dip-buy 50% / ATR 1.0-2.0 → hold / ATR <1.0 → stop-loss
 >30s  Universal stop-loss: direction wrong → market-price ladder sell
 >30s  P1 hedge: bid < $0.05 → buy opposite token for $1 pair
 >90s  P0 take-profit: hyperbolic discounting threshold
@@ -64,16 +67,24 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
 
 ### Exit (P0-P1 + P4)
+- **-25% Hard Stop**: When token drops ≥25% from entry price, unconditional market sell regardless of ATR or direction. Absolute floor to prevent catastrophic loss.
+- **Direction Flip Emergency Exit**: Tracks `direction_correct` state across cycles. When flipping from `True→False`, immediately liquidates all holdings (including any dip-bought shares). Last line of defense against late reversals.
+- **ATR 3-Layer Decision Matrix**: When token drops ≥15% (`PRICE_DROP_TRIGGER`), action depends on ATR deviation (crypto distance from PTB in ATR units):
+  - **ATR ≥ 2.0** (safe zone): 🟢 Dip-buy — adds 50% of original position at best_ask via FOK. Requires: direction correct, remaining > 60s, max 1 dip-buy per position. Averages down cost basis for higher profit if direction holds.
+  - **ATR 1.0-2.0** (uncertain): 🟡 Hold — no action, continue monitoring. ATR rising → enters safe zone, ATR falling → enters danger zone.
+  - **ATR < 1.0** (danger zone): 🔴 Stop-loss — immediate sell at best_bid. Crypto is too close to PTB, direction likely to flip.
 - **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.20) and `P0_HYPERBOLIC_K` (default 0.15). P0 sells at entry_price (guaranteed fill) instead of best_bid.
 - **Market-Price Immediate Stop-Loss**: `market_sell_immediate()` cancels existing orders first (prevents balance lock), then ladder sells at bid→95%→90%→80%→$0.05→$0.01 (~6s to clear). On "not enough balance / allowance" error with confirmed on-chain balance, auto-refreshes allowance and retries before falling back to reduced-size attempts.
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
-- **EV-Driven Diamond Hands**: Direction correct + ≤120s remaining → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥1.0, capped at 2.0) → hold to settlement. Weak EV (0~0.03) → releases to Stage 3/4 fine-grained EV strategy. Early exit requires both EV < -3% AND ATR < 1.0 (dual condition).
+- **EV-Driven Diamond Hands**: Direction correct + token drop < 15% → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥ time-decayed threshold) → hold to settlement. Weak signal → releases to Stage 2/3/4 for fine-grained exit.
 - **Direction-Based Exit**: Uses crypto price vs PTB to determine win/loss (not token orderbook price, which can be misleading due to wide bid-ask spreads near settlement).
+  - Token drop ≥ 25% → **-25% hard stop** (unconditional)
+  - Direction flips True→False → **Emergency liquidation**
+  - Token drop ≥ 15% → **ATR 3-layer decision** (dip-buy / hold / stop-loss)
   - Direction correct + EV > 0.03 or strong ATR → **hold to settlement** ($1.00)
   - Direction correct but weak signal → releases to stage exit strategy
   - Direction wrong → **Universal market-price stop-loss** (immediate ladder sell)
   - No buyers (bid < $0.05) → Attempt hedge (P1), fall back to wait for expiry
-  - Safety: direction correct but token drops >10% → downgrade to "unknown", trigger stop-loss
 - **Wide Spread Protection**: `get_market_price()` detects bid-ask spread > 50% and falls back to midpoint API → `last-trade-price` → single-side price, preventing false loss signals.
 - **Empty Book Fallback (Monitor)**: `get_best_bid()` / `get_best_ask()` fall back to `last-trade-price ± SLIPPAGE` when CLOB is empty (bid ≤ 0.02 or ask ≥ 0.95). Enables hedge and stop-loss decisions with real market prices instead of $0.01/$0.99.
 - **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
@@ -153,6 +164,9 @@ Layer 2 — Position Sizing
   └─ Balance constraints (10-20% of balance)
 
 Layer 3 — Position Management
+  ├─ -25% hard stop: unconditional market sell (PRICE_DROP_HARD_STOP)
+  ├─ Direction flip emergency exit: True→False → immediate liquidation
+  ├─ ATR 3-layer decision: ≥15% drop → dip-buy (ATR≥2) / hold (1-2) / stop-loss (ATR<1)
   ├─ P0: Hyperbolic discounting profit-take (entry_price sell for guaranteed fill)
   ├─ P1: Opposite token hedge (bid < $0.05 → buy opposite for $1 pair)
   ├─ Market-price immediate stop-loss (cancel first, then ladder sell)
@@ -262,6 +276,12 @@ See `.env.example` for all configurable parameters:
 | `PENDING_ORDER_TTL` | No | Max wait for LIVE orders before cancel (default: 120s) |
 | `EARLY_EXIT_RATIO` | No | Probability of early exit for spread cost calc (default: 0.3) |
 | `PENDING_MIN_FILL` | No | Min filled size to record position (default: 0.5) |
+| `PRICE_DROP_TRIGGER` | No | Token drop % to trigger ATR decision (default: 0.15 = 15%) |
+| `PRICE_DROP_HARD_STOP` | No | Unconditional hard stop-loss % (default: 0.25 = 25%) |
+| `ATR_SAFE_THRESHOLD` | No | ATR deviation ≥ this = safe zone, dip-buy (default: 2.0) |
+| `ATR_DANGER_THRESHOLD` | No | ATR deviation < this = danger zone, stop-loss (default: 1.0) |
+| `DIP_BUY_SIZE_RATIO` | No | Dip-buy amount as ratio of original position (default: 0.50) |
+| `DIP_BUY_MIN_REMAINING` | No | Min remaining seconds to allow dip-buy (default: 60) |
 
 ### Running
 
@@ -309,6 +329,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.0**: ATR 3-layer stop-loss redesign — Replaces old Token crash circuit breaker (60% drop) and late-loss circuit breaker (30%+wrong direction) with ATR-deviation-based decision matrix. When token drops ≥15% from entry: ATR≥2.0 (crypto far from PTB) → dip-buy 50% of original position at best_ask via FOK (max 1 per position, requires direction correct + >60s remaining); ATR 1.0-2.0 → hold and monitor; ATR<1.0 (crypto near PTB) → immediate stop-loss at best_bid. New -25% hard stop: unconditional market sell regardless of ATR or direction. New direction flip emergency exit: when `direction_correct` transitions True→False, immediately liquidates all holdings including dip-bought shares. All thresholds configurable via env (`PRICE_DROP_TRIGGER`, `PRICE_DROP_HARD_STOP`, `ATR_SAFE_THRESHOLD`, `ATR_DANGER_THRESHOLD`, `DIP_BUY_SIZE_RATIO`, `DIP_BUY_MIN_REMAINING`). Preserves P0 hyperbolic take-profit, early tolerance window, P1 hedge, and Stage 2/3/4 graduated exit.
 
 - **v8.4**: Fast stop-loss + FOK entry + late-loss circuit breaker — HTTP timeout reduced from 5s to 3s (`FOK_TIMEOUT` env, saves 2s per failed order during stop-loss). Entry orders switched from GTC limit to FOK (fill-or-kill): no more pending/LIVE orders, either instant fill or instant fail. FOK orders now auto-retry on HTTP 425. `sell_position` adds ghost fill detection after FOK timeout (checks on-chain balance before retry). All 7 NO_BALANCE code paths now send Telegram notification (previously silently closed). New late-loss circuit breaker: when remaining ≤120s + direction wrong + loss >30% (`LATE_LOSS_THRESHOLD` env) → force immediate market sell (early stage skipped to avoid false triggers from thin liquidity). Token crash threshold adjusted: 50%→40% drop, absolute price check now relative to entry (50% of entry_price instead of fixed $0.10).
 - **v8.3**: Balance unit fix + ghost fill detection fix — `get_balance()` and `get_token_balance()` now divide API response by 1e6 (Polymarket returns atomic USDC/token units with 6 decimals). Previously raw balance ~57M fed into Kelly produced `$1.7M dollar_amount` → always clamped to MAX_BET. Kelly sizing now works correctly with real dollar balance. Stop-loss ghost fill detection no longer bypassed on "not enough balance / allowance" errors — all FOK ERROR status now triggers on-chain balance recheck (~100ms, saves 3-4s of useless retries when tokens already sold). Added logging for allowance-refresh retry failures. Added post-reduction-loop final balance recheck as ghost fill safety net.

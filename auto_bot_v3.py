@@ -222,7 +222,12 @@ def get_realtime_odds(up_token, down_token):
                 if bids and asks:
                     best_bid = float(bids[0]["price"])
                     best_ask = float(asks[0]["price"])
-                    if best_bid > 0 and best_ask > 0:
+                    if best_bid >= best_ask:
+                        logger.warning(f"  ⚠️ {label} 订单簿倒挂: bid=${best_bid:.2f} >= ask=${best_ask:.2f}，丢弃")
+                        result[f"{prefix}_bid"] = None
+                        result[f"{prefix}_ask"] = None
+                        result[f"{prefix}_mid"] = None
+                    elif best_bid > 0 and best_ask > 0:
                         result[f"{prefix}_mid"] = round((best_bid + best_ask) / 2, 4)
                 elif asks:
                     result[f"{prefix}_mid"] = result[f"{prefix}_ask"]
@@ -762,8 +767,14 @@ class MarketTracker:
             # API时序错误（市场未开始接单），不计为交易失败
             logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
         else:
-            logger.error(f"  ❌ 下注失败: {output[:150]}")
-            record_bet_result(False, slug)
+            output_str = str(output) if output else ""
+            if "fully filled" in output_str or "FOK" in output_str:
+                logger.warning(f"  ⚠️ FOK未成交（流动性不足），跳过（不计入统计）")
+            elif "Request exception" in output_str or "status_code=None" in output_str:
+                logger.warning(f"  ⚠️ 网络超时，跳过（不计入统计）: {output_str[:80]}")
+            else:
+                logger.error(f"  ❌ 下注失败: {output_str[:150]}")
+                record_bet_result(False, slug)
         
         logger.info(f"  📊 {get_state_summary()}")
         print(f"{'='*60}\n")
