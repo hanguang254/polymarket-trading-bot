@@ -86,7 +86,7 @@ def send_telegram(text):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except:
+    except Exception:
         pass
 
 def get_open_positions():
@@ -113,7 +113,7 @@ def _get_orderbook_bids_asks(token_id):
             raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
             raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
             return normalize_orderbook(raw_bids, raw_asks)
-    except:
+    except Exception:
         pass
     return [], []
 
@@ -131,7 +131,7 @@ def get_market_price(token_id):
             mid = (best_bid + best_ask) / 2
             if mid > 0 and spread / mid < 0.50:
                 return round(mid, 4)
-    except:
+    except Exception:
         pass
     # 方案2：SDK midpoint
     mid = clob_client.get_midpoint(token_id)
@@ -142,8 +142,6 @@ def get_market_price(token_id):
     if ltp:
         return ltp
     # 方案4：只有 bid 或 ask
-    if best_bid and best_ask:
-        return round((best_bid + best_ask) / 2, 4)
     if best_bid:
         return best_bid
     if best_ask:
@@ -158,7 +156,7 @@ def get_best_bid_raw(token_id):
             best_bid = float(bids[0]['price'])
             if best_bid > 0.02:
                 return best_bid
-    except:
+    except Exception:
         pass
     ltp = get_last_trade_price(token_id)
     if ltp:
@@ -175,7 +173,7 @@ def get_best_bid(token_id):
             best_bid = float(bids[0]['price'])
             if best_bid > 0.02:
                 return best_bid * 0.99
-    except:
+    except Exception:
         pass
     ltp = get_last_trade_price(token_id)
     if ltp:
@@ -192,7 +190,7 @@ def get_best_ask(token_id):
             ask = float(asks[0]['price'])
             if ask < 0.95:
                 return ask
-    except:
+    except Exception:
         pass
     ltp = get_last_trade_price(token_id)
     if ltp:
@@ -278,39 +276,6 @@ def find_optimal_price(liquidity, target_size):
     
     return best_bid * 0.95
 
-def parse_order_output(output):
-    """解析CLI订单输出，提取成交状态和实际价格"""
-    info = {
-        "status": None,
-        "matched": False,
-        "making": 0,
-        "taking": 0,
-        "order_id": None,
-        "success": None,
-    }
-    for line in output.strip().split("\n"):
-        line = line.strip()
-        lower = line.lower()
-        if lower.startswith("order id:") or lower.startswith("order_id:"):
-            info["order_id"] = line.split(":", 1)[1].strip()
-        elif lower.startswith("success:"):
-            val = line.split(":", 1)[1].strip().lower()
-            if val in ("true", "false"):
-                info["success"] = val == "true"
-        elif line.startswith("Status:"):
-            info["status"] = line.split(":", 1)[1].strip()
-            info["matched"] = info["status"] == "MATCHED"
-        elif line.startswith("Making:"):
-            try:
-                info["making"] = float(line.split(":", 1)[1].strip())
-            except:
-                pass
-        elif line.startswith("Taking:"):
-            try:
-                info["taking"] = float(line.split(":", 1)[1].strip())
-            except:
-                pass
-    return info
 
 def _check_and_adjust_size(token_id, size):
     """校验链上真实余额，返回调整后的 size。
@@ -349,8 +314,8 @@ def market_sell_immediate(token_id, size, price=None):
     if adjusted is not None:
         size = adjusted
 
-    # 止损直接地板价：CLOB按最高bid撮合，$0.01=市价卖出，省掉试探延迟
-    sell_price = 0.01
+    # 优先用调用方传入的 best_bid，否则地板价（CLOB按最高bid撮合）
+    sell_price = round(price, 2) if price and price > 0.01 else 0.01
 
     print(f"    ⚡ FOK止损: 地板价${sell_price:.2f}(按最高bid撮合)")
 
@@ -549,7 +514,7 @@ def get_market_end_time(slug):
         if len(parts) >= 4:
             timestamp = int(parts[-1])
             return timestamp + 300  # 5分钟市场
-    except:
+    except Exception:
         pass
     return None
 
@@ -602,7 +567,7 @@ def check_market_closed(slug):
                         market = markets[0]
                         if isinstance(market, dict):
                             return market.get("closed", False)
-    except:
+    except Exception:
         pass
     return False
 
@@ -643,7 +608,7 @@ def get_market_outcome(slug, direction):
                                             return 1.00 if direction == "DOWN" else 0.00
                                 except (ValueError, TypeError):
                                     pass
-    except:
+    except Exception:
         pass
     return None
 
@@ -658,7 +623,7 @@ def get_current_crypto_price(coin):
         if resp.status_code == 200:
             data = resp.json()
             return float(data["price"])
-    except:
+    except Exception:
         pass
     return None
 
@@ -674,7 +639,7 @@ def get_ptb_from_slug(slug):
         )
         if result.returncode == 0:
             return float(result.stdout.strip())
-    except:
+    except Exception:
         pass
     return None
 
@@ -698,7 +663,7 @@ def get_atr_from_binance(coin, period=14):
                 trs.append(tr)
             if trs:
                 return sum(trs) / len(trs)
-    except:
+    except Exception:
         pass
     return None
 
@@ -773,16 +738,6 @@ def execute_dip_buy(token_id, original_size, coin, slug, pos):
     except Exception as e:
         print(f"    ❌ 抄底异常: {str(e)[:80]}")
         return False, 0, None
-
-
-    time_factor = remaining_seconds / 60.0
-    threshold = base_profit * (1.0 + hyperbolic_k * time_factor)
-    # 适配昂贵token：阈值不能超过最大可能利润的80%
-    # 入场价0.82时最大利润21.9%，若阈值26%则永远无法触发止盈
-    if entry_price and entry_price > 0:
-        max_possible_profit = (1.0 - entry_price) / entry_price
-        threshold = min(threshold, max_possible_profit * 0.80)
-    return threshold
 
 def should_attempt_stop_loss(direction_correct):
     return direction_correct is False
@@ -1313,7 +1268,7 @@ def check_balance_changed(token_id, expected_size):
         if balance is not None:
             threshold = max(0.01, expected_size * 0.01)
             return balance <= threshold
-    except:
+    except Exception:
         pass
     return False
 
@@ -1390,7 +1345,8 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5):
 def sell_in_batches(token_id, total_size, base_price):
     """分批出货 - 确保全部卖完"""
     if total_size <= 5:
-        return sell_and_confirm(token_id, total_size, base_price, timeout_sec=3)
+        success, actual = sell_and_confirm(token_id, total_size, base_price, timeout_sec=3)
+        return success, total_size if success else 0, actual if success else None
     
     # 分3批
     batches = [
@@ -1520,7 +1476,7 @@ def monitor():
                         continue
 
                     # -30s ~ 0s：等待结算并检查市场关闭
-                    if int(-remaining) % 10 == 0:
+                    if int(-remaining) % 10 < 3:
                         print(f"  ⏳ {slug} 已关闭，等待结算 | 过期{-remaining:.0f}s")
 
                     if check_market_closed(slug):
