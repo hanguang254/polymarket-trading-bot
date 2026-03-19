@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.3
+# Polymarket Trading Bot v9.4
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -12,7 +12,7 @@ The bot uses Bayesian sequential updating to detect directional signals, enters 
 
 ```
 0s    Market starts
-2s    PTB acquisition (Playwright → HTML → Gamma API fallback)
+2s    PTB acquisition (Playwright only, no fallback — skip if unavailable)
 20s   Bayesian warmup (5s intervals, 3s after 80s)
 40s   PTB deadline
 90s   Early bet window opens (lower thresholds, CLOB mispricing)
@@ -104,7 +104,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
-- **Playwright Smart Degradation**: Skip browser PTB after 3 consecutive failures
+- **Playwright PTB (No Fallback)**: PTB only from Playwright subprocess. HTML/Gamma API fallbacks removed (returned wrong market's PTB). Skip browser PTB after 3 consecutive failures.
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
 - **Auto Redeem**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`), shows USDC balance after each round
@@ -185,7 +185,7 @@ Layer 3 — Position Management
 
 Layer 4 — System Protection
   ├─ Max open positions: 2 (configurable)
-  ├─ Daily loss limit: $10 (configurable)
+  ├─ Daily loss limit: $10 (thread-safe, pre-deducted cost on entry, settled on close)
   ├─ Circuit breaker: 5 failures → 300s pause
   ├─ Loss cooldown: 3 periods after failed bet
   └─ Min balance check: $5
@@ -339,6 +339,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.4**: MAX_DAILY_LOSS风控修复 + PTB去兜底 — Daily loss limit now thread-safe with `threading.Lock`, checked at the top of `analyze_and_trade()` (before any analysis/betting), preventing parallel BTC/ETH threads from both passing the check simultaneously. Bet cost pre-deducted to `daily_pnl` on entry (worst-case full loss), settled with actual PnL on position close via `settle_bet_cost()`. Dip-buy (`execute_dip_buy`) also checks daily loss limit before adding. PTB fallback layers (HTML scraper + Gamma API) removed — they returned wrong market's PTB on Playwright timeout (e.g., $73,934 from a different 5-min window instead of $71,193). Now Playwright-only: fail → skip market, no false PTB.
 
 - **v9.3**: PTB Proximity Buffer + consecutive confirmation stop-loss — When crypto price is near PTB (within configurable ATR threshold), direction signal is unreliable noise. New proximity buffer freezes `direction_correct = True`, suppressing all direction-based stop-losses (hard stop, direction flip, ATR danger, full-time wrong). Threshold decays with time: 0.7 ATR (first 2min) → 0.3 ATR (mid) → 0.15 ATR (last 1min). Extreme safety valve at -50% token drop. Direction flip (True→False) now requires consecutive confirmation rounds (2 for ATR<1.5, 1 for ATR≥1.5) instead of instant liquidation — prevents single-poll price fluctuation from triggering premature exits. Full-time direction-wrong stop-loss also requires streak confirmation (3 rounds for ATR<1.0, 2 for ATR<1.5, 1 for larger deviations). Bug fix: `prev_direction_correct` now preserved during pending confirmation to prevent #2 trigger from becoming dead code. New env: `PTB_PROXIMITY_ATR` (default 0.7), `PTB_PROXIMITY_EXTREME_STOP` (default 0.50).
 
