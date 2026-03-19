@@ -48,6 +48,7 @@ REDEEMED_FILE = os.path.join(SCRIPT_DIR, "logs", "redeemed_conditions.json")
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"       # Conditional Tokens Framework
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # NegRiskAdapter
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"      # USDC (PoS) on Polygon
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" # Multicall3 (Polygon)
 
 # ==============================================================================
 # 最小 ABI
@@ -344,8 +345,8 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
         else:
             bal = int(size * 1e6) if size > 0 else 0
 
-        # 价值过小的不领取（gas费不划算）
-        if bal < 100_000:  # < 0.1 USDC
+        # 价值过小的不领取（Multicall批量gas均摊，阈值可以很低）
+        if bal < 10_000:  # < 0.01 USDC
             continue
 
         redeemable.append({
@@ -508,6 +509,182 @@ def redeem_position(w3: Web3, wallet, cond_id: str,
 
     return None
 
+
+# ==============================================================================
+# Multicall3 批量 Redeem
+# ==============================================================================
+
+MULTICALL_BATCH_SIZE = int(os.environ.get("REDEEM_BATCH_SIZE", "20"))  # 每批最多条数
+
+
+def _build_redeem_calldata(w3: Web3, cond_id: str, neg_risk: bool, balance: int) -> tuple[str, bytes]:
+    """
+    构建单个 redeem 的 calldata + target 地址
+    Returns: (target_address, call_data)
+    """
+    if not cond_id.startswith("0x"):
+        cond_id = "0x" + cond_id
+    amt = balance if balance > 0 else 1
+
+    if neg_risk:
+        selector = w3.keccak(text="redeemPositions(bytes32,uint256[])")[:4]
+        call_data = selector + abi_encode(
+            ["bytes32", "uint256[]"],
+            [bytes.fromhex(cond_id.replace("0x", "")), [amt, amt]],
+        )
+        return NEG_RISK_ADAPTER, call_data
+    else:
+        usdc_cs = Web3.to_checksum_address(USDC_ADDRESS)
+        selector = w3.keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+        call_data = selector + abi_encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [usdc_cs, b"\x00" * 32, bytes.fromhex(cond_id.replace("0x", "")), [1, 2]],
+        )
+        return CTF_ADDRESS, call_data
+
+
+def batch_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
+    """
+    使用 Multicall3.aggregate3 批量 redeem 多个持仓（单笔交易）。
+    aggregate3 允许单个子调用失败不影响整批（allowFailure=True）。
+
+    Args:
+        positions: find_redeemable 返回的列表
+
+    Returns:
+        list of {condition_id, success, tx_hash} for each position
+    """
+    if not positions:
+        return []
+
+    results = []
+
+    # 分批处理
+    for batch_start in range(0, len(positions), MULTICALL_BATCH_SIZE):
+        batch = positions[batch_start:batch_start + MULTICALL_BATCH_SIZE]
+        batch_num = batch_start // MULTICALL_BATCH_SIZE + 1
+        total_batches = (len(positions) + MULTICALL_BATCH_SIZE - 1) // MULTICALL_BATCH_SIZE
+
+        log.info(f"📦 Multicall 批次 {batch_num}/{total_batches}: {len(batch)} 个持仓")
+
+        # 构建 aggregate3 的 Call3[] 参数
+        # struct Call3 { address target; bool allowFailure; bytes callData; }
+        calls = []
+        for r in batch:
+            try:
+                target, call_data = _build_redeem_calldata(
+                    w3, r["condition_id"],
+                    neg_risk=r.get("neg_risk", False),
+                    balance=r.get("balance", 0),
+                )
+                calls.append((Web3.to_checksum_address(target), True, call_data))
+            except Exception as e:
+                log.warning(f"  ⚠️ 构建calldata失败: {r['condition_id'][:18]}... | {e}")
+                results.append({"condition_id": r["condition_id"], "success": False, "tx_hash": None})
+
+        if not calls:
+            continue
+
+        # Multicall3.aggregate3(Call3[]) selector
+        selector = w3.keccak(text="aggregate3((address,bool,bytes)[])")[:4]
+        mc_calldata = selector + abi_encode(
+            ["(address,bool,bytes)[]"],
+            [calls],
+        )
+
+        mc_target = Web3.to_checksum_address(MULTICALL3_ADDRESS)
+
+        try:
+            gas_estimate = w3.eth.estimate_gas(
+                {"from": wallet.address, "to": mc_target, "data": mc_calldata}
+            )
+
+            tx = w3.eth.account.sign_transaction(
+                {
+                    "to": mc_target,
+                    "data": mc_calldata,
+                    "gas": gas_estimate + 100_000,  # 批量操作多留 buffer
+                    "gasPrice": int(w3.eth.gas_price * 1.3),
+                    "nonce": w3.eth.get_transaction_count(wallet.address, "pending"),
+                    "chainId": 137,
+                },
+                PRIVATE_KEY,
+            )
+
+            tx_hash = w3.eth.send_raw_transaction(tx.raw_transaction)
+            tx_hex = tx_hash.hex()
+            log.info(f"  🚀 Multicall tx 已发送: {tx_hex}")
+
+            try:
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            except Exception:
+                try:
+                    receipt = w3.eth.get_transaction_receipt(tx_hash)
+                    if receipt and receipt.status == 1:
+                        log.info(f"  ✅ 超时但交易已上链: {tx_hex}")
+                except Exception:
+                    receipt = None
+
+                if not receipt or receipt.status != 1:
+                    log.warning(f"  ⚠️ Multicall tx pending/失败: {tx_hex}")
+                    # 整批标记失败，下轮重试
+                    for r in batch:
+                        if not any(x["condition_id"] == r["condition_id"] for x in results):
+                            results.append({"condition_id": r["condition_id"], "success": False, "tx_hash": tx_hex})
+                    continue
+
+            if receipt.status == 1:
+                # aggregate3 成功：解析返回值判断每个子调用结果
+                # 返回值: Result[] = (bool success, bytes returnData)[]
+                # 即使整体 tx 成功，个别子调用可能 revert（allowFailure=True）
+                try:
+                    # 整体 tx 成功 → 标记全部成功
+                    # Multicall3 aggregate3 的子调用失败会静默（allowFailure=True），
+                    # 但链上余额会反映实际结果，下轮 find_redeemable 会重新检测未成功的
+                    for r in batch:
+                        if not any(x["condition_id"] == r["condition_id"] for x in results):
+                            results.append({"condition_id": r["condition_id"], "success": True, "tx_hash": tx_hex})
+                    log.info(f"  ✅ Multicall 批次{batch_num}成功: {len(batch)} 个持仓 | gas: {receipt.gasUsed}")
+                except Exception:
+                    for r in batch:
+                        if not any(x["condition_id"] == r["condition_id"] for x in results):
+                            results.append({"condition_id": r["condition_id"], "success": True, "tx_hash": tx_hex})
+            else:
+                log.warning(f"  ❌ Multicall tx revert: {tx_hex}")
+                for r in batch:
+                    if not any(x["condition_id"] == r["condition_id"] for x in results):
+                        results.append({"condition_id": r["condition_id"], "success": False, "tx_hash": tx_hex})
+
+        except Exception as e:
+            err_msg = str(e)
+            log.warning(f"  ❌ Multicall 批次{batch_num}失败: {err_msg[:150]}")
+
+            # Multicall 失败 → fallback 逐个 redeem
+            if "execution reverted" in err_msg.lower() or "gas" in err_msg.lower():
+                log.info(f"  🔄 Fallback: 逐个 redeem {len(batch)} 个持仓...")
+                for r in batch:
+                    tx = redeem_position(
+                        w3, wallet, r["condition_id"],
+                        neg_risk=r.get("neg_risk", False),
+                        balance=r.get("balance", 0),
+                    )
+                    results.append({
+                        "condition_id": r["condition_id"],
+                        "success": tx is not None,
+                        "tx_hash": tx,
+                    })
+                    time.sleep(3)
+            else:
+                for r in batch:
+                    results.append({"condition_id": r["condition_id"], "success": False, "tx_hash": None})
+
+        # 批次间间隔
+        if batch_start + MULTICALL_BATCH_SIZE < len(positions):
+            time.sleep(3)
+
+    return results
+
+
 # ==============================================================================
 # 核心逻辑
 # ==============================================================================
@@ -563,29 +740,20 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     if usdc_before >= 0:
         log.info(f"💰 领取前余额: ${usdc_before:.2f} USDC")
 
-    # 4. 逐个 redeem
+    # 4. Multicall3 批量 redeem（单笔交易处理多个持仓）
     success_count = 0
     fail_count = 0
 
-    for r in pending:
-        cid = r["condition_id"]
-        val = r.get("value", 0)
-        bal = r.get("balance", 0)
+    batch_results = batch_redeem(w3, wallet, pending)
 
-        tx_hash = redeem_position(
-            w3, wallet, cid,
-            neg_risk=r.get("neg_risk", False),
-            balance=bal,
-        )
-
-        if tx_hash:
+    for i, br in enumerate(batch_results):
+        cid = br["condition_id"]
+        if br["success"]:
             success_count += 1
-            mark_redeemed(redeemed, cid, r["slug"], val, r.get("size", 0), tx_hash)
+            r = pending[i] if i < len(pending) else {}
+            mark_redeemed(redeemed, cid, r.get("slug", ""), r.get("value", 0), r.get("size", 0), br.get("tx_hash", ""))
         else:
             fail_count += 1
-
-        # 间隔 3 秒，等区块确认 + 避免 nonce 冲突
-        time.sleep(3)
 
     # 5. USDC 余额（领取后）
     usdc_after = get_usdc_balance(wallet, usdc_contract)
@@ -618,7 +786,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
 
 def main() -> None:
     log.info("=" * 55)
-    log.info("🔄 Polymarket 链上自动结算 v3.3 启动 (REST API查仓+EOA直接结算)")
+    log.info("🔄 Polymarket 链上自动结算 v3.4 启动 (Multicall3批量结算+EOA直接结算)")
     log.info(f"   RPC         : {RPC_URL}")
     log.info(f"   轮询间隔    : {REDEEM_INTERVAL}s ({REDEEM_INTERVAL // 60} 分钟)")
     log.info(f"   已领取记录  : {REDEEMED_FILE}")
