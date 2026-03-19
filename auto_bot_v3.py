@@ -126,7 +126,7 @@ def get_ptb_multi_strategy(slug):
             t0 = time.time()
             result = subprocess.run(
                 [sys.executable, ptb_script, slug],
-                capture_output=True, text=True, timeout=15
+                capture_output=True, text=True, timeout=20
             )
             elapsed = time.time() - t0
             if result.returncode == 0 and result.stdout:
@@ -147,7 +147,7 @@ def get_ptb_multi_strategy(slug):
                 logger.warning(f"   Playwright PTB 无结果({_playwright_failures}/3) | {elapsed:.1f}s")
         except subprocess.TimeoutExpired:
             _playwright_failures += 1
-            logger.warning(f"   Playwright PTB 超时(15s)({_playwright_failures}/3)")
+            logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures}/3)")
         except Exception as e:
             _playwright_failures += 1
             err_msg = str(e)[:80]
