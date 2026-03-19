@@ -158,28 +158,7 @@ def get_ptb_multi_strategy(slug):
     else:
         logger.info(f"   跳过 Playwright（连续失败{_playwright_failures}次）")
 
-    # 2. 网页 HTML 抓取（requests + regex，无需浏览器，速度快）
-    try:
-        from ai_trader.polymarket_api import get_price_to_beat_browser
-        ptb = get_price_to_beat_browser(slug)
-        if ptb:
-            return ptb
-    except Exception as e:
-        logger.warning(f"   HTML PTB 失败: {e}")
-
-    # 3. Gamma API（最不可靠，eventMetadata 经常为空）
-    try:
-        resp = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
-        if resp.status_code == 200:
-            events = resp.json()
-            if events:
-                meta = events[0].get("eventMetadata", {})
-                ptb = meta.get("priceToBeat")
-                if ptb:
-                    return float(ptb)
-    except Exception as e:
-        logger.warning(f"   Gamma API PTB 失败: {e}")
-
+    # Playwright 获取不到就跳过，不使用兜底（HTML/Gamma容易抓到错误PTB）
     return None
 
 
