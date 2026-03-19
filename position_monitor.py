@@ -78,6 +78,19 @@ ATR_DANGER_THRESHOLD = float(os.environ.get("ATR_DANGER_THRESHOLD", "1.0"))
 DIP_BUY_SIZE_RATIO = float(os.environ.get("DIP_BUY_SIZE_RATIO", "0.50"))
 DIP_BUY_MIN_REMAINING = float(os.environ.get("DIP_BUY_MIN_REMAINING", "60"))
 
+# PTB Proximity Buffer（临近PTB时冻结方向信号，防止噪音触发止损）
+PTB_PROXIMITY_ATR = float(os.environ.get("PTB_PROXIMITY_ATR", "0.7"))
+PTB_PROXIMITY_EXTREME_STOP = float(os.environ.get("PTB_PROXIMITY_EXTREME_STOP", "0.50"))
+
+def calc_proximity_threshold(remaining):
+    """proximity zone 宽度随时间衰减：越接近到期 buffer 越窄"""
+    if remaining > 180:
+        return PTB_PROXIMITY_ATR           # 0.7 ATR（前2分钟完整buffer）
+    elif remaining > 60:
+        return 0.3 + 0.4 * (remaining - 60) / 120  # 0.7→0.3 线性衰减
+    else:
+        return 0.15                        # 最后1分钟极窄
+
 # 链上余额预缓存（止损时避免临时查链增加延迟）
 # {token_id: (balance, timestamp)}
 _balance_cache = {}
@@ -1465,9 +1478,10 @@ def monitor():
     # 启动 Polymarket WebSocket 实时 orderbook 流
     _poly_ws.start()
     _ws_subscribed = set()  # 已订阅的 token_ids
-    print("🔍 持仓监控 v9 启动（ATR三层决策 + 抄底 + 硬止损 + 方向翻转退出 + WS实时orderbook）...")
-    print("   Exit Protocol: P0双曲止盈 | -25%硬止损 | 方向翻转清仓 | ATR≥2抄底 | ATR<1止损")
+    print("🔍 持仓监控 v9.1 启动（ATR三层决策 + PTB Proximity Buffer + 连续确认止损）...")
+    print("   Exit Protocol: P0双曲止盈 | -25%硬止损 | 方向翻转(连续确认) | ATR≥2抄底 | ATR<1止损")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
+    print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%")
 
     close_attempts = {}  # (slug, entry_time) -> attempts count
     stop_loss_attempts = {}  # (slug, entry_time) -> stop loss attempts
@@ -1475,6 +1489,7 @@ def monitor():
     dip_bought = {}  # (slug, entry_time) -> True if already dip-bought
     prev_direction_correct = {}  # (slug, entry_time) -> last known direction_correct
     tp_fail_count = {}  # (slug, entry_time) -> 连续止盈失败次数
+    direction_wrong_streak = {}  # (slug, entry_time) -> 连续方向错误轮数（proximity zone外用）
     
     while True:
         try:
@@ -1492,6 +1507,7 @@ def monitor():
             dip_bought = {k: v for k, v in dip_bought.items() if k in open_keys}
             prev_direction_correct = {k: v for k, v in prev_direction_correct.items() if k in open_keys}
             tp_fail_count = {k: v for k, v in tp_fail_count.items() if k in open_keys}
+            direction_wrong_streak = {k: v for k, v in direction_wrong_streak.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -1566,6 +1582,7 @@ def monitor():
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                         continue
 
                     # -30s ~ 0s：等待结算并检查市场关闭
@@ -1590,6 +1607,7 @@ def monitor():
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                     continue
                 
                 # PTB 在下注时已记录，直接从持仓数据读取
@@ -1719,6 +1737,7 @@ def monitor():
                                     tp_state.pop(attempt_key, None)
                                     dip_bought.pop(attempt_key, None)
                                     tp_fail_count.pop(attempt_key, None)
+                                    direction_wrong_streak.pop(attempt_key, None)
                                     continue
                                 elif actual == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
@@ -1729,6 +1748,7 @@ def monitor():
                                     tp_state.pop(attempt_key, None)
                                     dip_bought.pop(attempt_key, None)
                                     tp_fail_count.pop(attempt_key, None)
+                                    direction_wrong_streak.pop(attempt_key, None)
                                     continue
                                 else:
                                     # 止盈卖出失败，累计失败次数
@@ -1759,6 +1779,27 @@ def monitor():
                     print(f"  ⚠️ 方向降级: 方向✅但ATR={diff_atr:.2f}<{ATR_DOWNGRADE_THRESHOLD}(逼近strike) + 跌{profit_rate*100:+.1f}% → 视为方向❌")
                     direction_correct = False
 
+                # --- PTB Proximity Buffer: crypto在PTB附近时冻结方向信号 ---
+                in_proximity = False
+                if diff_atr is not None and crypto_price and ptb_price:
+                    prox_threshold = calc_proximity_threshold(remaining)
+                    in_proximity = diff_atr < prox_threshold
+
+                    if in_proximity and direction_correct is False:
+                        # 极端安全阀：proximity zone 内 token 跌超50% → 不保护
+                        if profit_rate <= -PTB_PROXIMITY_EXTREME_STOP:
+                            print(f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<{prox_threshold:.2f} 但跌{profit_rate*100:+.1f}%>{-PTB_PROXIMITY_EXTREME_STOP*100:.0f}% → 不冻结")
+                            in_proximity = False
+                        else:
+                            print(f"  🔶 PTB临近区: {diff_atr:.2f}ATR<{prox_threshold:.2f} | 方向冻结✅ | 剩余{remaining:.0f}s")
+                            direction_correct = True  # 冻结方向，信任原始bet
+
+                # --- 更新方向错误连续计数（proximity zone外使用）---
+                if direction_correct is False and not in_proximity:
+                    direction_wrong_streak[attempt_key] = direction_wrong_streak.get(attempt_key, 0) + 1
+                elif direction_correct is True:
+                    direction_wrong_streak[attempt_key] = 0
+
                 # --- 1. -25% 硬止损线（方向错误/未知时触发，方向正确交给ATR矩阵）---
                 if (current_price is not None and entry_price > 0
                         and profit_rate <= -PRICE_DROP_HARD_STOP
@@ -1778,20 +1819,35 @@ def monitor():
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                         continue
                     if sold:
                         close_position(pos, sold_price)
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                         continue
 
-                # --- 2. 方向翻转紧急退出（True→False 时立即清仓）---
+                # --- 2. 方向翻转紧急退出（True→False 时需连续确认）---
                 prev_dir = prev_direction_correct.get(attempt_key)
                 if direction_correct is not None:
                     prev_direction_correct[attempt_key] = direction_correct
                 if prev_dir is True and direction_correct is False:
-                    print(f"  🚨 方向翻转: True→False | {atr_str} | 剩余{remaining:.0f}s → 紧急清仓")
+                    streak = direction_wrong_streak.get(attempt_key, 0)
+                    # 偏离越大 → 需要越少确认轮次
+                    if diff_atr is not None and diff_atr >= 1.5:
+                        required_confirms = 1  # 偏离大，快速清仓
+                    elif diff_atr is not None and diff_atr >= 1.0:
+                        required_confirms = 2
+                    else:
+                        required_confirms = 2  # 偏离小，多确认
+                    if streak < required_confirms:
+                        print(f"  ⏸️ 方向翻转待确认: {streak}/{required_confirms}轮 | {atr_str} | 剩余{remaining:.0f}s")
+                        # 恢复prev为True，下轮仍能检测到翻转（否则prev被更新为False，#2永远不再触发）
+                        prev_direction_correct[attempt_key] = True
+                        continue
+                    print(f"  🚨 方向翻转确认: 连续{streak}轮❌(≥{required_confirms}) | {atr_str} | 剩余{remaining:.0f}s → 清仓")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
                     ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
@@ -1806,12 +1862,14 @@ def monitor():
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                         continue
                     if sold:
                         close_position(pos, sold_price)
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                         continue
 
                 # --- 3. Token 跌幅 ≥ 触发线 → ATR 三层决策 ---
@@ -1875,12 +1933,14 @@ def monitor():
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
+                            direction_wrong_streak.pop(attempt_key, None)
                             continue
                         if sold:
                             close_position(pos, sold_price)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
+                            direction_wrong_streak.pop(attempt_key, None)
                             continue
                         # 未成交，记录重试
                         stop_loss_attempt_recorded = True
@@ -1910,6 +1970,22 @@ def monitor():
                 # --- 5. 全程方向错误止损（remaining > 0，跌幅未达触发线）---
                 if should_attempt_stop_loss(direction_correct) and remaining > 30:
                     elapsed = 300 - remaining
+
+                    # 连续确认要求：偏离越小需要越多轮确认
+                    streak = direction_wrong_streak.get(attempt_key, 0)
+                    if diff_atr is not None:
+                        if diff_atr < 1.0:
+                            required_streak = 3   # ~15秒
+                        elif diff_atr < 1.5:
+                            required_streak = 2   # ~10秒
+                        else:
+                            required_streak = 1   # 偏离大，快速止损
+                    else:
+                        required_streak = 2
+                    if streak < required_streak:
+                        if streak <= 1:
+                            print(f"  ⏸️ 方向错误待确认: {streak}/{required_streak}轮 | {atr_str} | 剩余{remaining:.0f}s")
+                        continue
 
                     # 早期容忍窗口
                     atr_val_sl = atr_val or get_atr_from_binance(coin)
@@ -1946,6 +2022,7 @@ def monitor():
                                     close_attempts.pop(attempt_key, None)
                                     stop_loss_attempts.pop(attempt_key, None)
                                     dip_bought.pop(attempt_key, None)
+                                    direction_wrong_streak.pop(attempt_key, None)
                                     sold = True
                                     continue
                                 else:
@@ -1977,6 +2054,7 @@ def monitor():
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                         continue
                     elif attempts >= 3:
                         print(f"  🔴 市价止损{attempts+1}次无买方，放弃等结算 | 剩余{remaining:.0f}s")
@@ -1989,6 +2067,7 @@ def monitor():
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
                         continue
                     else:
                         stop_loss_attempt_recorded = True
@@ -2160,6 +2239,7 @@ def monitor():
                     close_position(pos, sold_price)
                     close_attempts.pop(attempt_key, None)
                     dip_bought.pop(attempt_key, None)
+                    direction_wrong_streak.pop(attempt_key, None)
                     continue
 
                 if attempted_stop_loss and not sold and not stop_loss_attempt_recorded:

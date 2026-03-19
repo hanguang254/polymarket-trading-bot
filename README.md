@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.2
+# Polymarket Trading Bot v9.3
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -20,10 +20,11 @@ The bot uses Bayesian sequential updating to detect directional signals, enters 
 100s  Late bet window opens (standard thresholds)
 160s  Late bet window closes → Real-time EV monitoring starts
       ── Exit Protocol ──
->30s  -25% hard stop: unconditional market sell
->30s  Direction flip (True→False): emergency liquidation
+>30s  PTB Proximity Buffer: crypto near PTB → freeze direction signal (prevent noise stop-loss)
+>30s  -25% hard stop: unconditional market sell (proximity extreme stop at -50%)
+>30s  Direction flip (True→False): consecutive confirmation required, then liquidation
 >30s  Token drop ≥15%: ATR ≥2.0 → dip-buy 50% / ATR 1.0-2.0 → hold / ATR <1.0 → stop-loss
->30s  Universal stop-loss: direction wrong → market-price ladder sell
+>30s  Universal stop-loss: direction wrong + streak confirmed → market-price ladder sell
 >30s  P1 hedge: bid < $0.05 → buy opposite token for $1 pair
 >90s  P0 take-profit: hyperbolic discounting threshold
 120s  Stage 2: Weak signal exit (batch sell)
@@ -67,8 +68,9 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
 
 ### Exit (P0-P1 + P4)
-- **-25% Hard Stop**: When token drops ≥25% from entry price, unconditional market sell regardless of ATR or direction. Absolute floor to prevent catastrophic loss.
-- **Direction Flip Emergency Exit**: Tracks `direction_correct` state across cycles. When flipping from `True→False`, immediately liquidates all holdings (including any dip-bought shares). Last line of defense against late reversals.
+- **PTB Proximity Buffer**: When `abs(crypto_price - ptb_price) / ATR < dynamic_threshold`, crypto is in the "noise zone" near PTB — direction signal is unreliable. Freezes `direction_correct = True` (trusts original bet), suppressing all direction-based stop-losses. Threshold decays with time: 0.7 ATR (first 2min) → 0.3 ATR (mid) → 0.15 ATR (last 1min). Extreme safety valve: token drop ≥50% (`PTB_PROXIMITY_EXTREME_STOP`) forces exit regardless. Configurable via `PTB_PROXIMITY_ATR`.
+- **-25% Hard Stop**: When token drops ≥25% from entry price, market sell when direction is not confirmed correct. In proximity zone, direction is frozen True so hard stop only fires via extreme safety valve (-50%).
+- **Direction Flip Exit (Consecutive Confirmation)**: Tracks `direction_correct` across cycles. True→False flip now requires **consecutive confirmation** (2 rounds for ATR<1.5, 1 round for ATR≥1.5) before liquidation — prevents single-poll noise from triggering premature exits. `direction_wrong_streak` counter resets when direction returns to True.
 - **ATR 3-Layer Decision Matrix**: When token drops ≥15% (`PRICE_DROP_TRIGGER`), action depends on ATR deviation (crypto distance from PTB in ATR units):
   - **ATR ≥ 2.0** (safe zone): 🟢 Dip-buy — adds 50% of original position at best_ask via FOK. Requires: direction correct, remaining > 60s, max 1 dip-buy per position. Averages down cost basis for higher profit if direction holds.
   - **ATR 1.0-2.0** (uncertain): 🟡 Hold — no action, continue monitoring. ATR rising → enters safe zone, ATR falling → enters danger zone.
@@ -78,12 +80,13 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
 - **EV-Driven Diamond Hands**: Direction correct + token drop < 15% → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥ time-decayed threshold) → hold to settlement. Weak signal → releases to Stage 2/3/4 for fine-grained exit.
 - **Direction-Based Exit**: Uses crypto price vs PTB to determine win/loss (not token orderbook price, which can be misleading due to wide bid-ask spreads near settlement).
-  - Token drop ≥ 25% → **-25% hard stop** (unconditional)
-  - Direction flips True→False → **Emergency liquidation**
+  - Crypto near PTB (< dynamic ATR threshold) → **Proximity freeze** (direction = True, hold)
+  - Token drop ≥ 25% + direction not True → **-25% hard stop** (proximity zone: -50% extreme stop)
+  - Direction flips True→False → **Consecutive confirmation** then liquidation
   - Token drop ≥ 15% → **ATR 3-layer decision** (dip-buy / hold / stop-loss)
   - Direction correct + EV > 0.03 or strong ATR → **hold to settlement** ($1.00)
   - Direction correct but weak signal → releases to stage exit strategy
-  - Direction wrong → **Universal market-price stop-loss** (immediate ladder sell)
+  - Direction wrong + streak confirmed → **Universal market-price stop-loss** (ladder sell)
   - No buyers (bid < $0.05) → Attempt hedge (P1), fall back to wait for expiry
 - **Wide Spread Protection**: `get_market_price()` detects bid-ask spread > 50% and falls back to midpoint API → `last-trade-price` → single-side price, preventing false loss signals.
 - **Empty Book Fallback (Monitor)**: `get_best_bid()` / `get_best_ask()` fall back to `last-trade-price ± SLIPPAGE` when CLOB is empty (bid ≤ 0.02 or ask ≥ 0.95). Enables hedge and stop-loss decisions with real market prices instead of $0.01/$0.99.
@@ -167,8 +170,9 @@ Layer 2 — Position Sizing
   └─ Balance constraints (10-20% of balance)
 
 Layer 3 — Position Management
-  ├─ -25% hard stop: unconditional market sell (PRICE_DROP_HARD_STOP)
-  ├─ Direction flip emergency exit: True→False → immediate liquidation
+  ├─ PTB Proximity Buffer: crypto near PTB → freeze direction, prevent noise stop-loss
+  ├─ -25% hard stop: market sell when direction≠True (proximity: -50% extreme stop)
+  ├─ Direction flip exit: True→False + consecutive confirmation → liquidation
   ├─ ATR 3-layer decision: ≥15% drop → dip-buy (ATR≥2) / hold (1-2) / stop-loss (ATR<1)
   ├─ P0: Hyperbolic discounting profit-take (entry_price sell for guaranteed fill)
   ├─ P1: Opposite token hedge (bid < $0.05 → buy opposite for $1 pair)
@@ -286,6 +290,8 @@ See `.env.example` for all configurable parameters:
 | `ATR_DANGER_THRESHOLD` | No | ATR deviation < this = danger zone, stop-loss (default: 1.0) |
 | `DIP_BUY_SIZE_RATIO` | No | Dip-buy amount as ratio of original position (default: 0.50) |
 | `DIP_BUY_MIN_REMAINING` | No | Min remaining seconds to allow dip-buy (default: 60) |
+| `PTB_PROXIMITY_ATR` | No | Proximity zone width in ATR units, time-decayed (default: 0.7) |
+| `PTB_PROXIMITY_EXTREME_STOP` | No | Extreme safety valve: token drop % to force exit in proximity zone (default: 0.50) |
 
 ### Running
 
@@ -333,6 +339,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.3**: PTB Proximity Buffer + consecutive confirmation stop-loss — When crypto price is near PTB (within configurable ATR threshold), direction signal is unreliable noise. New proximity buffer freezes `direction_correct = True`, suppressing all direction-based stop-losses (hard stop, direction flip, ATR danger, full-time wrong). Threshold decays with time: 0.7 ATR (first 2min) → 0.3 ATR (mid) → 0.15 ATR (last 1min). Extreme safety valve at -50% token drop. Direction flip (True→False) now requires consecutive confirmation rounds (2 for ATR<1.5, 1 for ATR≥1.5) instead of instant liquidation — prevents single-poll price fluctuation from triggering premature exits. Full-time direction-wrong stop-loss also requires streak confirmation (3 rounds for ATR<1.0, 2 for ATR<1.5, 1 for larger deviations). Bug fix: `prev_direction_correct` now preserved during pending confirmation to prevent #2 trigger from becoming dead code. New env: `PTB_PROXIMITY_ATR` (default 0.7), `PTB_PROXIMITY_EXTREME_STOP` (default 0.50).
 
 - **v9.2**: Polymarket WebSocket real-time orderbook — FOK entry now uses WS `best_ask` (0ms delay) instead of REST orderbook query (100-300ms), eliminating price staleness between read and order placement. New `polymarket_ws.py` singleton connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`, handles `best_bid_ask`/`book`/`price_change` events. Position monitor's `get_best_bid/get_best_ask/get_market_price` all WS-first with REST fallback. Lazy connection design: WS only connects on first `subscribe()` (Polymarket requires immediate subscription after connect, otherwise disconnects). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect. FOK retry logic (+1tick/+2tick/80% size) now operates on fresher prices, expected to significantly improve fill rate.
 
