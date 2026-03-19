@@ -342,6 +342,7 @@ class MarketTracker:
         self.tracked = {}  # slug -> market info
         self.ptb_cache = {}
         self.analyzed = set()
+        self.early_analyzed = set()  # 早期窗口分析过但失败的市场，不阻塞晚期窗口
         self.positions = {}  # slug -> Position
         self.warmup_data = {}  # slug -> [{price, direction, timestamp}, ...]
         self.warmup_started = set()  # 已开始预热的市场
@@ -496,12 +497,13 @@ class MarketTracker:
                                 f"自跳过({skip_info['reason']})后 | 剩余{remaining:.0f}s"
                             )
                             self.analyzed.discard(slug)
+                            self.early_analyzed.discard(slug)
                             skip_info["reanalyze_count"] += 1
 
             # === 早期下注窗口：90-95s（API 在前60-80s返回425 Too Early） ===
             EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "90"))
             EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "95"))
-            if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed:
+            if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed and slug not in self.early_analyzed:
                 updater = self.bayesian_updaters.get(slug)
                 samples = self.warmup_data.get(slug, [])
 
@@ -515,7 +517,7 @@ class MarketTracker:
                         if gap_trend == "穿越":
                             logger.info(f"  ⏳ 早期窗口: gap穿越，等待晚期窗口")
                         else:
-                            self.analyzed.add(slug)
+                            self.early_analyzed.add(slug)
                             extra_info = {
                                 "gap_trend": gap_trend,
                                 "gap_info": gap_info,
@@ -844,6 +846,7 @@ class MarketTracker:
         
         if success:
             logger.info(f"  ✅ 下注成功！（{bet_size}份）")
+            self.analyzed.add(slug)  # 下注成功，阻止晚期窗口重复分析
 
             # ★ 立即预扣下注成本到 daily_pnl（防止并行线程超限）
             cost = round(entry_price * bet_size, 4)
@@ -953,6 +956,7 @@ class MarketTracker:
                 self.token_cache.pop(slug, None)
                 self.skipped_markets.pop(slug, None)
                 self.analyzed.discard(slug)
+                self.early_analyzed.discard(slug)
 
 
 def main():
