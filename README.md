@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.4
+# Polymarket Trading Bot v9.5
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -65,6 +65,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Parallel Entry Fetch**: Balance + orderbook queries run concurrently via ThreadPoolExecutor, saving ~0.5s per bet execution.
 - **CLOB C1 Calibration**: Replaces Gamma odds with CLOB `best_ask` for discount/EV/price checks — prevents buying at $0.85 while thinking price is $0.50. Empty book detection (ask ≥ 0.95) falls back to `last-trade-price`.
 - **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
+- **Volatility-Triggered Re-Analysis**: Markets skipped due to low confidence are tracked in `skipped_markets`. When crypto price moves ≥1.5 ATR from the skip price (`REANALYZE_ATR_MULT`), the market re-enters the analysis pipeline with updated Bayesian state. Cooldown (`REANALYZE_COOLDOWN`, default 15s) and max retrigger cap (`MAX_REANALYZE`, default 1) prevent loops. Skipped markets are cleaned up on position entry or market cleanup.
 - **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
 
 ### Exit (P0-P1 + P4)
@@ -105,6 +106,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
 - **Playwright PTB (No Fallback)**: PTB only from Playwright subprocess. HTML/Gamma API fallbacks removed (returned wrong market's PTB). Skip browser PTB after 3 consecutive failures.
+- **Volatility Re-Trigger**: Skipped markets monitored for large price moves — piggybacks on existing sampling loop (no extra API calls), re-enters analysis when volatility exceeds threshold
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
 - **Auto Redeem**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`), shows USDC balance after each round
@@ -292,6 +294,9 @@ See `.env.example` for all configurable parameters:
 | `DIP_BUY_MIN_REMAINING` | No | Min remaining seconds to allow dip-buy (default: 60) |
 | `PTB_PROXIMITY_ATR` | No | Proximity zone width in ATR units, time-decayed (default: 0.7) |
 | `PTB_PROXIMITY_EXTREME_STOP` | No | Extreme safety valve: token drop % to force exit in proximity zone (default: 0.50) |
+| `REANALYZE_ATR_MULT` | No | Price move in ATR multiples to retrigger skipped market (default: 1.5) |
+| `REANALYZE_COOLDOWN` | No | Min seconds before retrigger allowed (default: 15) |
+| `MAX_REANALYZE` | No | Max retrigger attempts per market (default: 1) |
 
 ### Running
 
@@ -339,6 +344,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.5**: 波动触发重分析 — Skipped markets (low confidence, weak gap cross) are now tracked and monitored for volatility. When crypto price moves ≥1.5 ATR (`REANALYZE_ATR_MULT`) from the skip price, the market re-enters the late window analysis pipeline with its accumulated Bayesian state. Piggybacks on existing warmup sampling loop (zero extra API calls). Guards: cooldown timer (`REANALYZE_COOLDOWN`, default 15s), max 1 retrigger per market (`MAX_REANALYZE`), no retrigger if position already open, `is_reanalyze` flag prevents infinite skip→retrigger loops. Skipped markets cleaned up on position entry and market cleanup. New env: `REANALYZE_ATR_MULT`, `REANALYZE_COOLDOWN`, `MAX_REANALYZE`.
 
 - **v9.4**: MAX_DAILY_LOSS风控修复 + PTB去兜底 — Daily loss limit now thread-safe with `threading.Lock`, checked at the top of `analyze_and_trade()` (before any analysis/betting), preventing parallel BTC/ETH threads from both passing the check simultaneously. Bet cost pre-deducted to `daily_pnl` on entry (worst-case full loss), settled with actual PnL on position close via `settle_bet_cost()`. Dip-buy (`execute_dip_buy`) also checks daily loss limit before adding. PTB fallback layers (HTML scraper + Gamma API) removed — they returned wrong market's PTB on Playwright timeout (e.g., $73,934 from a different 5-min window instead of $71,193). Now Playwright-only: fail → skip market, no false PTB.
 

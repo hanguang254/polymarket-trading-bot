@@ -347,6 +347,7 @@ class MarketTracker:
         self.warmup_started = set()  # 已开始预热的市场
         self.bayesian_updaters = {}  # slug -> BayesianUpdater
         self.token_cache = {}  # slug -> (up_token, down_token)  预热阶段缓存token_ids
+        self.skipped_markets = {}  # slug -> {skip_time, price_at_skip, reason, reanalyze_count}
     
     def update_markets(self):
         """更新市场列表"""
@@ -404,7 +405,7 @@ class MarketTracker:
             
             # === 预热期：20s-160s（PTB获取后立即开始贝叶斯采样，延续到晚期窗口） ===
             LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
-            if 20 <= elapsed <= LATE_BET_END and slug not in self.analyzed:
+            if 20 <= elapsed <= LATE_BET_END and (slug not in self.analyzed or slug in self.skipped_markets):
                 if slug not in self.warmup_started:
                     self.warmup_started.add(slug)
                     self.warmup_data[slug] = []
@@ -471,7 +472,32 @@ class MarketTracker:
                             logger.info(f"  ⏳ 等待PTB... price={price:.2f}")
                     except Exception as e:
                         logger.warning(f"  ⚠️ 预热采样失败: {e}")
-            
+
+                # === 波动重触发：跳过的市场检测价格大幅偏离 ===
+                REANALYZE_ATR_MULT = float(os.environ.get("REANALYZE_ATR_MULT", "1.5"))
+                REANALYZE_COOLDOWN = float(os.environ.get("REANALYZE_COOLDOWN", "15"))
+                MAX_REANALYZE = int(os.environ.get("MAX_REANALYZE", "1"))
+                if slug in self.skipped_markets and slug not in self.positions:
+                    skip_info = self.skipped_markets[slug]
+                    updater = self.bayesian_updaters.get(slug)
+                    samples = self.warmup_data.get(slug, [])
+                    latest_price = samples[-1]["price"] if samples else None
+
+                    if (skip_info["reanalyze_count"] < MAX_REANALYZE
+                            and time.time() - skip_info["skip_time"] >= REANALYZE_COOLDOWN
+                            and updater and updater.atr_val and updater.atr_val > 0
+                            and latest_price):
+                        move = abs(latest_price - skip_info["price_at_skip"])
+                        atr = updater.atr_val
+                        if move >= atr * REANALYZE_ATR_MULT:
+                            logger.info(
+                                f"\n🔄 波动重触发: {market['coin']} "
+                                f"移动{move:.0f} ({move/atr:.1f}ATR ≥ {REANALYZE_ATR_MULT}ATR) "
+                                f"自跳过({skip_info['reason']})后 | 剩余{remaining:.0f}s"
+                            )
+                            self.analyzed.discard(slug)
+                            skip_info["reanalyze_count"] += 1
+
             # === 早期下注窗口：90-95s（API 在前60-80s返回425 Too Early） ===
             EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "90"))
             EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "95"))
@@ -505,13 +531,22 @@ class MarketTracker:
             # === 晚期下注窗口：100s-160s（贝叶斯后验 + gap 趋势双重确认） ===
             LATE_BET_START = int(os.environ.get("LATE_BET_START", "100"))
             if LATE_BET_START <= elapsed <= LATE_BET_END and slug not in self.analyzed:
-                self.analyzed.add(slug)
+                # 获取跳过时的价格快照（用于波动重触发）
+                _skip_price = None
+                _samples_snap = self.warmup_data.get(slug, [])
+                if _samples_snap:
+                    _skip_price = _samples_snap[-1].get("price")
 
+                is_reanalyze = slug in self.skipped_markets
                 samples = self.warmup_data.get(slug, [])
                 # 保留 gap 趋势作为辅助信号
                 gap_trend, gap_info = self._calc_gap_trend(samples)
 
                 extra_info = {"gap_trend": gap_trend, "gap_info": gap_info, "warmup_samples": len(samples), "remaining_seconds": remaining}
+                if is_reanalyze:
+                    extra_info["reanalyze"] = True
+                    skip_info = self.skipped_markets.get(slug, {})
+                    extra_info["volatility_move_atr"] = skip_info.get("move_atr", 0)
 
                 # 贝叶斯后验结果
                 updater = self.bayesian_updaters.get(slug)
@@ -521,11 +556,20 @@ class MarketTracker:
                     b_dir = bayesian_summary["direction"]
                     b_phat = bayesian_summary["p_hat"]
                     b_conf = bayesian_summary["confidence"]
-                    logger.info(f"\n🧠 贝叶斯结果: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f} (n={updater.n_updates})")
+                    reanalyze_tag = " [重分析]" if is_reanalyze else ""
+                    logger.info(f"\n🧠 贝叶斯结果{reanalyze_tag}: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f} (n={updater.n_updates})")
 
                     # 贝叶斯置信度太低（<30%），方向不确定，跳过
                     if b_conf < 0.15:
                         logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，跳过")
+                        self.analyzed.add(slug)
+                        if not is_reanalyze and _skip_price:
+                            self.skipped_markets[slug] = {
+                                "skip_time": time.time(), "price_at_skip": _skip_price,
+                                "reason": "low_conf", "reanalyze_count": 0,
+                            }
+                        else:
+                            self.skipped_markets.pop(slug, None)
                         continue
                 else:
                     logger.info(f"\n📊 无贝叶斯数据，使用gap趋势: {gap_trend}")
@@ -539,15 +583,33 @@ class MarketTracker:
                             logger.info(f"  ✅ gap穿越但贝叶斯置信度高({b_conf:.3f})，允许交易")
                         else:
                             logger.warning(f"\n⚠️ {market['coin']} gap穿越+贝叶斯弱({b_conf:.3f})，跳过")
+                            self.analyzed.add(slug)
+                            if not is_reanalyze and _skip_price:
+                                self.skipped_markets[slug] = {
+                                    "skip_time": time.time(), "price_at_skip": _skip_price,
+                                    "reason": "gap_cross_weak", "reanalyze_count": 0,
+                                }
+                            else:
+                                self.skipped_markets.pop(slug, None)
                             continue
                     else:
                         logger.warning(f"\n⚠️ {market['coin']} gap穿越零轴，跳过")
+                        self.analyzed.add(slug)
+                        if not is_reanalyze and _skip_price:
+                            self.skipped_markets[slug] = {
+                                "skip_time": time.time(), "price_at_skip": _skip_price,
+                                "reason": "gap_cross", "reanalyze_count": 0,
+                            }
+                        else:
+                            self.skipped_markets.pop(slug, None)
                         continue
                 elif gap_trend == "缩小":
                     extra_info["min_discount"] = 0.18
                 elif gap_trend == "震荡":
                     extra_info["min_discount"] = 0.15
 
+                self.analyzed.add(slug)
+                self.skipped_markets.pop(slug, None)
                 pending_trades.append((slug, market, extra_info))
 
         # 并行执行所有待分析市场（BTC+ETH同时分析下注，而非串行等待）
@@ -695,6 +757,18 @@ class MarketTracker:
         
         if not should_bet:
             logger.warning(f"  ❌ 不满足: {details.get('bet_reason','')}")
+            # 记录跳过（供波动重触发使用），已经是重分析的不再记录
+            is_reanalyze = (extra_info or {}).get("reanalyze", False)
+            if not is_reanalyze and slug not in self.positions:
+                current_price = details.get("current_price") or details.get("crypto_price")
+                if current_price:
+                    self.skipped_markets[slug] = {
+                        "skip_time": time.time(), "price_at_skip": current_price,
+                        "reason": details.get("bet_reason", "no_edge")[:30],
+                        "reanalyze_count": 0,
+                    }
+            else:
+                self.skipped_markets.pop(slug, None)
             decrease_cooldown()
             logger.info(f"{'='*60}\n")
             return
@@ -877,6 +951,8 @@ class MarketTracker:
                 self.positions.pop(slug, None)
                 self.bayesian_updaters.pop(slug, None)
                 self.token_cache.pop(slug, None)
+                self.skipped_markets.pop(slug, None)
+                self.analyzed.discard(slug)
 
 
 def main():
