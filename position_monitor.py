@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 import requests
 from ai_trader.polymarket_api import normalize_orderbook
@@ -1490,10 +1491,10 @@ def monitor():
     # 启动 Polymarket WebSocket 实时 orderbook 流
     _poly_ws.start()
     _ws_subscribed = set()  # 已订阅的 token_ids
-    print("🔍 持仓监控 v9.1 启动（ATR三层决策 + PTB Proximity Buffer + 连续确认止损）...")
-    print("   Exit Protocol: P0双曲止盈 | -25%硬止损 | 方向翻转(连续确认) | ATR≥2抄底 | ATR<1止损")
+    print("🔍 持仓监控 v9.4 启动（ATR三层决策 + Proximity衰减streak + 滑动窗口）...")
+    print("   Exit Protocol: P0双曲止盈 | -25%硬止损 | 方向翻转(衰减streak) | ATR≥2抄底 | ATR<1止损")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
-    print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%")
+    print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%(时间衰减) | streak衰减+8轮滑动窗口")
 
     close_attempts = {}  # (slug, entry_time) -> attempts count
     stop_loss_attempts = {}  # (slug, entry_time) -> stop loss attempts
@@ -1501,7 +1502,8 @@ def monitor():
     dip_bought = {}  # (slug, entry_time) -> True if already dip-bought
     prev_direction_correct = {}  # (slug, entry_time) -> last known direction_correct
     tp_fail_count = {}  # (slug, entry_time) -> 连续止盈失败次数
-    direction_wrong_streak = {}  # (slug, entry_time) -> 连续方向错误轮数（proximity zone外用）
+    direction_wrong_streak = {}  # (slug, entry_time) -> 方向错误衰减计数（❌+1, ✅-1, 不清零）
+    direction_history = {}  # (slug, entry_time) -> deque(maxlen=8) 最近8轮方向记录
     
     while True:
         try:
@@ -1520,6 +1522,7 @@ def monitor():
             prev_direction_correct = {k: v for k, v in prev_direction_correct.items() if k in open_keys}
             tp_fail_count = {k: v for k, v in tp_fail_count.items() if k in open_keys}
             direction_wrong_streak = {k: v for k, v in direction_wrong_streak.items() if k in open_keys}
+            direction_history = {k: v for k, v in direction_history.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -1595,6 +1598,7 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                         continue
 
                     # -30s ~ 0s：等待结算并检查市场关闭
@@ -1620,8 +1624,9 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                     continue
-                
+
                 # PTB 在下注时已记录，直接从持仓数据读取
                 ptb_price = pos.get("ptb") or pos.get("price_to_beat")
                 crypto_price = get_current_crypto_price(coin)
@@ -1750,6 +1755,7 @@ def monitor():
                                     dip_bought.pop(attempt_key, None)
                                     tp_fail_count.pop(attempt_key, None)
                                     direction_wrong_streak.pop(attempt_key, None)
+                                    direction_history.pop(attempt_key, None)
                                     continue
                                 elif actual == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
@@ -1761,6 +1767,7 @@ def monitor():
                                     dip_bought.pop(attempt_key, None)
                                     tp_fail_count.pop(attempt_key, None)
                                     direction_wrong_streak.pop(attempt_key, None)
+                                    direction_history.pop(attempt_key, None)
                                     continue
                                 else:
                                     # 止盈卖出失败，累计失败次数
@@ -1792,25 +1799,53 @@ def monitor():
                     direction_correct = False
 
                 # --- PTB Proximity Buffer: crypto在PTB附近时冻结方向信号 ---
+                # 保存 proximity override 前的原始方向，用于 streak 计数
+                raw_direction_correct = direction_correct
                 in_proximity = False
                 if diff_atr is not None and crypto_price and ptb_price:
                     prox_threshold = calc_proximity_threshold(remaining)
                     in_proximity = diff_atr < prox_threshold
 
                     if in_proximity and direction_correct is False:
-                        # 极端安全阀：proximity zone 内 token 跌超50% → 不保护
-                        if profit_rate <= -PTB_PROXIMITY_EXTREME_STOP:
-                            print(f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<{prox_threshold:.2f} 但跌{profit_rate*100:+.1f}%>{-PTB_PROXIMITY_EXTREME_STOP*100:.0f}% → 不冻结")
+                        # 极端安全阀：时间衰减收紧（>120s:-50%, 60-120s:-45%, <60s:-40%）
+                        if remaining > 120:
+                            extreme_stop = PTB_PROXIMITY_EXTREME_STOP        # -50%
+                        elif remaining > 60:
+                            extreme_stop = PTB_PROXIMITY_EXTREME_STOP - 0.05  # -45%
+                        else:
+                            extreme_stop = PTB_PROXIMITY_EXTREME_STOP - 0.10  # -40%
+
+                        if profit_rate <= -extreme_stop:
+                            print(f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<{prox_threshold:.2f} 但跌{profit_rate*100:+.1f}%>{-extreme_stop*100:.0f}% → 不冻结")
                             in_proximity = False
                         else:
-                            print(f"  🔶 PTB临近区: {diff_atr:.2f}ATR<{prox_threshold:.2f} | 方向冻结✅ | 剩余{remaining:.0f}s")
-                            direction_correct = True  # 冻结方向，信任原始bet
+                            # 检查 streak/滑动窗口是否已累计确认方向错误 → 解除保护
+                            streak = direction_wrong_streak.get(attempt_key, 0)
+                            hist = direction_history.get(attempt_key, deque(maxlen=8))
+                            wrong_ratio = sum(1 for d in hist if d is False) / len(hist) if len(hist) >= 4 else 0
+                            # proximity 内 streak 阈值稍高（需要更强确认才解除保护）
+                            prox_streak_threshold = 4
+                            if streak >= prox_streak_threshold or wrong_ratio >= 0.75:
+                                print(f"  🔶→🚨 Proximity保护解除: streak={streak}≥{prox_streak_threshold} or ratio={wrong_ratio:.0%}≥75% | {diff_atr:.2f}ATR | 剩余{remaining:.0f}s")
+                                in_proximity = False  # 解除保护，让正常止损生效
+                            else:
+                                print(f"  🔶 PTB临近区: {diff_atr:.2f}ATR<{prox_threshold:.2f} | 方向冻结✅ | streak={streak} ratio={wrong_ratio:.0%} | 剩余{remaining:.0f}s")
+                                direction_correct = True  # 冻结方向，信任原始bet
 
-                # --- 更新方向错误连续计数（proximity zone外使用）---
-                if direction_correct is False and not in_proximity:
-                    direction_wrong_streak[attempt_key] = direction_wrong_streak.get(attempt_key, 0) + 1
-                elif direction_correct is True:
-                    direction_wrong_streak[attempt_key] = 0
+                # --- 更新方向错误计数（衰减式 + 滑动窗口）---
+                # 使用 raw_direction（proximity override 前的真实方向）来更新计数
+                if raw_direction_correct is not None:
+                    # 滑动窗口：记录最近8轮原始方向
+                    if attempt_key not in direction_history:
+                        direction_history[attempt_key] = deque(maxlen=8)
+                    direction_history[attempt_key].append(raw_direction_correct)
+
+                    # streak 衰减：❌+1, ✅-1（不清零）
+                    cur_streak = direction_wrong_streak.get(attempt_key, 0)
+                    if raw_direction_correct is False:
+                        direction_wrong_streak[attempt_key] = cur_streak + 1
+                    else:
+                        direction_wrong_streak[attempt_key] = max(0, cur_streak - 1)
 
                 # --- 1. -25% 硬止损线（方向错误/未知时触发，方向正确交给ATR矩阵）---
                 if (current_price is not None and entry_price > 0
@@ -1832,6 +1867,7 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                         continue
                     if sold:
                         close_position(pos, sold_price)
@@ -1839,12 +1875,14 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                         continue
 
                 # --- 2. 方向翻转紧急退出（True→False 时需连续确认）---
+                # 用 raw_direction 追踪翻转（不受 proximity 冻结影响）
                 prev_dir = prev_direction_correct.get(attempt_key)
-                if direction_correct is not None:
-                    prev_direction_correct[attempt_key] = direction_correct
+                if raw_direction_correct is not None:
+                    prev_direction_correct[attempt_key] = raw_direction_correct
                 if prev_dir is True and direction_correct is False:
                     streak = direction_wrong_streak.get(attempt_key, 0)
                     # 偏离越大 → 需要越少确认轮次
@@ -1875,6 +1913,7 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                         continue
                     if sold:
                         close_position(pos, sold_price)
@@ -1882,6 +1921,7 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                         continue
 
                 # --- 3. Token 跌幅 ≥ 触发线 → ATR 三层决策 ---
@@ -1946,6 +1986,7 @@ def monitor():
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
                             direction_wrong_streak.pop(attempt_key, None)
+                            direction_history.pop(attempt_key, None)
                             continue
                         if sold:
                             close_position(pos, sold_price)
@@ -1953,6 +1994,7 @@ def monitor():
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
                             direction_wrong_streak.pop(attempt_key, None)
+                            direction_history.pop(attempt_key, None)
                             continue
                         # 未成交，记录重试
                         stop_loss_attempt_recorded = True
@@ -2035,6 +2077,7 @@ def monitor():
                                     stop_loss_attempts.pop(attempt_key, None)
                                     dip_bought.pop(attempt_key, None)
                                     direction_wrong_streak.pop(attempt_key, None)
+                                    direction_history.pop(attempt_key, None)
                                     sold = True
                                     continue
                                 else:
@@ -2067,6 +2110,7 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                         continue
                     elif attempts >= 3:
                         print(f"  🔴 市价止损{attempts+1}次无买方，放弃等结算 | 剩余{remaining:.0f}s")
@@ -2080,6 +2124,7 @@ def monitor():
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
                         direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
                         continue
                     else:
                         stop_loss_attempt_recorded = True
@@ -2252,6 +2297,7 @@ def monitor():
                     close_attempts.pop(attempt_key, None)
                     dip_bought.pop(attempt_key, None)
                     direction_wrong_streak.pop(attempt_key, None)
+                    direction_history.pop(attempt_key, None)
                     continue
 
                 if attempted_stop_loss and not sold and not stop_loss_attempt_recorded:
