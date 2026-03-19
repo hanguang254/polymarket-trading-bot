@@ -137,25 +137,6 @@ def get_price_to_beat_playwright(slug, timeout_ms=12000):
                 }
             }
 
-            // 回退：全页搜索大额美元数字（PTB 量级 $10k-$10M）
-            const allLeaves = document.querySelectorAll('span, div, p');
-            for (const el of allLeaves) {
-                if (el.children.length > 0) continue;
-                const text = el.textContent.trim();
-                const m = text.match(/^\$([\d,]+(\.\d+)?)$/);
-                if (m) {
-                    const val = parseFloat(m[1].replace(/,/g, ''));
-                    if (val > 10000 && val < 10000000) return text;
-                }
-            }
-
-            // 最终回退：script 标签 JSON
-            const scripts = document.querySelectorAll('script');
-            for (const s of scripts) {
-                const m = s.textContent.match(/"priceToBeat"\s*:\s*"?([\d.]+)"?/);
-                if (m) return '$' + m[1];
-            }
-
             return null;
         }""")
         
