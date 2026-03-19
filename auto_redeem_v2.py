@@ -345,8 +345,8 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
         else:
             bal = int(size * 1e6) if size > 0 else 0
 
-        # 价值过小的不领取（Multicall批量gas均摊，阈值可以很低）
-        if bal < 10_000:  # < 0.01 USDC
+        # 余额为0的跳过（无意义调用）
+        if bal <= 0:
             continue
 
         redeemable.append({
