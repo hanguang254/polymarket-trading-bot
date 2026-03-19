@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 from ai_trader.polymarket_api import get_current_markets
 from ai_trader import clob_client
 from ai_analyze_v2 import analyze_and_decide
-from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result
+from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result, check_daily_loss_limit, record_bet_cost
 
 
 _playwright_failures = 0  # Playwright 连续失败计数
@@ -634,6 +634,13 @@ class MarketTracker:
     def analyze_and_trade(self, slug, market, extra_info=None):
         """分析并下注（带趋势确认）"""
         coin = market["coin"]
+
+        # ★ 日亏损上限检查（在任何分析之前，线程安全）
+        allowed, daily_pnl, limit = check_daily_loss_limit()
+        if not allowed:
+            logger.warning(f"  🚫 今日亏损 ${daily_pnl:+.2f} 已达上限 -${limit}，停止交易 [{coin}]")
+            return
+
         up_odds = market["up_odds"]
         down_odds = market["down_odds"]
         gap_trend = extra_info.get("gap_trend", "未知") if extra_info else "未知"
@@ -784,6 +791,11 @@ class MarketTracker:
         
         if success:
             logger.info(f"  ✅ 下注成功！（{bet_size}份）")
+
+            # ★ 立即预扣下注成本到 daily_pnl（防止并行线程超限）
+            cost = round(entry_price * bet_size, 4)
+            new_pnl = record_bet_cost(slug, cost)
+            logger.info(f"  📉 预扣成本 ${cost:.2f} → 今日PnL: ${new_pnl:+.2f}")
 
             # 记录持仓（使用实际下单价格和动态仓位）
             position = Position(

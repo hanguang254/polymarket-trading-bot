@@ -534,12 +534,15 @@ def close_position(position, exit_price):
 
     # Bug 5 fix: 用真实 PnL 更新 trading_state
     try:
-        from trading_state import record_bet_result
+        from trading_state import record_bet_result, settle_bet_cost
         entry = position.get("entry_price", 0)
         size = position.get("size", 0)
         pnl = (exit_price - entry) * size if entry > 0 else 0.0
         won = exit_price > entry if entry > 0 else False
-        record_bet_result(won, position.get("slug", "unknown"), pnl=pnl)
+        slug = position.get("slug", "unknown")
+        # 用实际盈亏替换预扣成本
+        settle_bet_cost(slug, pnl)
+        record_bet_result(won, slug, pnl=0.0)  # pnl已在settle中处理，这里只更新胜负统计
     except Exception:
         pass
 
@@ -790,6 +793,15 @@ def execute_dip_buy(token_id, original_size, coin, slug, pos):
     """抄底加仓：用FOK在best_ask买入原仓位的DIP_BUY_SIZE_RATIO倍
     返回: (success, bought_size, buy_price) or (False, 0, None)
     """
+    # ★ 抄底前检查日亏损上限
+    try:
+        from trading_state import check_daily_loss_limit
+        allowed, daily_pnl, limit = check_daily_loss_limit()
+        if not allowed:
+            print(f"    🚫 今日亏损 ${daily_pnl:+.2f} 已达上限 -${limit}，跳过抄底")
+            return False, 0, None
+    except Exception:
+        pass
     dip_size = max(1, int(original_size * DIP_BUY_SIZE_RATIO))
     best_ask = get_best_ask(token_id)
     if not best_ask or best_ask >= 0.95:
