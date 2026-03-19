@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Polymarket 自动领取已结算收益脚本 v3.3
+Polymarket 自动领取已结算收益脚本 v3.6
 - data-api REST 查持仓 + web3 EOA 直接链上结算（不走 Gnosis Safe）
 - EOA 直接调用 CTF.redeemPositions / NegRiskAdapter.redeemPositions
-- 支持 normal / neg-risk 自动切换重试
-- 链上 payoutDenominator 验证已结算 + balanceOf 检查余额
+- 并行 redeem: 预分配 nonce + 批量发送 + 统一收回执（117笔 ~20s）
+- revert 自动切换 normal↔neg-risk 重试
+- 链上验证余额变化，防止假标记
+- 启动时自动清理假标记（链上仍有余额的 = 未真正领取）
 - 持久化已 redeem 记录 + 日志按天写入文件 + Telegram 通知
 """
 import os
@@ -48,6 +50,7 @@ REDEEMED_FILE = os.path.join(SCRIPT_DIR, "logs", "redeemed_conditions.json")
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"       # Conditional Tokens Framework
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # NegRiskAdapter
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"      # USDC (PoS) on Polygon
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" # Multicall3 (Polygon)
 
 # ==============================================================================
 # 最小 ABI
@@ -344,8 +347,8 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
         else:
             bal = int(size * 1e6) if size > 0 else 0
 
-        # 价值过小的不领取（gas费不划算）
-        if bal < 100_000:  # < 0.1 USDC
+        # 余额为0的跳过（无意义调用）
+        if bal <= 0:
             continue
 
         redeemable.append({
@@ -508,6 +511,158 @@ def redeem_position(w3: Web3, wallet, cond_id: str,
 
     return None
 
+
+# ==============================================================================
+# 并行 Redeem（预分配 nonce，批量发送，统一收集回执）
+# ==============================================================================
+
+REDEEM_FIXED_GAS = 300_000  # redeem 通常 100-150k，固定 gas 避免逐个 estimate
+
+
+def _build_redeem_calldata(w3: Web3, cond_id: str, neg_risk: bool, balance: int) -> tuple[str, bytes]:
+    """
+    构建单个 redeem 的 calldata + target 地址
+    Returns: (target_address, call_data)
+    """
+    if not cond_id.startswith("0x"):
+        cond_id = "0x" + cond_id
+    amt = balance if balance > 0 else 1
+
+    if neg_risk:
+        selector = w3.keccak(text="redeemPositions(bytes32,uint256[])")[:4]
+        call_data = selector + abi_encode(
+            ["bytes32", "uint256[]"],
+            [bytes.fromhex(cond_id.replace("0x", "")), [amt, amt]],
+        )
+        return NEG_RISK_ADAPTER, call_data
+    else:
+        usdc_cs = Web3.to_checksum_address(USDC_ADDRESS)
+        selector = w3.keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+        call_data = selector + abi_encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [usdc_cs, b"\x00" * 32, bytes.fromhex(cond_id.replace("0x", "")), [1, 2]],
+        )
+        return CTF_ADDRESS, call_data
+
+
+def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
+    """
+    并行发送 redeem 交易（预分配 nonce）：
+    Phase 1: 批量构建 + 签名 + 快速发送（不等回执）
+    Phase 2: 统一收集回执
+    Phase 3: revert 的切换 normal↔neg-risk 逐个重试
+
+    Returns: list of {position, success, tx_hash}
+    """
+    if not positions:
+        return []
+
+    base_nonce = w3.eth.get_transaction_count(wallet.address, "pending")
+    gas_price = int(w3.eth.gas_price * 1.3)
+
+    # ── Phase 1: 批量发送 ──
+    sent = []  # (position, tx_hash_bytes, neg_risk_used)
+    send_ok = 0
+
+    log.info(f"⚡ Phase 1: 并行发送 {len(positions)} 笔 redeem 交易...")
+
+    for i, r in enumerate(positions):
+        cid = r["condition_id"]
+        neg_risk = r.get("neg_risk", False)
+        balance = r.get("balance", 0)
+
+        try:
+            target, call_data = _build_redeem_calldata(w3, cid, neg_risk, balance)
+            target_cs = Web3.to_checksum_address(target)
+
+            signed_tx = w3.eth.account.sign_transaction(
+                {
+                    "to": target_cs,
+                    "data": call_data,
+                    "gas": REDEEM_FIXED_GAS,
+                    "gasPrice": gas_price,
+                    "nonce": base_nonce + i,
+                    "chainId": 137,
+                },
+                PRIVATE_KEY,
+            )
+
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            sent.append((r, tx_hash, neg_risk))
+            send_ok += 1
+
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "nonce too low" in err_msg or "already known" in err_msg:
+                # nonce 冲突，说明前面的 tx 有问题，后续 nonce 也会失败
+                log.warning(f"  ⚠️ nonce 冲突，停止发送: {e}")
+                sent.append((r, None, neg_risk))
+                break
+            log.warning(f"  ⚠️ 发送失败: {r.get('slug', '')[:35]} | {str(e)[:80]}")
+            sent.append((r, None, neg_risk))
+
+        # 每 20 笔打印进度
+        if (i + 1) % 20 == 0:
+            log.info(f"  📤 已发送 {i+1}/{len(positions)} ...")
+
+    log.info(f"  📤 发送完毕: {send_ok}/{len(positions)} 笔")
+
+    # ── Phase 2: 收集回执 ──
+    log.info(f"⏳ Phase 2: 收集回执...")
+    results = []
+    retry_list = []  # (position, alt_neg_risk)
+
+    for r, tx_hash, neg_risk_used in sent:
+        if tx_hash is None:
+            results.append({"position": r, "success": False, "tx_hash": None})
+            continue
+
+        tx_hex = tx_hash.hex()
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                results.append({"position": r, "success": True, "tx_hash": tx_hex})
+            else:
+                # revert → 可能 neg_risk 标志错误，加入重试队列
+                log.info(f"  🔄 revert: {r.get('slug', '')[:35]} → 加入重试队列")
+                results.append({"position": r, "success": False, "tx_hash": tx_hex, "retry": True})
+                retry_list.append((r, not neg_risk_used))
+        except Exception as e:
+            log.warning(f"  ⚠️ 回执获取失败: {tx_hex[:16]}... | {str(e)[:80]}")
+            results.append({"position": r, "success": False, "tx_hash": tx_hex})
+
+    success_p2 = sum(1 for x in results if x["success"])
+    log.info(f"  📋 Phase 2 结果: {success_p2} 成功 / {len(results) - success_p2} 失败")
+
+    # ── Phase 3: 重试 revert 的（切换 normal↔neg-risk）──
+    if retry_list:
+        log.info(f"🔄 Phase 3: 重试 {len(retry_list)} 个 revert 持仓（切换合约类型）...")
+        for r, alt_neg_risk in retry_list:
+            cid = r["condition_id"]
+            # 用 redeem_position 的完整重试逻辑（会再次尝试两种方式）
+            tx = redeem_position(
+                w3, wallet, cid,
+                neg_risk=alt_neg_risk,
+                balance=r.get("balance", 0),
+            )
+            # 更新 results 中对应项
+            for res in results:
+                if (res["position"]["condition_id"] == cid
+                        and res.get("retry")):
+                    res["success"] = tx is not None
+                    res["tx_hash"] = tx
+                    res.pop("retry", None)
+                    break
+            time.sleep(1)
+
+        retry_ok = sum(1 for r, _ in retry_list
+                       for res in results
+                       if res["position"]["condition_id"] == r["condition_id"] and res["success"])
+        log.info(f"  📋 Phase 3 结果: {retry_ok}/{len(retry_list)} 重试成功")
+
+    return results
+
+
 # ==============================================================================
 # 核心逻辑
 # ==============================================================================
@@ -521,6 +676,60 @@ def get_usdc_balance(wallet, usdc_contract) -> float:
         return bal / 1e6
     except Exception:
         return -1
+
+
+def cleanup_false_redeemed(w3: Web3, wallet, ctf_contract) -> int:
+    """
+    启动时清理假标记：检查 redeemed_conditions.json 中的记录，
+    如果链上 token 余额仍 > 0，说明未真正领取，移除标记以便重试。
+    """
+    redeemed = load_redeemed()
+    if not redeemed:
+        return 0
+
+    eoa_cs = Web3.to_checksum_address(wallet.address)
+    check_addrs = [eoa_cs]
+    if PROXY_WALLET and PROXY_WALLET.lower() != wallet.address.lower():
+        check_addrs.append(Web3.to_checksum_address(PROXY_WALLET))
+
+    # 获取当前持仓以获取 token_id
+    positions = fetch_positions()
+    token_map = {}  # condition_id -> token_id
+    for p in positions:
+        cid = p.get("conditionId") or p.get("condition_id", "")
+        tid = p.get("asset") or p.get("token_id", "")
+        if cid and tid:
+            token_map[cid] = tid
+
+    removed = 0
+    to_remove = []
+
+    for cond_id in list(redeemed.keys()):
+        token_id = token_map.get(cond_id)
+        if not token_id:
+            continue  # 没有 token_id 无法验证，保留标记
+
+        # 链上检查余额
+        for addr in check_addrs:
+            try:
+                bal = ctf_contract.functions.balanceOf(addr, int(token_id)).call()
+                if bal > 0:
+                    slug = redeemed[cond_id].get("slug", cond_id[:18])
+                    log.info(f"  🔄 清理假标记: {slug} (余额仍有 {bal})")
+                    to_remove.append(cond_id)
+                    break
+            except Exception:
+                continue
+
+    for cid in to_remove:
+        del redeemed[cid]
+        removed += 1
+
+    if removed > 0:
+        save_redeemed(redeemed)
+        log.info(f"🧹 清理了 {removed} 个假标记，将在本轮重新领取")
+
+    return removed
 
 
 def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
@@ -563,33 +772,58 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     if usdc_before >= 0:
         log.info(f"💰 领取前余额: ${usdc_before:.2f} USDC")
 
-    # 4. 逐个 redeem
+    # 4. 并行 redeem（预分配 nonce + 批量发送 + 统一收回执）
+    eoa_cs = Web3.to_checksum_address(wallet.address)
+    check_addrs = [eoa_cs]
+    if PROXY_WALLET and PROXY_WALLET.lower() != wallet.address.lower():
+        check_addrs.append(Web3.to_checksum_address(PROXY_WALLET))
+
+    batch_results = parallel_redeem(w3, wallet, pending)
+
+    # 5. 链上验证 + 标记
     success_count = 0
     fail_count = 0
+    zero_payout_count = 0
 
-    for r in pending:
+    for br in batch_results:
+        r = br["position"]
         cid = r["condition_id"]
-        val = r.get("value", 0)
-        bal = r.get("balance", 0)
+        slug = r.get("slug", cid[:18])
+        token_id = r.get("token_id", "")
+        balance_before = r.get("balance", 0)
 
-        tx_hash = redeem_position(
-            w3, wallet, cid,
-            neg_risk=r.get("neg_risk", False),
-            balance=bal,
-        )
-
-        if tx_hash:
-            success_count += 1
-            mark_redeemed(redeemed, cid, r["slug"], val, r.get("size", 0), tx_hash)
-        else:
+        if not br["success"]:
             fail_count += 1
+            continue
 
-        # 间隔 3 秒，等区块确认 + 避免 nonce 冲突
-        time.sleep(3)
+        # 链上验证: token 余额是否真正减少
+        actually_redeemed = False
+        if token_id:
+            for addr in check_addrs:
+                try:
+                    new_bal = ctf_contract.functions.balanceOf(addr, int(token_id)).call()
+                    if new_bal < balance_before:
+                        actually_redeemed = True
+                        break
+                except Exception:
+                    continue
+            if not actually_redeemed:
+                log.warning(f"  ⚠️ tx成功但余额未变，不标记: {slug}")
+                fail_count += 1
+                continue
+        else:
+            actually_redeemed = True
 
-    # 5. USDC 余额（领取后）
+        success_count += 1
+        mark_redeemed(redeemed, cid, slug, r.get("value", 0), r.get("size", 0), br.get("tx_hash", ""))
+
+    # 6. USDC 余额（领取后）+ 统计赢/输
     usdc_after = get_usdc_balance(wallet, usdc_contract)
-    gained = (usdc_after - usdc_before) if usdc_before >= 0 and usdc_after >= 0 else 0
+    gained = (usdc_after - (usdc_now if usdc_now >= 0 else 0)) if usdc_after >= 0 else 0
+
+    if gained <= 0.001 and success_count > 0:
+        zero_payout_count = success_count
+        log.info(f"  💡 全部为输的token（$0收益），已清理链上残余余额")
 
     log.info(
         f"{'✅' if success_count > 0 else '⚠️'} 领取完成: "
@@ -618,7 +852,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
 
 def main() -> None:
     log.info("=" * 55)
-    log.info("🔄 Polymarket 链上自动结算 v3.3 启动 (REST API查仓+EOA直接结算)")
+    log.info("🔄 Polymarket 链上自动结算 v3.6 启动 (并行结算+链上验证+假标记清理)")
     log.info(f"   RPC         : {RPC_URL}")
     log.info(f"   轮询间隔    : {REDEEM_INTERVAL}s ({REDEEM_INTERVAL // 60} 分钟)")
     log.info(f"   已领取记录  : {REDEEMED_FILE}")
@@ -629,6 +863,12 @@ def main() -> None:
     if PROXY_WALLET:
         log.info(f"   Proxy 钱包  : {PROXY_WALLET}")
     log.info(f"   RPC 已连接   : chainId={w3.eth.chain_id}")
+
+    # 启动时清理假标记（之前 Multicall 可能标记了未真正领取的记录）
+    try:
+        cleanup_false_redeemed(w3, wallet, ctf_contract)
+    except Exception as e:
+        log.warning(f"⚠️ 假标记清理异常: {e}")
 
     total_redeemed = 0.0
     cycle = 0

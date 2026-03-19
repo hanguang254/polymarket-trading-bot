@@ -4,9 +4,13 @@
 """
 import json
 import os
+import threading
 from datetime import datetime, timezone, date
 
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", "10.0"))  # 每日最大亏损额（USDC）
+
+# 全局锁：保护 daily_pnl 读写，防止并行线程同时通过亏损检查
+_trade_lock = threading.Lock()
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "trading_state.json")
 
@@ -46,6 +50,55 @@ def should_trade():
     if daily_pnl <= -MAX_DAILY_LOSS:
         return False  # 当日亏损超限，停止交易
     return True
+
+
+def check_daily_loss_limit():
+    """线程安全的日亏损检查（在下注前调用）
+    Returns: (allowed: bool, daily_pnl: float, limit: float)
+    """
+    with _trade_lock:
+        state = load_state()
+        today = str(date.today())
+        if state.get("daily_pnl_date") != today:
+            state["daily_pnl"] = 0.0
+            state["daily_pnl_date"] = today
+            save_state(state)
+            return True, 0.0, MAX_DAILY_LOSS
+        daily_pnl = state.get("daily_pnl", 0.0)
+        if daily_pnl <= -MAX_DAILY_LOSS:
+            return False, daily_pnl, MAX_DAILY_LOSS
+        return True, daily_pnl, MAX_DAILY_LOSS
+
+
+def record_bet_cost(slug, cost):
+    """下注时立即扣减 daily_pnl（假设最坏情况全亏），防止并行超限
+    cost: 下注金额（正数），会作为负值计入 daily_pnl
+    """
+    with _trade_lock:
+        state = load_state()
+        today = str(date.today())
+        if state.get("daily_pnl_date") != today:
+            state["daily_pnl"] = 0.0
+            state["daily_pnl_date"] = today
+        state["daily_pnl"] = round(state.get("daily_pnl", 0.0) - cost, 4)
+        state.setdefault("pending_costs", {})[slug] = cost
+        save_state(state)
+        return state["daily_pnl"]
+
+
+def settle_bet_cost(slug, actual_pnl):
+    """平仓时用实际盈亏替换预扣的成本
+    actual_pnl: 实际盈亏（正=盈利，负=亏损）
+    """
+    with _trade_lock:
+        state = load_state()
+        pending = state.get("pending_costs", {})
+        cost = pending.pop(slug, 0.0)
+        # 先回补预扣的成本，再加上实际盈亏
+        state["daily_pnl"] = round(state.get("daily_pnl", 0.0) + cost + actual_pnl, 4)
+        state["pending_costs"] = pending
+        save_state(state)
+        return state["daily_pnl"]
 
 def record_bet_result(success, slug, pnl=0.0):
     """记录下注结果，pnl 为本次盈亏（正=盈利，负=亏损）"""

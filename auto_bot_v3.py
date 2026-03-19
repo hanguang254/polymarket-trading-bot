@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 from ai_trader.polymarket_api import get_current_markets
 from ai_trader import clob_client
 from ai_analyze_v2 import analyze_and_decide
-from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result
+from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result, check_daily_loss_limit, record_bet_cost
 
 
 _playwright_failures = 0  # Playwright 连续失败计数
@@ -158,28 +158,7 @@ def get_ptb_multi_strategy(slug):
     else:
         logger.info(f"   跳过 Playwright（连续失败{_playwright_failures}次）")
 
-    # 2. 网页 HTML 抓取（requests + regex，无需浏览器，速度快）
-    try:
-        from ai_trader.polymarket_api import get_price_to_beat_browser
-        ptb = get_price_to_beat_browser(slug)
-        if ptb:
-            return ptb
-    except Exception as e:
-        logger.warning(f"   HTML PTB 失败: {e}")
-
-    # 3. Gamma API（最不可靠，eventMetadata 经常为空）
-    try:
-        resp = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
-        if resp.status_code == 200:
-            events = resp.json()
-            if events:
-                meta = events[0].get("eventMetadata", {})
-                ptb = meta.get("priceToBeat")
-                if ptb:
-                    return float(ptb)
-    except Exception as e:
-        logger.warning(f"   Gamma API PTB 失败: {e}")
-
+    # Playwright 获取不到就跳过，不使用兜底（HTML/Gamma容易抓到错误PTB）
     return None
 
 
@@ -634,6 +613,13 @@ class MarketTracker:
     def analyze_and_trade(self, slug, market, extra_info=None):
         """分析并下注（带趋势确认）"""
         coin = market["coin"]
+
+        # ★ 日亏损上限检查（在任何分析之前，线程安全）
+        allowed, daily_pnl, limit = check_daily_loss_limit()
+        if not allowed:
+            logger.warning(f"  🚫 今日亏损 ${daily_pnl:+.2f} 已达上限 -${limit}，停止交易 [{coin}]")
+            return
+
         up_odds = market["up_odds"]
         down_odds = market["down_odds"]
         gap_trend = extra_info.get("gap_trend", "未知") if extra_info else "未知"
@@ -784,6 +770,11 @@ class MarketTracker:
         
         if success:
             logger.info(f"  ✅ 下注成功！（{bet_size}份）")
+
+            # ★ 立即预扣下注成本到 daily_pnl（防止并行线程超限）
+            cost = round(entry_price * bet_size, 4)
+            new_pnl = record_bet_cost(slug, cost)
+            logger.info(f"  📉 预扣成本 ${cost:.2f} → 今日PnL: ${new_pnl:+.2f}")
 
             # 记录持仓（使用实际下单价格和动态仓位）
             position = Position(
