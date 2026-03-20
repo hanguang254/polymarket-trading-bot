@@ -53,10 +53,7 @@ from ai_analyze_v2 import analyze_and_decide
 from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result, check_daily_loss_limit, record_bet_cost
 
 
-_playwright_failures = {}  # Playwright 连续失败计数（按币种独立: {coin: count}）
-_ptb_batch_pending = {}  # 待批量获取的 PTB: {slug: coin}
-_ptb_batch_lock = threading.Lock()
-_playwright_lock = threading.Lock()  # 串行化 Playwright 进程，防止多个 Chromium 同时启动爆内存
+_playwright_failures = 0  # Playwright 连续失败计数
 
 # ── 网络熔断器 ──
 _api_failures = 0          # 连续 API 失败计数
@@ -124,16 +121,11 @@ def circuit_breaker_record(success):
             _api_failures = 0
 
 def get_ptb_multi_strategy(slug):
-    """单个 PTB 获取（subprocess 隔离，加锁防止多个 Chromium 同时启动）"""
-    from ai_trader.coins import coin_from_slug
-    coin = coin_from_slug(slug)
-    failures = _playwright_failures.get(coin, 0)
+    """多层获取 PTB — 智能降级，超时保护防卡死"""
+    global _playwright_failures
 
-    if failures >= 3:
-        logger.info(f"   跳过 Playwright（{coin}连续失败{failures}次）")
-        return None
-
-    with _playwright_lock:
+    # 1. Playwright（subprocess隔离，超时可杀进程，防止卡死主流程）
+    if _playwright_failures < 3:
         try:
             ptb_script = os.path.join(os.path.dirname(__file__), "ai_trader", "playwright_ptb.py")
             t0 = time.time()
@@ -143,83 +135,36 @@ def get_ptb_multi_strategy(slug):
             )
             elapsed = time.time() - t0
             if result.returncode == 0 and result.stdout:
+                # 从 stdout 解析 PTB 值（格式：PTB=75282.89 或 ✅ PTB=75282.89）
                 import re
                 m = re.search(r'PTB=([\d.]+)', result.stdout)
                 if m:
                     ptb = float(m.group(1))
                     if 100 < ptb < 10_000_000:
-                        _playwright_failures[coin] = 0
+                        _playwright_failures = 0
                         print(f"✅ PTB={ptb:.2f} (Playwright, {elapsed:.1f}s)")
                         return ptb
-            _playwright_failures[coin] = failures + 1
-            if _playwright_failures[coin] >= 3:
-                logger.warning(f"   Playwright {coin}连续{_playwright_failures[coin]}次失败，后续跳过")
+            # 进程返回但没拿到PTB
+            _playwright_failures += 1
+            if _playwright_failures >= 3:
+                logger.warning(f"   Playwright 连续{_playwright_failures}次失败，后续跳过")
             else:
-                logger.warning(f"   Playwright PTB 无结果({_playwright_failures[coin]}/3) | {elapsed:.1f}s")
+                logger.warning(f"   Playwright PTB 无结果({_playwright_failures}/3) | {elapsed:.1f}s")
         except subprocess.TimeoutExpired:
-            _playwright_failures[coin] = failures + 1
-            logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures[coin]}/3) [{coin}]")
+            _playwright_failures += 1
+            logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures}/3)")
         except Exception as e:
-            _playwright_failures[coin] = failures + 1
-            logger.warning(f"   Playwright PTB 失败({_playwright_failures[coin]}/3): {str(e)[:80]}")
+            _playwright_failures += 1
+            err_msg = str(e)[:80]
+            if _playwright_failures >= 3:
+                logger.warning(f"   Playwright 连续{_playwright_failures}次失败，后续跳过: {err_msg}")
+            else:
+                logger.warning(f"   Playwright PTB 失败({_playwright_failures}/3): {err_msg}")
+    else:
+        logger.info(f"   跳过 Playwright（连续失败{_playwright_failures}次）")
 
+    # Playwright 获取不到就跳过，不使用兜底（HTML/Gamma容易抓到错误PTB）
     return None
-
-
-def get_ptb_batch(slugs):
-    """批量获取 PTB — 单浏览器多标签页并行（subprocess 隔离）
-    Returns: {slug: ptb_value, ...}
-    """
-    if not slugs:
-        return {}
-    try:
-        ptb_script = os.path.join(os.path.dirname(__file__), "ai_trader", "playwright_ptb.py")
-        t0 = time.time()
-        result = subprocess.run(
-            [sys.executable, ptb_script] + list(slugs),
-            capture_output=True, text=True, timeout=25
-        )
-        elapsed = time.time() - t0
-        if result.returncode == 0 and result.stdout:
-            import re
-            ptb_results = {}
-            for m in re.finditer(r'(\S+?)=([\d.]+)', result.stdout):
-                key, val = m.group(1), float(m.group(2))
-                # 匹配 slug=value 格式（批量输出）
-                for s in slugs:
-                    if s.endswith(key) or key in s:
-                        if 100 < val < 10_000_000:
-                            ptb_results[s] = val
-                            break
-                # 也匹配 PTB=value（单个输出）
-                if key == "PTB" and len(slugs) == 1 and 100 < val < 10_000_000:
-                    ptb_results[slugs[0]] = val
-            if ptb_results:
-                # 成功的币种重置失败计数
-                from ai_trader.coins import coin_from_slug
-                for s in ptb_results:
-                    _playwright_failures[coin_from_slug(s)] = 0
-                logger.info(f"   批量PTB {len(ptb_results)}/{len(slugs)} ({elapsed:.1f}s)")
-                return ptb_results
-        # 全部失败 — 打印 stderr 帮助调试
-        from ai_trader.coins import coin_from_slug
-        if result.stderr:
-            logger.warning(f"   批量PTB stderr: {result.stderr[:200]}")
-        if result.stdout:
-            logger.warning(f"   批量PTB stdout: {result.stdout[:200]}")
-        for s in slugs:
-            c = coin_from_slug(s)
-            _playwright_failures[c] = _playwright_failures.get(c, 0) + 1
-        logger.warning(f"   批量PTB 全部失败 ({elapsed:.1f}s)")
-    except subprocess.TimeoutExpired:
-        from ai_trader.coins import coin_from_slug
-        for s in slugs:
-            c = coin_from_slug(s)
-            _playwright_failures[c] = _playwright_failures.get(c, 0) + 1
-        logger.warning(f"   批量PTB 超时(25s)")
-    except Exception as e:
-        logger.warning(f"   批量PTB 异常: {str(e)[:80]}")
-    return {}
 
 
 def get_token_ids(slug):
@@ -430,8 +375,6 @@ class MarketTracker:
             
             if slug not in self.tracked:
                 self.tracked[slug] = market
-                # 新市场周期，重置该币种的 Playwright 失败计数
-                _playwright_failures.pop(market["coin"], None)
                 end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
                 remaining = (end_dt - now).total_seconds()
                 logger.info(f"\n🆕 新市场: {market['coin']} | {slug}")
@@ -460,8 +403,13 @@ class MarketTracker:
             
             # === PTB 获取期：2s-40s（尽早获取） ===
             if 2 <= elapsed < 40 and slug not in self.ptb_cache:
-                with _ptb_batch_lock:
-                    _ptb_batch_pending[slug] = market['coin']
+                logger.info(f"\n💰 获取 PTB: {market['coin']} | {slug}")
+                ptb = get_ptb_multi_strategy(slug)
+                if ptb:
+                    self.ptb_cache[slug] = ptb
+                    logger.info(f"   PTB: ${ptb:,.2f}")
+                else:
+                    logger.warning(f"   ⚠️ PTB 获取失败")
             
             # === 预热期：20s-160s（PTB获取后立即开始贝叶斯采样，延续到晚期窗口） ===
             LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
@@ -660,26 +608,7 @@ class MarketTracker:
                 self.skipped_markets.pop(slug, None)
                 pending_trades.append((slug, market, extra_info))
 
-        # 批量获取 PTB（单浏览器多标签页，2H2G服务器友好）
-        with _ptb_batch_lock:
-            batch_slugs = [s for s in _ptb_batch_pending if s not in self.ptb_cache]
-            _ptb_batch_pending.clear()
-        if batch_slugs:
-            # 过滤掉已熔断的币种
-            from ai_trader.coins import coin_from_slug
-            active_slugs = [s for s in batch_slugs if _playwright_failures.get(coin_from_slug(s), 0) < 3]
-            if active_slugs:
-                logger.info(f"\n💰 批量获取 PTB: {', '.join(coin_from_slug(s) for s in active_slugs)}")
-                ptb_results = get_ptb_batch(active_slugs)
-                for s, ptb_val in ptb_results.items():
-                    self.ptb_cache[s] = ptb_val
-                    logger.info(f"   PTB: {coin_from_slug(s)} ${ptb_val:,.2f}")
-                # 标记失败的 slug 不再重试（在本轮）
-                for s in active_slugs:
-                    if s not in ptb_results:
-                        logger.warning(f"   ⚠️ PTB 获取失败: {coin_from_slug(s)}")
-
-        # 并行执行所有待分析市场（BTC+ETH+BNB同时分析下注，而非串行等待）
+        # 并行执行所有待分析市场（BTC+ETH同时分析下注，而非串行等待）
         if len(pending_trades) > 1:
             from concurrent.futures import ThreadPoolExecutor as _TPE
             with _TPE(max_workers=len(pending_trades)) as pool:
