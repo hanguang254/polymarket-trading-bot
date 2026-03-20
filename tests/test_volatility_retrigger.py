@@ -116,14 +116,8 @@ class TestSkipRecording(unittest.TestCase):
         # 运行 check_analysis_trigger
         self.tracker.check_analysis_trigger()
 
-        # 应被记录到 skipped_markets
-        self.assertIn(slug, self.tracker.skipped_markets)
-        skip = self.tracker.skipped_markets[slug]
-        self.assertEqual(skip["reason"], "low_conf")
-        self.assertEqual(skip["reanalyze_count"], 0)
-        self.assertAlmostEqual(skip["price_at_skip"], 70715, delta=1)
-        # 也应被加入 analyzed
-        self.assertIn(slug, self.tracker.analyzed)
+        # 低置信度不永久封锁，等待冷却后重试
+        self.assertNotIn(slug, self.tracker.analyzed)
 
     def test_gap_cross_skip_records(self):
         """gap穿越 + 贝叶斯弱跳过时应记录"""
@@ -146,9 +140,8 @@ class TestSkipRecording(unittest.TestCase):
 
         self.tracker.check_analysis_trigger()
 
-        self.assertIn(slug, self.tracker.skipped_markets)
-        skip = self.tracker.skipped_markets[slug]
-        self.assertEqual(skip["reason"], "gap_cross_weak")
+        # gap穿越不永久封锁，等待冷却后重试
+        self.assertNotIn(slug, self.tracker.analyzed)
 
     def test_proceed_to_trade_clears_skip(self):
         """正常进入交易时不应留在 skipped_markets"""
@@ -249,10 +242,8 @@ class TestVolatilityDetection(unittest.TestCase):
 
         self.tracker.check_analysis_trigger()
 
-        # 波动触发 → 晚期窗口重新处理 → conf 仍低 → 跳过
-        # 因为 is_reanalyze=True，不会再记录到 skipped_markets
-        self.assertIn(slug, self.tracker.analyzed)
-        self.assertNotIn(slug, self.tracker.skipped_markets)
+        # 波动触发 → 晚期窗口重新处理 → conf 仍低 → 不封锁，等待冷却重试
+        self.assertNotIn(slug, self.tracker.analyzed)
 
     def test_small_move_no_trigger(self):
         """价格移动 < 1.5 ATR 时不触发"""
@@ -420,9 +411,8 @@ class TestReanalysisFlow(unittest.TestCase):
 
         self.tracker.check_analysis_trigger()
 
-        # 应被 analyzed 但不在 skipped_markets（is_reanalyze=True → 不再记录skip）
-        self.assertIn(slug, self.tracker.analyzed)
-        self.assertNotIn(slug, self.tracker.skipped_markets)
+        # conf仍低不封锁，等待冷却重试
+        self.assertNotIn(slug, self.tracker.analyzed)
 
 
 class TestAnalyzeAndTradeSkipRecording(unittest.TestCase):

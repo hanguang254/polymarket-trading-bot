@@ -350,6 +350,7 @@ class MarketTracker:
         self.token_cache = {}  # slug -> (up_token, down_token)  预热阶段缓存token_ids
         self.skipped_markets = {}  # slug -> {skip_time, price_at_skip, reason, reanalyze_count}
         self.trade_attempts = {}  # slug -> 晚期窗口交易尝试次数（FOK失败后允许重试）
+        self.last_analysis_time = {}  # slug -> 上次晚期分析时间戳（冷却用）
     
     def update_markets(self):
         """更新市场列表"""
@@ -540,6 +541,11 @@ class MarketTracker:
                     self.analyzed.add(slug)
                     logger.warning(f"\n⚠️ {market['coin']} 晚期窗口已重试{MAX_TRADE_RETRIES}次，放弃")
                     continue
+                # 冷却期：避免每2秒重复分析，等待市场条件变化
+                LATE_REANALYZE_INTERVAL = int(os.environ.get("LATE_REANALYZE_INTERVAL", "20"))
+                if time.time() - self.last_analysis_time.get(slug, 0) < LATE_REANALYZE_INTERVAL:
+                    continue
+                self.last_analysis_time[slug] = time.time()
                 # 获取跳过时的价格快照（用于波动重触发）
                 _skip_price = None
                 _samples_snap = self.warmup_data.get(slug, [])
@@ -568,17 +574,9 @@ class MarketTracker:
                     reanalyze_tag = " [重分析]" if is_reanalyze else ""
                     logger.info(f"\n🧠 贝叶斯结果{reanalyze_tag}: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f} (n={updater.n_updates})")
 
-                    # 贝叶斯置信度太低（<30%），方向不确定，跳过
+                    # 贝叶斯置信度太低（<15%），方向不确定，跳过（等冷却后重试）
                     if b_conf < 0.15:
-                        logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，跳过")
-                        self.analyzed.add(slug)
-                        if not is_reanalyze and _skip_price:
-                            self.skipped_markets[slug] = {
-                                "skip_time": time.time(), "price_at_skip": _skip_price,
-                                "reason": "low_conf", "reanalyze_count": 0,
-                            }
-                        else:
-                            self.skipped_markets.pop(slug, None)
+                        logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，等待变化")
                         continue
                 else:
                     logger.info(f"\n📊 无贝叶斯数据，使用gap趋势: {gap_trend}")
@@ -591,26 +589,10 @@ class MarketTracker:
                         if b_conf >= 0.6:
                             logger.info(f"  ✅ gap穿越但贝叶斯置信度高({b_conf:.3f})，允许交易")
                         else:
-                            logger.warning(f"\n⚠️ {market['coin']} gap穿越+贝叶斯弱({b_conf:.3f})，跳过")
-                            self.analyzed.add(slug)
-                            if not is_reanalyze and _skip_price:
-                                self.skipped_markets[slug] = {
-                                    "skip_time": time.time(), "price_at_skip": _skip_price,
-                                    "reason": "gap_cross_weak", "reanalyze_count": 0,
-                                }
-                            else:
-                                self.skipped_markets.pop(slug, None)
+                            logger.warning(f"\n⚠️ {market['coin']} gap穿越+贝叶斯弱({b_conf:.3f})，等待变化")
                             continue
                     else:
-                        logger.warning(f"\n⚠️ {market['coin']} gap穿越零轴，跳过")
-                        self.analyzed.add(slug)
-                        if not is_reanalyze and _skip_price:
-                            self.skipped_markets[slug] = {
-                                "skip_time": time.time(), "price_at_skip": _skip_price,
-                                "reason": "gap_cross", "reanalyze_count": 0,
-                            }
-                        else:
-                            self.skipped_markets.pop(slug, None)
+                        logger.warning(f"\n⚠️ {market['coin']} gap穿越零轴，等待变化")
                         continue
                 elif gap_trend == "缩小":
                     extra_info["min_discount"] = 0.18
@@ -779,10 +761,7 @@ class MarketTracker:
                     }
             else:
                 self.skipped_markets.pop(slug, None)
-            # 早期窗口失败不加入 analyzed，允许晚期窗口重新分析
-            is_early = (extra_info or {}).get("early_window", False)
-            if not is_early:
-                self.analyzed.add(slug)
+            # 分析拒绝不加入 analyzed，允许冷却后重新分析
             decrease_cooldown()
             logger.info(f"{'='*60}\n")
             return
