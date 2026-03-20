@@ -924,7 +924,8 @@ class MarketTracker:
             print(f"  {'📈' if pnl > 0 else '📉'} 盈亏: ${pnl:+.2f}")
             
             # 发送Telegram通知
-            coin = "BTC" if "btc" in slug.lower() else "ETH"
+            from ai_trader.coins import coin_from_slug
+            coin = coin_from_slug(slug)
             send_close_notification(coin, position.direction, position.entry_price, exit_price, position.size, pnl)
             
             # 记录到日志

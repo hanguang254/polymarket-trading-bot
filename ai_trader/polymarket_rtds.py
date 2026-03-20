@@ -20,11 +20,15 @@ RTDS_URL = "wss://ws-live-data.polymarket.com"
 PING_INTERVAL = 5  # 文档要求每5秒 PING
 STALE_THRESHOLD = 5  # 超过5秒无更新视为过期
 
-# Chainlink symbol 映射
-CHAINLINK_SYMBOLS = {
-    "BTC": "btc/usd",
-    "ETH": "eth/usd",
-}
+# Chainlink symbol 映射（从 coins.py 动态加载）
+def _load_chainlink_symbols():
+    try:
+        from ai_trader.coins import get_coins_config
+        return {coin: cfg["chainlink"] for coin, cfg in get_coins_config().items() if cfg.get("chainlink")}
+    except Exception:
+        return {"BTC": "btc/usd", "ETH": "eth/usd"}
+
+CHAINLINK_SYMBOLS = _load_chainlink_symbols()
 # 反向映射
 _SYMBOL_TO_COIN = {v: k for k, v in CHAINLINK_SYMBOLS.items()}
 

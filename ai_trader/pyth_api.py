@@ -10,11 +10,18 @@ import requests
 
 HERMES_BASE = "https://hermes.pyth.network"
 
-# Pyth 官方 price feed IDs
-PYTH_FEED_IDS = {
-    "BTC": "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-    "ETH": "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-}
+# Pyth 官方 price feed IDs（从 coins.py 动态加载）
+def _load_pyth_feeds():
+    try:
+        from ai_trader.coins import get_coins_config
+        return {coin: cfg["pyth_feed"] for coin, cfg in get_coins_config().items() if cfg.get("pyth_feed")}
+    except Exception:
+        return {
+            "BTC": "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+            "ETH": "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+        }
+
+PYTH_FEED_IDS = _load_pyth_feeds()
 
 
 class PythPriceStream:

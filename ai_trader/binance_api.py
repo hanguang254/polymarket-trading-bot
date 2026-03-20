@@ -50,7 +50,9 @@ class BinancePriceStream:
     def _connect(self):
         while self._running:
             try:
-                url = "wss://stream.binance.com:9443/ws/btcusdt@trade/ethusdt@trade"
+                from ai_trader.coins import get_coins_config
+                streams = "/".join(cfg["binance_ws"] for cfg in get_coins_config().values())
+                url = f"wss://stream.binance.com:9443/ws/{streams}"
                 self._ws = websocket.WebSocketApp(
                     url,
                     on_message=self._on_message,
@@ -72,12 +74,11 @@ class BinancePriceStream:
             data = json.loads(message)
             symbol = data.get("s", "")
             price = float(data["p"])
-            if symbol == "BTCUSDT":
-                self.prices["BTC"] = price
-                self.last_update["BTC"] = time.time()
-            elif symbol == "ETHUSDT":
-                self.prices["ETH"] = price
-                self.last_update["ETH"] = time.time()
+            # 动态解析: BTCUSDT→BTC, ETHUSDT→ETH, BNBUSDT→BNB
+            coin = symbol.replace("USDT", "").upper() if symbol.endswith("USDT") else None
+            if coin:
+                self.prices[coin] = price
+                self.last_update[coin] = time.time()
         except Exception:
             pass
 

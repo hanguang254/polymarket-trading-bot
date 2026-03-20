@@ -18,6 +18,7 @@ from ai_trader.binance_api import price_stream as _price_stream
 from ai_trader.pyth_api import pyth_stream as _pyth_stream, get_pyth_price
 from ai_trader.polymarket_ws import poly_ws as _poly_ws
 from ai_trader.polymarket_rtds import chainlink_stream as _chainlink_stream
+from ai_trader.coins import coin_from_slug as _coin_from_slug, get_binance_symbol as _get_binance_symbol
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ═══ 日志：print 同时写入 logs/monitor.log ═══
@@ -748,7 +749,7 @@ def get_current_crypto_price(coin):
     if ws_price is not None:
         return ws_price
     try:
-        symbol = "BTCUSDT" if coin == "BTC" else "ETHUSDT"
+        symbol = _get_binance_symbol(coin)
         resp = requests.get(
             f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
             timeout=5
@@ -779,7 +780,7 @@ def get_ptb_from_slug(slug):
 def get_atr_from_binance(coin, period=14):
     """获取ATR（平均真实波幅）"""
     try:
-        symbol = "BTCUSDT" if coin == "BTC" else "ETHUSDT"
+        symbol = _get_binance_symbol(coin)
         resp = requests.get(
             f"https://api.binance.com/api/v3/klines",
             params={"symbol": symbol, "interval": "1m", "limit": period + 1},
@@ -1277,7 +1278,7 @@ def reconcile_pending_orders():
 
             size = filled_size if filled_size else order.get("requested_size") or order.get("size") or 0
 
-            coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+            coin = _coin_from_slug(slug)
             confidence = order.get("confidence") or 0
             ev = order.get("ev") or 0
 
@@ -1375,7 +1376,7 @@ def reconcile_pending_orders():
                     "resolved_at": now.isoformat(),
                 })
                 try:
-                    coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+                    coin = _coin_from_slug(slug)
                     msg = (
                         f"🛡️ <b>挂单价格保护取消</b>\n\n"
                         f"币种: {coin}\n"
@@ -1401,7 +1402,7 @@ def reconcile_pending_orders():
             })
             # 过期取消通知
             try:
-                coin = "BTC" if "btc" in (slug or "").lower() else "ETH"
+                coin = _coin_from_slug(slug)
                 msg = (
                     f"⌛ <b>挂单过期取消</b>\n\n"
                     f"币种: {coin}\n"
@@ -1616,7 +1617,7 @@ def monitor():
                 slug = pos.get("slug", "unknown")
                 entry_time = pos.get("entry_time", "")
                 attempt_key = (slug, entry_time)
-                coin = "BTC" if "btc" in slug else "ETH"
+                coin = _coin_from_slug(slug)
                 direction = pos.get("direction", "UP")
 
                 # 预缓存 neg_risk/fee_rate，避免平仓时额外HTTP查询

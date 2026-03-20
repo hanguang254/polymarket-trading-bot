@@ -48,9 +48,11 @@ def get_current_markets():
     base_5m = (now_ts // 300) * 300
     
     markets = []
-    for prefix in ['btc-updown-5m', 'eth-updown-5m']:
+    from ai_trader.coins import get_coins_config, coin_from_slug
+    coins_cfg = get_coins_config()
+    for coin, cfg in coins_cfg.items():
+        prefix = cfg["slug_prefix"]
         slug = f"{prefix}-{base_5m}"
-        coin = 'BTC' if 'btc' in prefix else 'ETH'
         
         try:
             resp = requests.get(
