@@ -53,7 +53,8 @@ from ai_analyze_v2 import analyze_and_decide
 from trading_state import should_trade, decrease_cooldown, get_state_summary, record_bet_result, check_daily_loss_limit, record_bet_cost
 
 
-_playwright_failures = 0  # Playwright 连续失败计数
+_playwright_failures = {}  # Playwright 连续失败计数（按币种独立: {coin: count}）
+_playwright_lock = threading.Lock()  # 串行化analyze_and_trade中的PTB获取
 
 # ── 网络熔断器 ──
 _api_failures = 0          # 连续 API 失败计数
@@ -120,50 +121,56 @@ def circuit_breaker_record(success):
             logger.error(f"  ⚡ 触发熔断！连续{_api_failures}次API失败，暂停{CIRCUIT_BREAK_DURATION}s")
             _api_failures = 0
 
+def _fetch_ptb_subprocess(slug):
+    """单个 PTB subprocess 获取（内部函数，不含锁/失败计数）
+    Returns: (ptb_value, elapsed) or (None, elapsed)
+    """
+    ptb_script = os.path.join(os.path.dirname(__file__), "ai_trader", "playwright_ptb.py")
+    t0 = time.time()
+    result = subprocess.run(
+        [sys.executable, ptb_script, slug],
+        capture_output=True, text=True, timeout=20
+    )
+    elapsed = time.time() - t0
+    if result.returncode == 0 and result.stdout:
+        import re
+        m = re.search(r'PTB=([\d.]+)', result.stdout)
+        if m:
+            ptb = float(m.group(1))
+            if 100 < ptb < 10_000_000:
+                return ptb, elapsed
+    return None, elapsed
+
+
 def get_ptb_multi_strategy(slug):
-    """多层获取 PTB — 智能降级，超时保护防卡死"""
-    global _playwright_failures
+    """单个 PTB 获取（加锁防止并行线程同时启动多个 Chromium）"""
+    from ai_trader.coins import coin_from_slug
+    coin = coin_from_slug(slug)
+    failures = _playwright_failures.get(coin, 0)
 
-    # 1. Playwright（subprocess隔离，超时可杀进程，防止卡死主流程）
-    if _playwright_failures < 3:
+    if failures >= 3:
+        logger.info(f"   跳过 Playwright（{coin}连续失败{failures}次）")
+        return None
+
+    with _playwright_lock:
         try:
-            ptb_script = os.path.join(os.path.dirname(__file__), "ai_trader", "playwright_ptb.py")
-            t0 = time.time()
-            result = subprocess.run(
-                [sys.executable, ptb_script, slug],
-                capture_output=True, text=True, timeout=20
-            )
-            elapsed = time.time() - t0
-            if result.returncode == 0 and result.stdout:
-                # 从 stdout 解析 PTB 值（格式：PTB=75282.89 或 ✅ PTB=75282.89）
-                import re
-                m = re.search(r'PTB=([\d.]+)', result.stdout)
-                if m:
-                    ptb = float(m.group(1))
-                    if 100 < ptb < 10_000_000:
-                        _playwright_failures = 0
-                        print(f"✅ PTB={ptb:.2f} (Playwright, {elapsed:.1f}s)")
-                        return ptb
-            # 进程返回但没拿到PTB
-            _playwright_failures += 1
-            if _playwright_failures >= 3:
-                logger.warning(f"   Playwright 连续{_playwright_failures}次失败，后续跳过")
+            ptb, elapsed = _fetch_ptb_subprocess(slug)
+            if ptb:
+                _playwright_failures[coin] = 0
+                print(f"✅ PTB={ptb:.2f} (Playwright, {elapsed:.1f}s)")
+                return ptb
+            _playwright_failures[coin] = failures + 1
+            if _playwright_failures[coin] >= 3:
+                logger.warning(f"   Playwright {coin}连续{_playwright_failures[coin]}次失败，后续跳过")
             else:
-                logger.warning(f"   Playwright PTB 无结果({_playwright_failures}/3) | {elapsed:.1f}s")
+                logger.warning(f"   Playwright PTB 无结果({_playwright_failures[coin]}/3) | {elapsed:.1f}s")
         except subprocess.TimeoutExpired:
-            _playwright_failures += 1
-            logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures}/3)")
+            _playwright_failures[coin] = failures + 1
+            logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures[coin]}/3) [{coin}]")
         except Exception as e:
-            _playwright_failures += 1
-            err_msg = str(e)[:80]
-            if _playwright_failures >= 3:
-                logger.warning(f"   Playwright 连续{_playwright_failures}次失败，后续跳过: {err_msg}")
-            else:
-                logger.warning(f"   Playwright PTB 失败({_playwright_failures}/3): {err_msg}")
-    else:
-        logger.info(f"   跳过 Playwright（连续失败{_playwright_failures}次）")
+            _playwright_failures[coin] = failures + 1
+            logger.warning(f"   Playwright PTB 失败({_playwright_failures[coin]}/3): {str(e)[:80]}")
 
-    # Playwright 获取不到就跳过，不使用兜底（HTML/Gamma容易抓到错误PTB）
     return None
 
 
@@ -356,6 +363,7 @@ class MarketTracker:
         self.skipped_markets = {}  # slug -> {skip_time, price_at_skip, reason, reanalyze_count}
         self.trade_attempts = {}  # slug -> 晚期窗口交易尝试次数（FOK失败后允许重试）
         self.last_analysis_time = {}  # slug -> 上次晚期分析时间戳（冷却用）
+        self._ptb_pending = {}  # slug -> coin, 待并行获取PTB的市场
     
     def update_markets(self):
         """更新市场列表"""
@@ -375,6 +383,8 @@ class MarketTracker:
             
             if slug not in self.tracked:
                 self.tracked[slug] = market
+                # 新市场周期，重置该币种的 Playwright 失败计数
+                _playwright_failures.pop(market["coin"], None)
                 end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
                 remaining = (end_dt - now).total_seconds()
                 logger.info(f"\n🆕 新市场: {market['coin']} | {slug}")
@@ -401,15 +411,10 @@ class MarketTracker:
             elapsed = (now - start_dt).total_seconds()
             remaining = (end_dt - now).total_seconds()
             
-            # === PTB 获取期：2s-40s（尽早获取） ===
+            # === PTB 获取期：2s-40s（收集待获取列表，循环末尾并行获取） ===
             if 2 <= elapsed < 40 and slug not in self.ptb_cache:
-                logger.info(f"\n💰 获取 PTB: {market['coin']} | {slug}")
-                ptb = get_ptb_multi_strategy(slug)
-                if ptb:
-                    self.ptb_cache[slug] = ptb
-                    logger.info(f"   PTB: ${ptb:,.2f}")
-                else:
-                    logger.warning(f"   ⚠️ PTB 获取失败")
+                if slug not in self._ptb_pending:
+                    self._ptb_pending[slug] = market['coin']
             
             # === 预热期：20s-160s（PTB获取后立即开始贝叶斯采样，延续到晚期窗口） ===
             LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
@@ -608,7 +613,42 @@ class MarketTracker:
                 self.skipped_markets.pop(slug, None)
                 pending_trades.append((slug, market, extra_info))
 
-        # 并行执行所有待分析市场（BTC+ETH同时分析下注，而非串行等待）
+        # 并行获取 PTB（每个币种独立 Chromium 进程，4H4G服务器可并行）
+        if self._ptb_pending:
+            pending_slugs = {s: c for s, c in self._ptb_pending.items() if s not in self.ptb_cache}
+            self._ptb_pending.clear()
+            if pending_slugs:
+                # 过滤掉已熔断的币种
+                from ai_trader.coins import coin_from_slug
+                active = {s: c for s, c in pending_slugs.items() if _playwright_failures.get(c, 0) < 3}
+                if active:
+                    coins_str = ", ".join(active.values())
+                    logger.info(f"\n💰 并行获取 PTB: {coins_str}")
+                    from concurrent.futures import ThreadPoolExecutor as _TPE
+                    def _fetch_one_ptb(slug_coin):
+                        s, c = slug_coin
+                        try:
+                            ptb, elapsed = _fetch_ptb_subprocess(s)
+                            if ptb:
+                                _playwright_failures[c] = 0
+                                return s, ptb, elapsed
+                            _playwright_failures[c] = _playwright_failures.get(c, 0) + 1
+                            logger.warning(f"   PTB 无结果: {c} ({_playwright_failures[c]}/3) | {elapsed:.1f}s")
+                        except subprocess.TimeoutExpired:
+                            _playwright_failures[c] = _playwright_failures.get(c, 0) + 1
+                            logger.warning(f"   PTB 超时: {c} ({_playwright_failures[c]}/3)")
+                        except Exception as e:
+                            _playwright_failures[c] = _playwright_failures.get(c, 0) + 1
+                            logger.warning(f"   PTB 失败: {c} ({_playwright_failures[c]}/3): {str(e)[:60]}")
+                        return s, None, 0
+                    with _TPE(max_workers=len(active)) as pool:
+                        results = list(pool.map(_fetch_one_ptb, active.items()))
+                    for s, ptb_val, elapsed in results:
+                        if ptb_val:
+                            self.ptb_cache[s] = ptb_val
+                            logger.info(f"   ✅ PTB: {coin_from_slug(s)} ${ptb_val:,.2f} ({elapsed:.1f}s)")
+
+        # 并行执行所有待分析市场（BTC+ETH+BNB同时分析下注，而非串行等待）
         if len(pending_trades) > 1:
             from concurrent.futures import ThreadPoolExecutor as _TPE
             with _TPE(max_workers=len(pending_trades)) as pool:

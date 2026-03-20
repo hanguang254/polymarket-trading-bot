@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.9
+# Polymarket Trading Bot v10.0
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -347,6 +347,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v10.0**: PTB并行获取 + 失败计数按币种独立 — PTB fetch for multiple coins now runs in parallel using `ThreadPoolExecutor` (one Chromium subprocess per coin, all launched simultaneously). On 4H4G servers, 3 coins fetch in ~10s instead of ~30s serial. PTB requests are collected during warmup phase (2-40s) and batch-launched before analysis. `_playwright_failures` changed from global integer to per-coin dict — BTC timeout no longer blocks ETH/BNB. Counter resets on each new 5-minute market cycle. `analyze_and_trade` fallback PTB fetch uses `_playwright_lock` to serialize (prevents parallel threads from launching extra Chromium). Requires 4GB+ RAM for 3 concurrent Chromium processes.
 
 - **v9.9**: 币种可配置化 + BNB支持 + Chainlink止损优化 — **Multi-coin support**: New `ai_trader/coins.py` centralized coin configuration. All hardcoded BTC/ETH references replaced with dynamic lookups. Add/remove coins via `ENABLED_COINS` env var (e.g., `BTC,ETH,BNB`). Each coin auto-configures: Binance WS stream, Chainlink RTDS symbol, Pyth feed ID, Polymarket slug prefix. BNB (Binance Coin) added as third supported coin (`bnb-updown-5m` markets, Chainlink `bnb/usd` settlement feed). Files updated: `polymarket_api.py` (market discovery), `binance_api.py` (WS streams + symbol parsing), `pyth_api.py` (feed IDs), `polymarket_rtds.py` (Chainlink symbols), `position_monitor.py` (slug→coin + Binance symbol), `auto_bot_v3.py` (slug→coin). P3 correlation control applies to all enabled coins (same-direction positions get Kelly halved). **Chainlink stop-loss optimization**: (1) ATR decay stop — exits when ATR drops below 0.5 AND below 30% of entry ATR, before token price collapses (saves ~$2-3 per losing trade). (2) ATR acceleration stop — 3 consecutive ATR readings declining with current ATR<0.5 + token loss>10% triggers immediate exit. (3) Direction-correct ATR stop — ATR<0.5 + token loss>20% now triggers stop-loss even with correct direction (50:50 gamble not worth holding). (4) Proximity fast release — token loss exceeding hard stop line (-25%) immediately breaks proximity protection without waiting for streak=4. New env: `ENABLED_COINS`, `ATR_DECAY_EXIT_THRESHOLD`, `ATR_DECAY_RATIO`, `ATR_DIRECTION_CORRECT_STOP`. New file: `ai_trader/coins.py`.
 
