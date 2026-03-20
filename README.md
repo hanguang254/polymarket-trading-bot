@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.5
+# Polymarket Trading Bot v9.6
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -98,8 +98,9 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
 
 ### Infrastructure
-- **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used by warmup sampling, analysis, and position monitoring. Auto-reconnect with 2s backoff + 30s ping keepalive.
-- **Polymarket WebSocket Orderbook Stream**: `PolymarketOrderbookStream` singleton in `polymarket_ws.py` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` for real-time orderbook data. Handles `best_bid_ask`, `book`, and `price_change` events. FOK entry uses WS `best_ask` (0ms) instead of REST orderbook query (100-300ms), significantly reducing price staleness between read and order placement. Position monitor's `get_best_bid/get_best_ask/get_market_price` all use WS-first with REST fallback. Lazy connection: WS connects only on first `subscribe()` call (Polymarket requires immediate subscription after connect). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect with 2s backoff.
+- **Pyth Network On-Chain Price Stream**: `PythPriceStream` singleton in `pyth_api.py` receives BTC/ETH prices from Pyth Hermes v2 SSE stream (`hermes.pyth.network`). On-chain oracle prices are closer to Polymarket settlement source than CEX prices. Used as **primary** price source for position monitoring and settlement judgment (`get_current_crypto_price()`). REST fallback when SSE is stale. No API key required, free tier is production-grade.
+- **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used by warmup sampling and analysis (K-line/ATR). Serves as **fallback** for position monitoring when Pyth is unavailable. Auto-reconnect with 2s backoff + 30s ping keepalive.
+- **Polymarket WebSocket Orderbook Stream**: `PolymarketOrderbookStream` singleton in `polymarket_ws.py` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` for real-time orderbook data. Handles `best_bid_ask`, `book`, and `price_change` events. FOK entry uses WS `best_ask` (0ms) instead of REST orderbook query (100-300ms), significantly reducing price staleness between read and order placement. Position monitor's `get_best_bid/get_best_ask/get_market_price` all use WS-first with REST fallback. Lazy connection: WS connects only on first `subscribe()` call (Polymarket requires immediate subscription after connect). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect with exponential backoff (2s→4s→8s→...→30s, resets on stable connection).
 - **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
 - **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
@@ -127,7 +128,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | `ai_trader/lmsr_liquidity.py` | Orderbook liquidity: spread + depth + slippage → dynamic threshold |
 | `position_monitor.py` | EV-driven exit + 4-stage closing + pending order reconciliation + outcome recording |
 | `auto_redeem_v2.py` | Auto claim settled positions (REST API + on-chain redeem) |
-| `ai_trader/binance_api.py` | Binance market data: WebSocket real-time price stream + REST klines/stats |
+| `ai_trader/pyth_api.py` | Pyth Network on-chain price stream: SSE real-time + REST fallback (primary for position monitor) |
+| `ai_trader/binance_api.py` | Binance market data: WebSocket real-time price stream + REST klines/stats (fallback for position monitor) |
 | `ai_trader/polymarket_ws.py` | Polymarket Market Channel WebSocket: real-time orderbook/best_bid_ask stream |
 | `ai_trader/indicators.py` | Technical indicators (EMA, RSI, ATR, Bollinger Bands) |
 | `ai_trader/polymarket_api.py` | Polymarket API + PTB HTML scraper |
@@ -297,6 +299,7 @@ See `.env.example` for all configurable parameters:
 | `REANALYZE_ATR_MULT` | No | Price move in ATR multiples to retrigger skipped market (default: 1.5) |
 | `REANALYZE_COOLDOWN` | No | Min seconds before retrigger allowed (default: 15) |
 | `MAX_REANALYZE` | No | Max retrigger attempts per market (default: 1) |
+| `MAX_TRADE_RETRIES` | No | Max FOK retry attempts in late window (default: 3) |
 
 ### Running
 
@@ -344,6 +347,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.6**: Pyth链上价格源 + FOK晚期重试 + WS指数退避 — Position monitor now uses Pyth Network on-chain oracle prices (Hermes v2 SSE stream) as primary price source, replacing Binance. Pyth prices are closer to Polymarket settlement source (UMA oracle references on-chain feeds), reducing price discrepancy in win/loss judgment. Price source priority: Pyth SSE → Pyth REST → Binance WS → Binance REST. Monitor status line shows `Pyth`/`WS`/`REST` tag. K-line data (ATR/OHLCV) remains Binance (Pyth has no candle data). Late window FOK retry: previously, FOK/liquidity failures in the late window (100-160s) permanently blocked re-analysis (`self.analyzed.add` was unconditional before trade execution). Now only marks as analyzed on success or non-retryable failure (AI says no bet, missing PTB/token). FOK/liquidity failures allow retry on next loop iteration (~7s), up to `MAX_TRADE_RETRIES` (default 3). Polymarket WS reconnection now uses exponential backoff (2s→4s→8s→...→30s) instead of flat 2s, preventing reconnection storms that trigger server-side rate limiting. Backoff resets on stable connection (>10s). Reduced reconnect log noise. New files: `ai_trader/pyth_api.py`. New env: `MAX_TRADE_RETRIES`.
 
 - **v9.5**: 波动触发重分析 — Skipped markets (low confidence, weak gap cross) are now tracked and monitored for volatility. When crypto price moves ≥1.5 ATR (`REANALYZE_ATR_MULT`) from the skip price, the market re-enters the late window analysis pipeline with its accumulated Bayesian state. Piggybacks on existing warmup sampling loop (zero extra API calls). Guards: cooldown timer (`REANALYZE_COOLDOWN`, default 15s), max 1 retrigger per market (`MAX_REANALYZE`), no retrigger if position already open, `is_reanalyze` flag prevents infinite skip→retrigger loops. Skipped markets cleaned up on position entry and market cleanup. New env: `REANALYZE_ATR_MULT`, `REANALYZE_COOLDOWN`, `MAX_REANALYZE`.
 

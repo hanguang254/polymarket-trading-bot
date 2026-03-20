@@ -349,6 +349,7 @@ class MarketTracker:
         self.bayesian_updaters = {}  # slug -> BayesianUpdater
         self.token_cache = {}  # slug -> (up_token, down_token)  预热阶段缓存token_ids
         self.skipped_markets = {}  # slug -> {skip_time, price_at_skip, reason, reanalyze_count}
+        self.trade_attempts = {}  # slug -> 晚期窗口交易尝试次数（FOK失败后允许重试）
     
     def update_markets(self):
         """更新市场列表"""
@@ -532,7 +533,13 @@ class MarketTracker:
 
             # === 晚期下注窗口：100s-160s（贝叶斯后验 + gap 趋势双重确认） ===
             LATE_BET_START = int(os.environ.get("LATE_BET_START", "100"))
+            MAX_TRADE_RETRIES = int(os.environ.get("MAX_TRADE_RETRIES", "3"))
             if LATE_BET_START <= elapsed <= LATE_BET_END and slug not in self.analyzed:
+                # FOK/流动性失败重试上限
+                if self.trade_attempts.get(slug, 0) >= MAX_TRADE_RETRIES:
+                    self.analyzed.add(slug)
+                    logger.warning(f"\n⚠️ {market['coin']} 晚期窗口已重试{MAX_TRADE_RETRIES}次，放弃")
+                    continue
                 # 获取跳过时的价格快照（用于波动重触发）
                 _skip_price = None
                 _samples_snap = self.warmup_data.get(slug, [])
@@ -610,7 +617,7 @@ class MarketTracker:
                 elif gap_trend == "震荡":
                     extra_info["min_discount"] = 0.15
 
-                self.analyzed.add(slug)
+                self.trade_attempts[slug] = self.trade_attempts.get(slug, 0) + 1
                 self.skipped_markets.pop(slug, None)
                 pending_trades.append((slug, market, extra_info))
 
@@ -703,6 +710,7 @@ class MarketTracker:
                 self.ptb_cache[slug] = ptb
         if not ptb:
             print("  ❌ 无法获取 PTB")
+            self.analyzed.add(slug)
             logger.info(f"{'='*60}\n")
             return
         
@@ -771,6 +779,7 @@ class MarketTracker:
                     }
             else:
                 self.skipped_markets.pop(slug, None)
+            self.analyzed.add(slug)
             decrease_cooldown()
             logger.info(f"{'='*60}\n")
             return
@@ -808,6 +817,7 @@ class MarketTracker:
         down_token = extra_info.get("down_token")
         if not up_token or not down_token:
             logger.error(f"  ❌ 无法获取 token_id")
+            self.analyzed.add(slug)
             logger.info(f"{'='*60}\n")
             return
 
@@ -868,18 +878,21 @@ class MarketTracker:
             logger.warning(f"  ⏳ 挂单待成交: {output} | 已记录待成交，交由 monitor 对账入仓")
         elif isinstance(output, str) and output.startswith("SKIP_"):
             # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
-            logger.warning(f"  ⚠️ {output}，跳过（不计入统计）")
+            retry_n = self.trade_attempts.get(slug, 0)
+            logger.warning(f"  ⚠️ {output}，跳过（不计入统计）| 尝试{retry_n}次，等待重试")
         elif isinstance(output, str) and ("Too Early" in output or "not ready" in output or "425" in output):
             # API时序错误（市场未开始接单），不计为交易失败
             logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
         else:
             output_str = str(output) if output else ""
             if "fully filled" in output_str or "FOK" in output_str:
-                logger.warning(f"  ⚠️ FOK未成交（流动性不足），跳过（不计入统计）")
+                retry_n = self.trade_attempts.get(slug, 0)
+                logger.warning(f"  ⚠️ FOK未成交（流动性不足）| 尝试{retry_n}次，等待重试")
             elif "Request exception" in output_str or "status_code=None" in output_str:
                 logger.warning(f"  ⚠️ 网络超时，跳过（不计入统计）: {output_str[:80]}")
             else:
                 logger.error(f"  ❌ 下注失败: {output_str[:150]}")
+                self.analyzed.add(slug)
                 record_bet_result(False, slug)
         
         logger.info(f"  📊 {get_state_summary()}")
@@ -955,6 +968,7 @@ class MarketTracker:
                 self.bayesian_updaters.pop(slug, None)
                 self.token_cache.pop(slug, None)
                 self.skipped_markets.pop(slug, None)
+                self.trade_attempts.pop(slug, None)
                 self.analyzed.discard(slug)
                 self.early_analyzed.discard(slug)
 
