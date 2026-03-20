@@ -779,7 +779,10 @@ class MarketTracker:
                     }
             else:
                 self.skipped_markets.pop(slug, None)
-            self.analyzed.add(slug)
+            # 早期窗口失败不加入 analyzed，允许晚期窗口重新分析
+            is_early = (extra_info or {}).get("early_window", False)
+            if not is_early:
+                self.analyzed.add(slug)
             decrease_cooldown()
             logger.info(f"{'='*60}\n")
             return
