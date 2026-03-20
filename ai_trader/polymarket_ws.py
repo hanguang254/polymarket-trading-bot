@@ -46,6 +46,8 @@ class PolymarketOrderbookStream:
         self._subscribed_ids = set()  # 当前已订阅的 asset_ids
         self._ping_thread = None
         self._ready = False  # start() 标记就绪，subscribe() 触发连接
+        self._reconnect_delay = 2  # 指数退避: 2→4→8→...→30s
+        self._connected_at = 0  # 连接建立时间（用于判断是否稳定）
 
     def start(self):
         """标记就绪，实际连接延迟到第一次 subscribe() 时建立
@@ -163,9 +165,14 @@ class PolymarketOrderbookStream:
             except Exception as e:
                 print(f"  ⚠️ Polymarket WS 连接异常: {e}")
             if self._running:
-                time.sleep(2)
+                time.sleep(self._reconnect_delay)
+                # 指数退避: 2→4→8→16→30s（避免重连风暴触发服务器限速）
+                self._reconnect_delay = min(self._reconnect_delay * 2, 30)
 
     def _on_open(self, ws):
+        self._connected_at = time.time()
+        # 连接成功，重置退避延迟
+        self._reconnect_delay = 2
         print("  ✅ Polymarket WS 已连接 (实时orderbook)")
         # 发送初始订阅
         if self._subscribed_ids:
@@ -282,11 +289,13 @@ class PolymarketOrderbookStream:
         pass
 
     def _on_error(self, ws, error):
-        print(f"  ⚠️ Polymarket WS 错误: {error}")
+        # 频繁断连时减少日志噪音（连接稳定>10s才打印错误）
+        if time.time() - self._connected_at > 10:
+            print(f"  ⚠️ Polymarket WS 错误: {error}")
 
     def _on_close(self, ws, code, msg):
         if self._running:
-            print(f"  ⚠️ Polymarket WS 断开(code={code})，2s后重连...")
+            print(f"  ⚠️ Polymarket WS 断开(code={code})，{self._reconnect_delay}s后重连...")
 
 
 def _safe_float(val):

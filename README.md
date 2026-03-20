@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v9.4
+# Polymarket Trading Bot v9.7
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -65,6 +65,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Parallel Entry Fetch**: Balance + orderbook queries run concurrently via ThreadPoolExecutor, saving ~0.5s per bet execution.
 - **CLOB C1 Calibration**: Replaces Gamma odds with CLOB `best_ask` for discount/EV/price checks — prevents buying at $0.85 while thinking price is $0.50. Empty book detection (ask ≥ 0.95) falls back to `last-trade-price`.
 - **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
+- **Volatility-Triggered Re-Analysis**: Markets skipped due to low confidence are tracked in `skipped_markets`. When crypto price moves ≥1.5 ATR from the skip price (`REANALYZE_ATR_MULT`), the market re-enters the analysis pipeline with updated Bayesian state. Cooldown (`REANALYZE_COOLDOWN`, default 15s) and max retrigger cap (`MAX_REANALYZE`, default 1) prevent loops. Skipped markets are cleaned up on position entry or market cleanup.
 - **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
 
 ### Exit (P0-P1 + P4)
@@ -97,14 +98,16 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
 
 ### Infrastructure
-- **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used by warmup sampling, analysis, and position monitoring. Auto-reconnect with 2s backoff + 30s ping keepalive.
-- **Polymarket WebSocket Orderbook Stream**: `PolymarketOrderbookStream` singleton in `polymarket_ws.py` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` for real-time orderbook data. Handles `best_bid_ask`, `book`, and `price_change` events. FOK entry uses WS `best_ask` (0ms) instead of REST orderbook query (100-300ms), significantly reducing price staleness between read and order placement. Position monitor's `get_best_bid/get_best_ask/get_market_price` all use WS-first with REST fallback. Lazy connection: WS connects only on first `subscribe()` call (Polymarket requires immediate subscription after connect). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect with 2s backoff.
+- **Pyth Network On-Chain Price Stream**: `PythPriceStream` singleton in `pyth_api.py` receives BTC/ETH prices from Pyth Hermes v2 SSE stream (`hermes.pyth.network`). On-chain oracle prices are closer to Polymarket settlement source than CEX prices. Used as **primary** price source for position monitoring and settlement judgment (`get_current_crypto_price()`). REST fallback when SSE is stale. No API key required, free tier is production-grade.
+- **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used by warmup sampling and analysis (K-line/ATR). Serves as **fallback** for position monitoring when Pyth is unavailable. Auto-reconnect with 2s backoff + 30s ping keepalive.
+- **Polymarket WebSocket Orderbook Stream**: `PolymarketOrderbookStream` singleton in `polymarket_ws.py` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` for real-time orderbook data. Handles `best_bid_ask`, `book`, and `price_change` events. FOK entry uses WS `best_ask` (0ms) instead of REST orderbook query (100-300ms), significantly reducing price staleness between read and order placement. Position monitor's `get_best_bid/get_best_ask/get_market_price` all use WS-first with REST fallback. Lazy connection: WS connects only on first `subscribe()` call (Polymarket requires immediate subscription after connect). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect with exponential backoff (2s→4s→8s→...→30s, resets on stable connection).
 - **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
 - **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
 - **Playwright PTB (No Fallback)**: PTB only from Playwright subprocess. HTML/Gamma API fallbacks removed (returned wrong market's PTB). Skip browser PTB after 3 consecutive failures.
+- **Volatility Re-Trigger**: Skipped markets monitored for large price moves — piggybacks on existing sampling loop (no extra API calls), re-enters analysis when volatility exceeds threshold
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
 - **Auto Redeem**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`), shows USDC balance after each round
@@ -125,7 +128,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | `ai_trader/lmsr_liquidity.py` | Orderbook liquidity: spread + depth + slippage → dynamic threshold |
 | `position_monitor.py` | EV-driven exit + 4-stage closing + pending order reconciliation + outcome recording |
 | `auto_redeem_v2.py` | Auto claim settled positions (REST API + on-chain redeem) |
-| `ai_trader/binance_api.py` | Binance market data: WebSocket real-time price stream + REST klines/stats |
+| `ai_trader/pyth_api.py` | Pyth Network on-chain price stream: SSE real-time + REST fallback (primary for position monitor) |
+| `ai_trader/binance_api.py` | Binance market data: WebSocket real-time price stream + REST klines/stats (fallback for position monitor) |
 | `ai_trader/polymarket_ws.py` | Polymarket Market Channel WebSocket: real-time orderbook/best_bid_ask stream |
 | `ai_trader/indicators.py` | Technical indicators (EMA, RSI, ATR, Bollinger Bands) |
 | `ai_trader/polymarket_api.py` | Polymarket API + PTB HTML scraper |
@@ -292,6 +296,10 @@ See `.env.example` for all configurable parameters:
 | `DIP_BUY_MIN_REMAINING` | No | Min remaining seconds to allow dip-buy (default: 60) |
 | `PTB_PROXIMITY_ATR` | No | Proximity zone width in ATR units, time-decayed (default: 0.7) |
 | `PTB_PROXIMITY_EXTREME_STOP` | No | Extreme safety valve: token drop % to force exit in proximity zone (default: 0.50) |
+| `REANALYZE_ATR_MULT` | No | Price move in ATR multiples to retrigger skipped market (default: 1.5) |
+| `REANALYZE_COOLDOWN` | No | Min seconds before retrigger allowed (default: 15) |
+| `MAX_REANALYZE` | No | Max retrigger attempts per market (default: 1) |
+| `MAX_TRADE_RETRIES` | No | Max FOK retry attempts in late window (default: 3) |
 
 ### Running
 
@@ -339,6 +347,12 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v9.7**: PnL统计修复 + 晚期窗口重分析 — **PnL tracking fixes**: (1) Ghost trade price estimation — when FOK returns ERROR but on-chain balance is zero (ghost fill), exit price now estimated via LTP/best_bid instead of $0.01 floor price, preventing massive false losses ($4-5 per ghost trade). (2) Cross-process file lock — `trading_state.json` now protected by `fcntl.flock` (process-level) + `threading.Lock` (thread-level), fixing race conditions between `auto_bot_v3` and `position_monitor` that could corrupt `daily_pnl`/`pending_costs`/win-loss counts. `record_bet_result` now runs under the same lock. (3) Partial exit PnL tracking — Stage 2 batch sell partial fills now call `record_partial_pnl()` for mini-settlement, adding back the sold shares' pre-deducted cost + actual PnL to `daily_pnl` immediately (previously lost until final close). (4) NO_BALANCE exit price fallback — 9 code paths that used `current_price or 0` now use multi-source fallback (current_price → LTP → best_bid → entry_price), preventing false full-loss recording when tokens were already sold. (5) Dip-buy cost pre-deduction — `execute_dip_buy` now calls `record_bet_cost` after successful buy; `pending_costs` accumulates (+=) instead of overwriting, correctly tracking total cost basis for dip-buy positions. **Late window re-analysis**: Early window (90-95s) analysis failure no longer blocks late window — `self.analyzed` is only set on bet success, MAX_TRADE_RETRIES exhaustion, or fatal error. Late window pre-check rejections (conf<0.15, gap cross) no longer permanently block; they wait for `LATE_REANALYZE_INTERVAL` (default 20s) cooldown then re-evaluate with updated Bayesian posterior. With 100s late window (100-200s) and 20s interval, up to 5 re-analyses with fresh market data. New env: `LATE_REANALYZE_INTERVAL`, `MAX_TRADE_RETRIES` (moved to .env.example with recommended default 5).
+
+- **v9.6**: Pyth链上价格源 + FOK晚期重试 + WS指数退避 — Position monitor now uses Pyth Network on-chain oracle prices (Hermes v2 SSE stream) as primary price source, replacing Binance. Pyth prices are closer to Polymarket settlement source (UMA oracle references on-chain feeds), reducing price discrepancy in win/loss judgment. Price source priority: Pyth SSE → Pyth REST → Binance WS → Binance REST. Monitor status line shows `Pyth`/`WS`/`REST` tag. K-line data (ATR/OHLCV) remains Binance (Pyth has no candle data). Late window FOK retry: previously, FOK/liquidity failures in the late window (100-160s) permanently blocked re-analysis (`self.analyzed.add` was unconditional before trade execution). Now only marks as analyzed on success or non-retryable failure (AI says no bet, missing PTB/token). FOK/liquidity failures allow retry on next loop iteration (~7s), up to `MAX_TRADE_RETRIES` (default 3). Polymarket WS reconnection now uses exponential backoff (2s→4s→8s→...→30s) instead of flat 2s, preventing reconnection storms that trigger server-side rate limiting. Backoff resets on stable connection (>10s). Reduced reconnect log noise. New files: `ai_trader/pyth_api.py`. New env: `MAX_TRADE_RETRIES`.
+
+- **v9.5**: 波动触发重分析 — Skipped markets (low confidence, weak gap cross) are now tracked and monitored for volatility. When crypto price moves ≥1.5 ATR (`REANALYZE_ATR_MULT`) from the skip price, the market re-enters the late window analysis pipeline with its accumulated Bayesian state. Piggybacks on existing warmup sampling loop (zero extra API calls). Guards: cooldown timer (`REANALYZE_COOLDOWN`, default 15s), max 1 retrigger per market (`MAX_REANALYZE`), no retrigger if position already open, `is_reanalyze` flag prevents infinite skip→retrigger loops. Skipped markets cleaned up on position entry and market cleanup. New env: `REANALYZE_ATR_MULT`, `REANALYZE_COOLDOWN`, `MAX_REANALYZE`.
 
 - **v9.4**: MAX_DAILY_LOSS风控修复 + PTB去兜底 — Daily loss limit now thread-safe with `threading.Lock`, checked at the top of `analyze_and_trade()` (before any analysis/betting), preventing parallel BTC/ETH threads from both passing the check simultaneously. Bet cost pre-deducted to `daily_pnl` on entry (worst-case full loss), settled with actual PnL on position close via `settle_bet_cost()`. Dip-buy (`execute_dip_buy`) also checks daily loss limit before adding. PTB fallback layers (HTML scraper + Gamma API) removed — they returned wrong market's PTB on Playwright timeout (e.g., $73,934 from a different 5-min window instead of $71,193). Now Playwright-only: fail → skip market, no false PTB.
 

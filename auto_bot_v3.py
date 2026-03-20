@@ -24,6 +24,7 @@ import time
 import json
 import os
 import subprocess
+import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -59,6 +60,10 @@ _api_failures = 0          # 连续 API 失败计数
 _circuit_open_until = 0    # 熔断恢复时间戳（Unix）
 CIRCUIT_BREAK_THRESHOLD = 5   # 连续失败N次触发熔断
 CIRCUIT_BREAK_DURATION = 300  # 熔断持续时间（秒）
+
+# 持仓数检查锁 + 预占计数：防止并行线程同时通过 MAX_OPEN_POSITIONS 检查
+_position_lock = threading.Lock()
+_pending_bets = 0  # 正在下注中（已通过检查但尚未写入positions.jsonl）
 
 
 def get_correlated_exposure(direction, coin):
@@ -126,7 +131,7 @@ def get_ptb_multi_strategy(slug):
             t0 = time.time()
             result = subprocess.run(
                 [sys.executable, ptb_script, slug],
-                capture_output=True, text=True, timeout=15
+                capture_output=True, text=True, timeout=20
             )
             elapsed = time.time() - t0
             if result.returncode == 0 and result.stdout:
@@ -147,7 +152,7 @@ def get_ptb_multi_strategy(slug):
                 logger.warning(f"   Playwright PTB 无结果({_playwright_failures}/3) | {elapsed:.1f}s")
         except subprocess.TimeoutExpired:
             _playwright_failures += 1
-            logger.warning(f"   Playwright PTB 超时(15s)({_playwright_failures}/3)")
+            logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures}/3)")
         except Exception as e:
             _playwright_failures += 1
             err_msg = str(e)[:80]
@@ -342,11 +347,15 @@ class MarketTracker:
         self.tracked = {}  # slug -> market info
         self.ptb_cache = {}
         self.analyzed = set()
+        self.early_analyzed = set()  # 早期窗口分析过但失败的市场，不阻塞晚期窗口
         self.positions = {}  # slug -> Position
         self.warmup_data = {}  # slug -> [{price, direction, timestamp}, ...]
         self.warmup_started = set()  # 已开始预热的市场
         self.bayesian_updaters = {}  # slug -> BayesianUpdater
         self.token_cache = {}  # slug -> (up_token, down_token)  预热阶段缓存token_ids
+        self.skipped_markets = {}  # slug -> {skip_time, price_at_skip, reason, reanalyze_count}
+        self.trade_attempts = {}  # slug -> 晚期窗口交易尝试次数（FOK失败后允许重试）
+        self.last_analysis_time = {}  # slug -> 上次晚期分析时间戳（冷却用）
     
     def update_markets(self):
         """更新市场列表"""
@@ -404,7 +413,7 @@ class MarketTracker:
             
             # === 预热期：20s-160s（PTB获取后立即开始贝叶斯采样，延续到晚期窗口） ===
             LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
-            if 20 <= elapsed <= LATE_BET_END and slug not in self.analyzed:
+            if 20 <= elapsed <= LATE_BET_END and (slug not in self.analyzed or slug in self.skipped_markets):
                 if slug not in self.warmup_started:
                     self.warmup_started.add(slug)
                     self.warmup_data[slug] = []
@@ -471,11 +480,37 @@ class MarketTracker:
                             logger.info(f"  ⏳ 等待PTB... price={price:.2f}")
                     except Exception as e:
                         logger.warning(f"  ⚠️ 预热采样失败: {e}")
-            
+
+                # === 波动重触发：跳过的市场检测价格大幅偏离 ===
+                REANALYZE_ATR_MULT = float(os.environ.get("REANALYZE_ATR_MULT", "1.5"))
+                REANALYZE_COOLDOWN = float(os.environ.get("REANALYZE_COOLDOWN", "15"))
+                MAX_REANALYZE = int(os.environ.get("MAX_REANALYZE", "1"))
+                if slug in self.skipped_markets and slug not in self.positions:
+                    skip_info = self.skipped_markets[slug]
+                    updater = self.bayesian_updaters.get(slug)
+                    samples = self.warmup_data.get(slug, [])
+                    latest_price = samples[-1]["price"] if samples else None
+
+                    if (skip_info["reanalyze_count"] < MAX_REANALYZE
+                            and time.time() - skip_info["skip_time"] >= REANALYZE_COOLDOWN
+                            and updater and updater.atr_val and updater.atr_val > 0
+                            and latest_price):
+                        move = abs(latest_price - skip_info["price_at_skip"])
+                        atr = updater.atr_val
+                        if move >= atr * REANALYZE_ATR_MULT:
+                            logger.info(
+                                f"\n🔄 波动重触发: {market['coin']} "
+                                f"移动{move:.0f} ({move/atr:.1f}ATR ≥ {REANALYZE_ATR_MULT}ATR) "
+                                f"自跳过({skip_info['reason']})后 | 剩余{remaining:.0f}s"
+                            )
+                            self.analyzed.discard(slug)
+                            self.early_analyzed.discard(slug)
+                            skip_info["reanalyze_count"] += 1
+
             # === 早期下注窗口：90-95s（API 在前60-80s返回425 Too Early） ===
             EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "90"))
             EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "95"))
-            if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed:
+            if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed and slug not in self.early_analyzed:
                 updater = self.bayesian_updaters.get(slug)
                 samples = self.warmup_data.get(slug, [])
 
@@ -489,7 +524,7 @@ class MarketTracker:
                         if gap_trend == "穿越":
                             logger.info(f"  ⏳ 早期窗口: gap穿越，等待晚期窗口")
                         else:
-                            self.analyzed.add(slug)
+                            self.early_analyzed.add(slug)
                             extra_info = {
                                 "gap_trend": gap_trend,
                                 "gap_info": gap_info,
@@ -504,14 +539,34 @@ class MarketTracker:
 
             # === 晚期下注窗口：100s-160s（贝叶斯后验 + gap 趋势双重确认） ===
             LATE_BET_START = int(os.environ.get("LATE_BET_START", "100"))
+            MAX_TRADE_RETRIES = int(os.environ.get("MAX_TRADE_RETRIES", "3"))
             if LATE_BET_START <= elapsed <= LATE_BET_END and slug not in self.analyzed:
-                self.analyzed.add(slug)
+                # FOK/流动性失败重试上限
+                if self.trade_attempts.get(slug, 0) >= MAX_TRADE_RETRIES:
+                    self.analyzed.add(slug)
+                    logger.warning(f"\n⚠️ {market['coin']} 晚期窗口已重试{MAX_TRADE_RETRIES}次，放弃")
+                    continue
+                # 冷却期：避免每2秒重复分析，等待市场条件变化
+                LATE_REANALYZE_INTERVAL = int(os.environ.get("LATE_REANALYZE_INTERVAL", "20"))
+                if time.time() - self.last_analysis_time.get(slug, 0) < LATE_REANALYZE_INTERVAL:
+                    continue
+                self.last_analysis_time[slug] = time.time()
+                # 获取跳过时的价格快照（用于波动重触发）
+                _skip_price = None
+                _samples_snap = self.warmup_data.get(slug, [])
+                if _samples_snap:
+                    _skip_price = _samples_snap[-1].get("price")
 
+                is_reanalyze = slug in self.skipped_markets
                 samples = self.warmup_data.get(slug, [])
                 # 保留 gap 趋势作为辅助信号
                 gap_trend, gap_info = self._calc_gap_trend(samples)
 
                 extra_info = {"gap_trend": gap_trend, "gap_info": gap_info, "warmup_samples": len(samples), "remaining_seconds": remaining}
+                if is_reanalyze:
+                    extra_info["reanalyze"] = True
+                    skip_info = self.skipped_markets.get(slug, {})
+                    extra_info["volatility_move_atr"] = skip_info.get("move_atr", 0)
 
                 # 贝叶斯后验结果
                 updater = self.bayesian_updaters.get(slug)
@@ -521,11 +576,12 @@ class MarketTracker:
                     b_dir = bayesian_summary["direction"]
                     b_phat = bayesian_summary["p_hat"]
                     b_conf = bayesian_summary["confidence"]
-                    logger.info(f"\n🧠 贝叶斯结果: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f} (n={updater.n_updates})")
+                    reanalyze_tag = " [重分析]" if is_reanalyze else ""
+                    logger.info(f"\n🧠 贝叶斯结果{reanalyze_tag}: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f} (n={updater.n_updates})")
 
-                    # 贝叶斯置信度太低（<30%），方向不确定，跳过
+                    # 贝叶斯置信度太低（<15%），方向不确定，跳过（等冷却后重试）
                     if b_conf < 0.15:
-                        logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，跳过")
+                        logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，等待变化")
                         continue
                 else:
                     logger.info(f"\n📊 无贝叶斯数据，使用gap趋势: {gap_trend}")
@@ -538,16 +594,18 @@ class MarketTracker:
                         if b_conf >= 0.6:
                             logger.info(f"  ✅ gap穿越但贝叶斯置信度高({b_conf:.3f})，允许交易")
                         else:
-                            logger.warning(f"\n⚠️ {market['coin']} gap穿越+贝叶斯弱({b_conf:.3f})，跳过")
+                            logger.warning(f"\n⚠️ {market['coin']} gap穿越+贝叶斯弱({b_conf:.3f})，等待变化")
                             continue
                     else:
-                        logger.warning(f"\n⚠️ {market['coin']} gap穿越零轴，跳过")
+                        logger.warning(f"\n⚠️ {market['coin']} gap穿越零轴，等待变化")
                         continue
                 elif gap_trend == "缩小":
                     extra_info["min_discount"] = 0.18
                 elif gap_trend == "震荡":
                     extra_info["min_discount"] = 0.15
 
+                self.trade_attempts[slug] = self.trade_attempts.get(slug, 0) + 1
+                self.skipped_markets.pop(slug, None)
                 pending_trades.append((slug, market, extra_info))
 
         # 并行执行所有待分析市场（BTC+ETH同时分析下注，而非串行等待）
@@ -639,6 +697,7 @@ class MarketTracker:
                 self.ptb_cache[slug] = ptb
         if not ptb:
             print("  ❌ 无法获取 PTB")
+            self.analyzed.add(slug)
             logger.info(f"{'='*60}\n")
             return
         
@@ -695,29 +754,46 @@ class MarketTracker:
         
         if not should_bet:
             logger.warning(f"  ❌ 不满足: {details.get('bet_reason','')}")
+            # 记录跳过（供波动重触发使用），已经是重分析的不再记录
+            is_reanalyze = (extra_info or {}).get("reanalyze", False)
+            if not is_reanalyze and slug not in self.positions:
+                current_price = details.get("current_price") or details.get("crypto_price")
+                if current_price:
+                    self.skipped_markets[slug] = {
+                        "skip_time": time.time(), "price_at_skip": current_price,
+                        "reason": details.get("bet_reason", "no_edge")[:30],
+                        "reanalyze_count": 0,
+                    }
+            else:
+                self.skipped_markets.pop(slug, None)
+            # 分析拒绝不加入 analyzed，允许冷却后重新分析
             decrease_cooldown()
             logger.info(f"{'='*60}\n")
             return
         
         logger.info(f"  ✅ 满足下注条件！")
 
-        # 检查最大同时持仓数（读 positions.jsonl 中未关闭的仓位）
+        # 检查最大同时持仓数（锁+预占计数，防止并行线程同时通过检查）
         MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "2"))
-        try:
-            positions_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
-            open_count = 0
-            if os.path.exists(positions_file):
-                with open(positions_file) as _f:
-                    for _line in _f:
-                        _p = json.loads(_line.strip())
-                        if not _p.get("closed", False):
-                            open_count += 1
-            if open_count >= MAX_OPEN_POSITIONS:
-                logger.warning(f"  ⏸️ 已有 {open_count} 个持仓，超过上限 {MAX_OPEN_POSITIONS}，跳过")
-                logger.info(f"{'='*60}\n")
-                return
-        except Exception as _e:
-            logger.warning(f"  ⚠️ 检查持仓数失败: {_e}")
+        global _pending_bets
+        with _position_lock:
+            try:
+                positions_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
+                open_count = 0
+                if os.path.exists(positions_file):
+                    with open(positions_file) as _f:
+                        for _line in _f:
+                            _p = json.loads(_line.strip())
+                            if not _p.get("closed", False):
+                                open_count += 1
+                total = open_count + _pending_bets
+                if total >= MAX_OPEN_POSITIONS:
+                    logger.warning(f"  ⏸️ 持仓{open_count}+下注中{_pending_bets}={total}，达上限{MAX_OPEN_POSITIONS}，跳过")
+                    logger.info(f"{'='*60}\n")
+                    return
+                _pending_bets += 1
+            except Exception as _e:
+                logger.warning(f"  ⚠️ 检查持仓数失败: {_e}")
 
         # 检查冷却期：满足下注条件时跳过冷却（EV模型已确认有edge）
         if not should_trade():
@@ -732,6 +808,7 @@ class MarketTracker:
         down_token = extra_info.get("down_token")
         if not up_token or not down_token:
             logger.error(f"  ❌ 无法获取 token_id")
+            self.analyzed.add(slug)
             logger.info(f"{'='*60}\n")
             return
 
@@ -758,55 +835,63 @@ class MarketTracker:
         except Exception:
             pass  # fallback: execute_bet内部自行获取
 
-        success, entry_price, bet_size, output = execute_bet(
-            slug, direction, token_id,
-            confidence=confidence,
-            ev=details.get('expected_value', 0),
-            p_hat=p_hat,
-            entry_details=details,
-            kelly_reduction=kelly_reduction,
-            pre_balance=_balance,
-        )
-        
-        if success:
-            logger.info(f"  ✅ 下注成功！（{bet_size}份）")
-
-            # ★ 立即预扣下注成本到 daily_pnl（防止并行线程超限）
-            cost = round(entry_price * bet_size, 4)
-            new_pnl = record_bet_cost(slug, cost)
-            logger.info(f"  📉 预扣成本 ${cost:.2f} → 今日PnL: ${new_pnl:+.2f}")
-
-            # 记录持仓（使用实际下单价格和动态仓位）
-            position = Position(
-                slug, token_id, direction, entry_price, bet_size,
-                datetime.now(timezone.utc).isoformat()
+        try:
+            success, entry_price, bet_size, output = execute_bet(
+                slug, direction, token_id,
+                confidence=confidence,
+                ev=details.get('expected_value', 0),
+                p_hat=p_hat,
+                entry_details=details,
+                kelly_reduction=kelly_reduction,
+                pre_balance=_balance,
             )
-            self.positions[slug] = position
 
-            # 真实盈亏在 position_monitor close_position 时记录
+            if success:
+                logger.info(f"  ✅ 下注成功！（{bet_size}份）")
+                self.analyzed.add(slug)  # 下注成功，阻止晚期窗口重复分析
 
-            # 发送通知
-            send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
-        elif isinstance(output, str) and output.startswith("PENDING"):
-            logger.warning(f"  ⏳ 挂单待成交: {output} | 已记录待成交，交由 monitor 对账入仓")
-        elif isinstance(output, str) and output.startswith("SKIP_"):
-            # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
-            logger.warning(f"  ⚠️ {output}，跳过（不计入统计）")
-        elif isinstance(output, str) and ("Too Early" in output or "not ready" in output or "425" in output):
-            # API时序错误（市场未开始接单），不计为交易失败
-            logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
-        else:
-            output_str = str(output) if output else ""
-            if "fully filled" in output_str or "FOK" in output_str:
-                logger.warning(f"  ⚠️ FOK未成交（流动性不足），跳过（不计入统计）")
-            elif "Request exception" in output_str or "status_code=None" in output_str:
-                logger.warning(f"  ⚠️ 网络超时，跳过（不计入统计）: {output_str[:80]}")
+                # ★ 立即预扣下注成本到 daily_pnl（防止并行线程超限）
+                cost = round(entry_price * bet_size, 4)
+                new_pnl = record_bet_cost(slug, cost)
+                logger.info(f"  📉 预扣成本 ${cost:.2f} → 今日PnL: ${new_pnl:+.2f}")
+
+                # 记录持仓（使用实际下单价格和动态仓位）
+                position = Position(
+                    slug, token_id, direction, entry_price, bet_size,
+                    datetime.now(timezone.utc).isoformat()
+                )
+                self.positions[slug] = position
+
+                # 真实盈亏在 position_monitor close_position 时记录
+
+                # 发送通知
+                send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
+            elif isinstance(output, str) and output.startswith("PENDING"):
+                logger.warning(f"  ⏳ 挂单待成交: {output} | 已记录待成交，交由 monitor 对账入仓")
+            elif isinstance(output, str) and output.startswith("SKIP_"):
+                # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
+                retry_n = self.trade_attempts.get(slug, 0)
+                logger.warning(f"  ⚠️ {output}，跳过（不计入统计）| 尝试{retry_n}次，等待重试")
+            elif isinstance(output, str) and ("Too Early" in output or "not ready" in output or "425" in output):
+                # API时序错误（市场未开始接单），不计为交易失败
+                logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
             else:
-                logger.error(f"  ❌ 下注失败: {output_str[:150]}")
-                record_bet_result(False, slug)
-        
-        logger.info(f"  📊 {get_state_summary()}")
-        print(f"{'='*60}\n")
+                output_str = str(output) if output else ""
+                if "fully filled" in output_str or "FOK" in output_str:
+                    retry_n = self.trade_attempts.get(slug, 0)
+                    logger.warning(f"  ⚠️ FOK未成交（流动性不足）| 尝试{retry_n}次，等待重试")
+                elif "Request exception" in output_str or "status_code=None" in output_str:
+                    logger.warning(f"  ⚠️ 网络超时，跳过（不计入统计）: {output_str[:80]}")
+                else:
+                    logger.error(f"  ❌ 下注失败: {output_str[:150]}")
+                    self.analyzed.add(slug)
+                    record_bet_result(False, slug)
+
+            logger.info(f"  📊 {get_state_summary()}")
+            print(f"{'='*60}\n")
+        finally:
+            with _position_lock:
+                _pending_bets = max(0, _pending_bets - 1)
     
     def close_position(self, slug, position):
         """平仓"""
@@ -877,6 +962,10 @@ class MarketTracker:
                 self.positions.pop(slug, None)
                 self.bayesian_updaters.pop(slug, None)
                 self.token_cache.pop(slug, None)
+                self.skipped_markets.pop(slug, None)
+                self.trade_attempts.pop(slug, None)
+                self.analyzed.discard(slug)
+                self.early_analyzed.discard(slug)
 
 
 def main():
@@ -888,6 +977,10 @@ def main():
 
     # 初始化 CLOB SDK 客户端（全局单例，全程复用）
     clob_client.init_client()
+
+    # 启动 Pyth 链上价格流（持仓监控主数据源）
+    from ai_trader.pyth_api import pyth_stream
+    pyth_stream.start()
 
     # 启动 Binance WebSocket 实时价格流（预热+分析共用）
     from ai_trader.binance_api import price_stream

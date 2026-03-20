@@ -15,6 +15,7 @@ import requests
 from ai_trader.polymarket_api import normalize_orderbook
 from ai_trader import clob_client
 from ai_trader.binance_api import price_stream as _price_stream
+from ai_trader.pyth_api import pyth_stream as _pyth_stream, get_pyth_price
 from ai_trader.polymarket_ws import poly_ws as _poly_ws
 from py_clob_client.order_builder.constants import BUY, SELL
 
@@ -363,6 +364,35 @@ def _check_and_adjust_size(token_id, size, position=None):
         return size
     return None
 
+def _estimate_exit_price(token_id, current_price, entry_price):
+    """NO_BALANCE时估算退出价（避免用0导致虚假全额亏损）
+    优先级: current_price → LTP → best_bid → entry_price(保本)
+    """
+    if current_price and current_price > 0:
+        return current_price
+    ltp = get_last_trade_price(token_id)
+    if ltp and ltp > 0.01:
+        return ltp
+    bid = get_best_bid_raw(token_id)
+    if bid and bid > 0.01:
+        return bid
+    # 无法获取任何价格 → 用入场价（PnL=0），避免虚假全额亏损
+    return entry_price if entry_price and entry_price > 0 else 0
+
+
+def _estimate_ghost_price(token_id, caller_price):
+    """幽灵成交时估算实际成交价（CLOB按best_bid撮合，不是地板价）"""
+    ltp = get_last_trade_price(token_id)
+    if ltp and ltp > 0.01:
+        return ltp
+    bid = get_best_bid_raw(token_id)
+    if bid and bid > 0.01:
+        return bid
+    if caller_price and caller_price > 0.01:
+        return caller_price
+    return None  # 无法估算
+
+
 def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel=False):
     """市价立即卖出（止损专用）
     价格策略（逐级降价，追求成交而非价格）：
@@ -410,8 +440,9 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
         if info.get("status") == "ERROR":
             recheck = _check_and_adjust_size(token_id, size)
             if recheck == 0:
-                print(f"    ⚡ 链上余额已清零，订单实际已成交（幽灵成交）")
-                return True, sell_price
+                ghost_price = _estimate_ghost_price(token_id, price) or sell_price
+                print(f"    ⚡ 链上余额已清零，订单实际已成交（幽灵成交）| 估计价=${ghost_price:.4f}")
+                return True, ghost_price
 
         if "not enough balance" in err.lower():
             # 链上确认有余额 → 可能是allowance不足，刷新后重试原始size
@@ -427,8 +458,9 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
                 # allowance刷新后再查一次余额，检测幽灵成交
                 recheck_a = _check_and_adjust_size(token_id, size)
                 if recheck_a == 0:
-                    print(f"    ⚡ 链上余额已清零，订单实际已成交（幽灵成交）")
-                    return True, sell_price
+                    ghost_price = _estimate_ghost_price(token_id, price) or sell_price
+                    print(f"    ⚡ 链上余额已清零，订单实际已成交（幽灵成交）| 估计价=${ghost_price:.4f}")
+                    return True, ghost_price
             # allowance刷新无效或链上余额不确定 → 减量重试
             for retry_size in [round(size * 0.98, 2), round(size * 0.95, 2), round(size * 0.90, 2)]:
                 if retry_size < 1:
@@ -445,8 +477,9 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
             # 减量全部失败 → 最终余额回查，兜底检测幽灵成交
             final_check = _check_and_adjust_size(token_id, size)
             if final_check == 0:
-                print(f"    ⚡ 减量重试后链上余额已清零（幽灵成交）")
-                return True, sell_price
+                ghost_price = _estimate_ghost_price(token_id, price) or sell_price
+                print(f"    ⚡ 减量重试后链上余额已清零（幽灵成交）| 估计价=${ghost_price:.4f}")
+                return True, ghost_price
             print(f"    ⚠️ 减量重试均失败，余额可能为零")
             return False, "NO_BALANCE"
 
@@ -691,12 +724,19 @@ def get_market_outcome(slug, direction):
     return None
 
 def get_current_crypto_price(coin):
-    """获取BTC/ETH当前实时价格 - 优先WebSocket(0ms)，fallback REST"""
-    # 优先从 WebSocket 内存读取
+    """获取BTC/ETH当前实时价格 - 优先Pyth链上价格，fallback Binance"""
+    # 优先从 Pyth 链上价格读取（更接近 Polymarket 结算价）
+    pyth_price = _pyth_stream.get_price(coin)
+    if pyth_price is not None:
+        return pyth_price
+    # Pyth REST fallback
+    pyth_rest = get_pyth_price(coin)
+    if pyth_rest is not None:
+        return pyth_rest
+    # 最终 fallback: Binance
     ws_price = _price_stream.get_price(coin)
     if ws_price is not None:
         return ws_price
-    # WebSocket 未就绪或超时，fallback REST
     try:
         symbol = "BTCUSDT" if coin == "BTC" else "ETHUSDT"
         resp = requests.get(
@@ -816,6 +856,14 @@ def execute_dip_buy(token_id, original_size, coin, slug, pos):
         if info["matched"]:
             actual_price = round(info["making"] / dip_size, 4) if dip_size > 0 and info["making"] > 0 else buy_price
             print(f"    ✅ 抄底成交: {dip_size}份 × ${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
+            # 预扣抄底成本到daily_pnl（record_bet_cost会累加到已有pending_costs）
+            try:
+                from trading_state import record_bet_cost
+                dip_cost = round(actual_price * dip_size, 4)
+                record_bet_cost(slug, dip_cost)
+                print(f"    📉 抄底预扣成本 ${dip_cost:.2f}")
+            except Exception:
+                pass
             return True, dip_size, actual_price
         print(f"    ❌ 抄底FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
 
@@ -825,6 +873,13 @@ def execute_dip_buy(token_id, original_size, coin, slug, pos):
         if info2["matched"]:
             actual_price2 = round(info2["making"] / dip_size, 4) if dip_size > 0 and info2["making"] > 0 else buy_price2
             print(f"    ✅ 抄底重试成交: {dip_size}份 × ${actual_price2:.4f} | {info2.get('elapsed_ms', 0):.0f}ms")
+            try:
+                from trading_state import record_bet_cost
+                dip_cost2 = round(actual_price2 * dip_size, 4)
+                record_bet_cost(slug, dip_cost2)
+                print(f"    📉 抄底预扣成本 ${dip_cost2:.2f}")
+            except Exception:
+                pass
             return True, dip_size, actual_price2
         return False, 0, None
     except Exception as e:
@@ -1486,7 +1541,9 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    # 启动 Binance WebSocket 实时价格流
+    # 启动 Pyth 链上价格流（主数据源，更接近 Polymarket 结算价）
+    _pyth_stream.start()
+    # 启动 Binance WebSocket 实时价格流（fallback）
     _price_stream.start()
     # 启动 Polymarket WebSocket 实时 orderbook 流
     _poly_ws.start()
@@ -1582,13 +1639,14 @@ def monitor():
                         # 自动清理：优先用API查真实结算结果
                         settle_price = get_market_outcome(slug, direction)
                         if settle_price is None:
-                            # API无结果，回退Binance价格（可能不准）
+                            # API无结果，回退链上价格判断
                             ptb = pos.get("ptb") or pos.get("price_to_beat")
                             crypto = get_current_crypto_price(coin)
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                print(f"  ⚠️ API无outcome，用Binance回退判断(可能不准)")
+                                src = "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
+                                print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
                         close_position(pos, settle_price)
@@ -1614,7 +1672,8 @@ def monitor():
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                print(f"  ⚠️ API无outcome，用Binance回退判断(可能不准)")
+                                src = "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
+                                print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
@@ -1645,8 +1704,13 @@ def monitor():
 
                 status = "🟢赢" if is_winning else "🔴输" if is_losing else "⚪"
                 # 补充显示：用加密货币方向替代可能失真的 token 利润率
-                # 价格来源标记：WS=WebSocket, REST=REST API
-                price_source = "WS" if _price_stream.get_price(coin) is not None else "REST"
+                # 价格来源标记：Pyth=链上, WS=Binance WebSocket, REST=Binance REST
+                if _pyth_stream.get_price(coin) is not None:
+                    price_source = "Pyth"
+                elif _price_stream.get_price(coin) is not None:
+                    price_source = "WS"
+                else:
+                    price_source = "REST"
                 crypto_label = f" | {coin}=${crypto_price:,.2f}({price_source})" if crypto_price else ""
                 if direction_correct is not None:
                     dir_icon = "✅" if direction_correct else "❌"
@@ -1759,8 +1823,8 @@ def monitor():
                                     continue
                                 elif actual == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                    self_notify(pos, current_price or 0, coin, direction, size, "P0止盈(余额已清)")
-                                    close_position(pos, current_price or 0)
+                                    self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "P0止盈(余额已清)")
+                                    close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                                     close_attempts.pop(attempt_key, None)
                                     stop_loss_attempts.pop(attempt_key, None)
                                     tp_state.pop(attempt_key, None)
@@ -1861,8 +1925,8 @@ def monitor():
                         self_notify(pos, sold_price, coin, direction, size, "硬止损(-25%)")
                     elif actual_price == "NO_BALANCE":
                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                        self_notify(pos, current_price or 0, coin, direction, size, "硬止损(余额已清)")
-                        close_position(pos, current_price or 0)
+                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "硬止损(余额已清)")
+                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
@@ -1907,8 +1971,8 @@ def monitor():
                         self_notify(pos, sold_price, coin, direction, size, "方向翻转清仓")
                     elif actual_price == "NO_BALANCE":
                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                        self_notify(pos, current_price or 0, coin, direction, size, "方向翻转(余额已清)")
-                        close_position(pos, current_price or 0)
+                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "方向翻转(余额已清)")
+                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
@@ -1980,8 +2044,8 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, f"ATR止损({atr_str})")
                         elif actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, current_price or 0, coin, direction, size, "ATR止损(余额已清)")
-                            close_position(pos, current_price or 0)
+                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR止损(余额已清)")
+                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
@@ -2104,8 +2168,8 @@ def monitor():
                         self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
                     elif actual_price == "NO_BALANCE":
                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                        self_notify(pos, current_price or 0, coin, direction, size, "止损(余额已清)")
-                        close_position(pos, current_price or 0)
+                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "止损(余额已清)")
+                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                         close_attempts.pop(attempt_key, None)
                         stop_loss_attempts.pop(attempt_key, None)
                         dip_bought.pop(attempt_key, None)
@@ -2153,8 +2217,8 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "阶段2平仓")
                         elif actual == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, current_price or 0, coin, direction, size, "阶段2(余额已清)")
-                            close_position(pos, current_price or 0)
+                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段2(余额已清)")
+                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             continue
@@ -2185,6 +2249,14 @@ def monitor():
                                 }
                                 update_position(pos, new_size=remaining_size, partial_exit=partial_exit)
                                 pos["size"] = remaining_size
+                                # 记录部分成交的PnL到daily_pnl（mini-settlement）
+                                try:
+                                    from trading_state import record_partial_pnl
+                                    new_daily = record_partial_pnl(slug, sold_price, sold_count, entry_price)
+                                    partial_pnl = (sold_price - entry_price) * sold_count
+                                    print(f"    📊 部分成交PnL: ${partial_pnl:+.2f} ({sold_count}份×${sold_price:.2f}) → 今日PnL: ${new_daily:+.2f}")
+                                except Exception:
+                                    pass
                                 self_notify(pos, sold_price, coin, direction, sold_count, f"阶段2分批({sold_count}/{size})")
                                 close_attempts.pop(attempt_key, None)
                                 continue
@@ -2232,8 +2304,8 @@ def monitor():
                                     ok, actual_price = market_sell_immediate(token_id, size, price=best_bid, position=pos)
                                     if actual_price == "NO_BALANCE":
                                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                        self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
-                                        close_position(pos, current_price or 0)
+                                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段3(余额已清)")
+                                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                                         close_attempts.pop(attempt_key, None)
                                         continue
                                     elif ok:
@@ -2252,8 +2324,8 @@ def monitor():
                                 ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                                 if actual_price == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                    self_notify(pos, current_price or 0, coin, direction, size, "阶段3(余额已清)")
-                                    close_position(pos, current_price or 0)
+                                    self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段3(余额已清)")
+                                    close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                                     close_attempts.pop(attempt_key, None)
                                     continue
                                 elif ok:
@@ -2283,8 +2355,8 @@ def monitor():
                         ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                         if actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, current_price or 0, coin, direction, size, "阶段4(余额已清)")
-                            close_position(pos, current_price or 0)
+                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段4(余额已清)")
+                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
                             close_attempts.pop(attempt_key, None)
                             continue
                         elif ok:
