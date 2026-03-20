@@ -56,6 +56,7 @@ from trading_state import should_trade, decrease_cooldown, get_state_summary, re
 _playwright_failures = {}  # Playwright 连续失败计数（按币种独立: {coin: count}）
 _ptb_batch_pending = {}  # 待批量获取的 PTB: {slug: coin}
 _ptb_batch_lock = threading.Lock()
+_playwright_lock = threading.Lock()  # 串行化 Playwright 进程，防止多个 Chromium 同时启动爆内存
 
 # ── 网络熔断器 ──
 _api_failures = 0          # 连续 API 失败计数
@@ -123,7 +124,7 @@ def circuit_breaker_record(success):
             _api_failures = 0
 
 def get_ptb_multi_strategy(slug):
-    """单个 PTB 获取（subprocess 隔离，超时可杀进程）"""
+    """单个 PTB 获取（subprocess 隔离，加锁防止多个 Chromium 同时启动）"""
     from ai_trader.coins import coin_from_slug
     coin = coin_from_slug(slug)
     failures = _playwright_failures.get(coin, 0)
@@ -132,34 +133,35 @@ def get_ptb_multi_strategy(slug):
         logger.info(f"   跳过 Playwright（{coin}连续失败{failures}次）")
         return None
 
-    try:
-        ptb_script = os.path.join(os.path.dirname(__file__), "ai_trader", "playwright_ptb.py")
-        t0 = time.time()
-        result = subprocess.run(
-            [sys.executable, ptb_script, slug],
-            capture_output=True, text=True, timeout=20
-        )
-        elapsed = time.time() - t0
-        if result.returncode == 0 and result.stdout:
-            import re
-            m = re.search(r'PTB=([\d.]+)', result.stdout)
-            if m:
-                ptb = float(m.group(1))
-                if 100 < ptb < 10_000_000:
-                    _playwright_failures[coin] = 0
-                    print(f"✅ PTB={ptb:.2f} (Playwright, {elapsed:.1f}s)")
-                    return ptb
-        _playwright_failures[coin] = failures + 1
-        if _playwright_failures[coin] >= 3:
-            logger.warning(f"   Playwright {coin}连续{_playwright_failures[coin]}次失败，后续跳过")
-        else:
-            logger.warning(f"   Playwright PTB 无结果({_playwright_failures[coin]}/3) | {elapsed:.1f}s")
-    except subprocess.TimeoutExpired:
-        _playwright_failures[coin] = failures + 1
-        logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures[coin]}/3) [{coin}]")
-    except Exception as e:
-        _playwright_failures[coin] = failures + 1
-        logger.warning(f"   Playwright PTB 失败({_playwright_failures[coin]}/3): {str(e)[:80]}")
+    with _playwright_lock:
+        try:
+            ptb_script = os.path.join(os.path.dirname(__file__), "ai_trader", "playwright_ptb.py")
+            t0 = time.time()
+            result = subprocess.run(
+                [sys.executable, ptb_script, slug],
+                capture_output=True, text=True, timeout=20
+            )
+            elapsed = time.time() - t0
+            if result.returncode == 0 and result.stdout:
+                import re
+                m = re.search(r'PTB=([\d.]+)', result.stdout)
+                if m:
+                    ptb = float(m.group(1))
+                    if 100 < ptb < 10_000_000:
+                        _playwright_failures[coin] = 0
+                        print(f"✅ PTB={ptb:.2f} (Playwright, {elapsed:.1f}s)")
+                        return ptb
+            _playwright_failures[coin] = failures + 1
+            if _playwright_failures[coin] >= 3:
+                logger.warning(f"   Playwright {coin}连续{_playwright_failures[coin]}次失败，后续跳过")
+            else:
+                logger.warning(f"   Playwright PTB 无结果({_playwright_failures[coin]}/3) | {elapsed:.1f}s")
+        except subprocess.TimeoutExpired:
+            _playwright_failures[coin] = failures + 1
+            logger.warning(f"   Playwright PTB 超时(20s)({_playwright_failures[coin]}/3) [{coin}]")
+        except Exception as e:
+            _playwright_failures[coin] = failures + 1
+            logger.warning(f"   Playwright PTB 失败({_playwright_failures[coin]}/3): {str(e)[:80]}")
 
     return None
 
