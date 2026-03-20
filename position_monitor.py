@@ -85,6 +85,11 @@ DIP_BUY_MIN_REMAINING = float(os.environ.get("DIP_BUY_MIN_REMAINING", "60"))
 PTB_PROXIMITY_ATR = float(os.environ.get("PTB_PROXIMITY_ATR", "0.7"))
 PTB_PROXIMITY_EXTREME_STOP = float(os.environ.get("PTB_PROXIMITY_EXTREME_STOP", "0.50"))
 
+# ATR 衰减止损（crypto实时价格驱动，不依赖token价格）
+ATR_DECAY_EXIT_THRESHOLD = float(os.environ.get("ATR_DECAY_EXIT_THRESHOLD", "0.5"))  # ATR降到此值以下触发
+ATR_DECAY_RATIO = float(os.environ.get("ATR_DECAY_RATIO", "0.30"))  # ATR降到入场值的此比例以下触发
+ATR_DIRECTION_CORRECT_STOP = float(os.environ.get("ATR_DIRECTION_CORRECT_STOP", "0.5"))  # 方向正确但ATR<此值+token跌>20%也止损
+
 def calc_proximity_threshold(remaining):
     """proximity zone 宽度随时间衰减：越接近到期 buffer 越窄"""
     if remaining > 180:
@@ -1555,8 +1560,8 @@ def monitor():
     # 启动 Polymarket WebSocket 实时 orderbook 流
     _poly_ws.start()
     _ws_subscribed = set()  # 已订阅的 token_ids
-    print("🔍 持仓监控 v9.4 启动（ATR三层决策 + Proximity衰减streak + 滑动窗口）...")
-    print("   Exit Protocol: P0双曲止盈 | -25%硬止损 | 方向翻转(衰减streak) | ATR≥2抄底 | ATR<1止损")
+    print("🔍 持仓监控 v9.8 启动（ATR三层决策 + Chainlink止损优化 + Proximity衰减streak）...")
+    print("   Exit Protocol: P0双曲止盈 | ATR衰减止损 | ATR加速下降 | -25%硬止损 | 方向翻转 | ATR≥2抄底 | ATR<1止损")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
     print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%(时间衰减) | streak衰减+8轮滑动窗口")
 
@@ -1568,6 +1573,8 @@ def monitor():
     tp_fail_count = {}  # (slug, entry_time) -> 连续止盈失败次数
     direction_wrong_streak = {}  # (slug, entry_time) -> 方向错误衰减计数（❌+1, ✅-1, 不清零）
     direction_history = {}  # (slug, entry_time) -> deque(maxlen=8) 最近8轮方向记录
+    atr_history = {}  # (slug, entry_time) -> deque(maxlen=5) 最近5轮ATR值（速度检测用）
+    entry_atr = {}  # (slug, entry_time) -> 入场时的ATR值
     
     while True:
         try:
@@ -1587,6 +1594,8 @@ def monitor():
             tp_fail_count = {k: v for k, v in tp_fail_count.items() if k in open_keys}
             direction_wrong_streak = {k: v for k, v in direction_wrong_streak.items() if k in open_keys}
             direction_history = {k: v for k, v in direction_history.items() if k in open_keys}
+            atr_history = {k: v for k, v in atr_history.items() if k in open_keys}
+            entry_atr = {k: v for k, v in entry_atr.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -1861,6 +1870,87 @@ def monitor():
                 _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
                 atr_str = f"{diff_atr:.1f}ATR" if diff_atr else "N/A"
 
+                # ═══ 基于 Chainlink 实时价格的止损优化 ═══
+                # 记录入场ATR（首次见到）
+                if attempt_key not in entry_atr and diff_atr is not None:
+                    entry_atr[attempt_key] = diff_atr
+                # 更新ATR历史（速度检测用）
+                if diff_atr is not None:
+                    if attempt_key not in atr_history:
+                        atr_history[attempt_key] = deque(maxlen=5)
+                    atr_history[attempt_key].append(diff_atr)
+
+                # --- 0A. ATR衰减止损: crypto快速逼近PTB，不等token崩盘 ---
+                # 条件: ATR < 0.5 且 ATR降到入场值的30%以下 且 token已亏损
+                if (diff_atr is not None and diff_atr < ATR_DECAY_EXIT_THRESHOLD
+                        and attempt_key in entry_atr and entry_atr[attempt_key] > 0
+                        and diff_atr / entry_atr[attempt_key] < ATR_DECAY_RATIO
+                        and profit_rate < -0.05):
+                    decay_pct = (1 - diff_atr / entry_atr[attempt_key]) * 100
+                    print(f"  🚨 ATR衰减止损: {diff_atr:.2f}ATR (入场{entry_atr[attempt_key]:.1f}ATR, 衰减{decay_pct:.0f}%) + 跌{profit_rate*100:+.1f}% | 剩余{remaining:.0f}s")
+                    attempted_stop_loss = True
+                    cancel_all_orders(token_id)
+                    best_bid_sl = get_best_bid_raw(token_id)
+                    if best_bid_sl and best_bid_sl >= 0.05:
+                        ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl, position=pos, skip_cancel=True)
+                    else:
+                        ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
+                    if ok:
+                        sold = True
+                        sold_price = actual_price
+                        self_notify(pos, sold_price, coin, direction, size, f"ATR衰减止损({diff_atr:.1f}/{entry_atr[attempt_key]:.1f})")
+                    elif actual_price == "NO_BALANCE":
+                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR衰减(余额已清)")
+                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                        close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
+                        dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
+                        continue
+                    if sold:
+                        close_position(pos, sold_price)
+                        close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
+                        dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
+                        continue
+
+                # --- 0B. ATR加速下降止损: 3轮内ATR连续下降且已低于0.5 ---
+                if diff_atr is not None and attempt_key in atr_history:
+                    hist = atr_history[attempt_key]
+                    if len(hist) >= 3 and profit_rate < -0.10:
+                        recent = list(hist)[-3:]
+                        # 连续下降 且 当前ATR低
+                        if recent[0] > recent[1] > recent[2] and recent[2] < ATR_DECAY_EXIT_THRESHOLD:
+                            speed = recent[0] - recent[2]
+                            print(f"  🚨 ATR加速下降: {recent[0]:.2f}→{recent[1]:.2f}→{recent[2]:.2f} (Δ{speed:.2f}) + 跌{profit_rate*100:+.1f}% | 剩余{remaining:.0f}s")
+                            attempted_stop_loss = True
+                            cancel_all_orders(token_id)
+                            best_bid_sl = get_best_bid_raw(token_id)
+                            if best_bid_sl and best_bid_sl >= 0.05:
+                                ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl, position=pos, skip_cancel=True)
+                            else:
+                                ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
+                            if ok:
+                                sold = True
+                                sold_price = actual_price
+                                self_notify(pos, sold_price, coin, direction, size, f"ATR加速下降({speed:.1f})")
+                            elif actual_price == "NO_BALANCE":
+                                self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR加速(余额已清)")
+                                close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                                close_attempts.pop(attempt_key, None)
+                                continue
+                            if sold:
+                                close_position(pos, sold_price)
+                                close_attempts.pop(attempt_key, None)
+                                stop_loss_attempts.pop(attempt_key, None)
+                                dip_bought.pop(attempt_key, None)
+                                direction_wrong_streak.pop(attempt_key, None)
+                                direction_history.pop(attempt_key, None)
+                                continue
+
                 # --- 方向降级：ATR趋零说明crypto逼近strike，方向随时可能翻转 ---
                 # direction_correct=True 但 ATR<0.3 且 token已大幅亏损 → 降级为False
                 # 让现有硬止损(-25%)和ATR危险区自然生效，避免方向"技术正确"时全程观望到归零
@@ -1890,6 +1980,10 @@ def monitor():
 
                         if profit_rate <= -extreme_stop:
                             print(f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<{prox_threshold:.2f} 但跌{profit_rate*100:+.1f}%>{-extreme_stop*100:.0f}% → 不冻结")
+                            in_proximity = False
+                        elif profit_rate <= -PRICE_DROP_HARD_STOP:
+                            # token跌超硬止损线(-25%) → proximity立即解除，不等streak
+                            print(f"  🚨 Proximity快速解除: 跌{profit_rate*100:+.1f}%超硬止损线-{PRICE_DROP_HARD_STOP*100:.0f}% | {diff_atr:.2f}ATR → 不冻结")
                             in_proximity = False
                         else:
                             # 检查 streak/滑动窗口是否已累计确认方向错误 → 解除保护
@@ -2034,10 +2128,13 @@ def monitor():
                             print(f"    ⚠️ 抄底未成交，方向安全继续持有 | {atr_str} | 剩余{remaining:.0f}s")
                         continue
 
-                    elif diff_atr is not None and diff_atr < ATR_DANGER_THRESHOLD and not direction_correct:
+                    elif diff_atr is not None and diff_atr < ATR_DANGER_THRESHOLD and (
+                            not direction_correct
+                            or (diff_atr < ATR_DIRECTION_CORRECT_STOP and profit_rate <= -0.20)):
                         # 🔴 危险区: ATR < 1.0 且方向错误 → 立即止损
-                        # 方向正确时 ATR 短暂降低属正常波动，不应止损
-                        print(f"  🔴 ATR止损: 跌{profit_rate*100:+.1f}% | {atr_str}<{ATR_DANGER_THRESHOLD} | 方向❌ | 剩余{remaining:.0f}s")
+                        # 改进: ATR < 0.5 且 token跌>20% → 即使方向正确也止损（50:50赌局不值得）
+                        dir_label = "方向❌" if not direction_correct else f"方向✅但ATR={diff_atr:.2f}<{ATR_DIRECTION_CORRECT_STOP}"
+                        print(f"  🔴 ATR止损: 跌{profit_rate*100:+.1f}% | {atr_str}<{ATR_DANGER_THRESHOLD} | {dir_label} | 剩余{remaining:.0f}s")
                         attempted_stop_loss = True
                         cancel_all_orders(token_id)
                         # 用best_bid卖出（token此时还有价值，不用地板价）
