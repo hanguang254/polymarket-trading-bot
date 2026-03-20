@@ -17,6 +17,7 @@ from ai_trader import clob_client
 from ai_trader.binance_api import price_stream as _price_stream
 from ai_trader.pyth_api import pyth_stream as _pyth_stream, get_pyth_price
 from ai_trader.polymarket_ws import poly_ws as _poly_ws
+from ai_trader.polymarket_rtds import chainlink_stream as _chainlink_stream
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ═══ 日志：print 同时写入 logs/monitor.log ═══
@@ -724,8 +725,12 @@ def get_market_outcome(slug, direction):
     return None
 
 def get_current_crypto_price(coin):
-    """获取BTC/ETH当前实时价格 - 优先Pyth链上价格，fallback Binance"""
-    # 优先从 Pyth 链上价格读取（更接近 Polymarket 结算价）
+    """获取BTC/ETH当前实时价格 - 优先Chainlink结算价，fallback Pyth/Binance"""
+    # 优先从 RTDS Chainlink 读取（Polymarket 直接结算价，零延迟）
+    cl_price = _chainlink_stream.get_price(coin)
+    if cl_price is not None:
+        return cl_price
+    # Pyth 链上价格 fallback
     pyth_price = _pyth_stream.get_price(coin)
     if pyth_price is not None:
         return pyth_price
@@ -1541,7 +1546,9 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    # 启动 Pyth 链上价格流（主数据源，更接近 Polymarket 结算价）
+    # 启动 RTDS Chainlink 价格流（主数据源，Polymarket 直接结算价）
+    _chainlink_stream.start()
+    # 启动 Pyth 链上价格流（fallback）
     _pyth_stream.start()
     # 启动 Binance WebSocket 实时价格流（fallback）
     _price_stream.start()
@@ -1645,7 +1652,7 @@ def monitor():
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                src = "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
+                                src = "CL" if _chainlink_stream.get_price(coin) is not None else "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
                                 print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
@@ -1672,7 +1679,7 @@ def monitor():
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                src = "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
+                                src = "CL" if _chainlink_stream.get_price(coin) is not None else "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
                                 print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
@@ -1704,8 +1711,10 @@ def monitor():
 
                 status = "🟢赢" if is_winning else "🔴输" if is_losing else "⚪"
                 # 补充显示：用加密货币方向替代可能失真的 token 利润率
-                # 价格来源标记：Pyth=链上, WS=Binance WebSocket, REST=Binance REST
-                if _pyth_stream.get_price(coin) is not None:
+                # 价格来源标记：CL=Chainlink结算价, Pyth=链上, WS=Binance WebSocket, REST=Binance REST
+                if _chainlink_stream.get_price(coin) is not None:
+                    price_source = "CL"
+                elif _pyth_stream.get_price(coin) is not None:
                     price_source = "Pyth"
                 elif _price_stream.get_price(coin) is not None:
                     price_source = "WS"
