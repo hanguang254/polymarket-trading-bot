@@ -201,8 +201,12 @@ def get_ptb_batch(slugs):
                     _playwright_failures[coin_from_slug(s)] = 0
                 logger.info(f"   批量PTB {len(ptb_results)}/{len(slugs)} ({elapsed:.1f}s)")
                 return ptb_results
-        # 全部失败
+        # 全部失败 — 打印 stderr 帮助调试
         from ai_trader.coins import coin_from_slug
+        if result.stderr:
+            logger.warning(f"   批量PTB stderr: {result.stderr[:200]}")
+        if result.stdout:
+            logger.warning(f"   批量PTB stdout: {result.stdout[:200]}")
         for s in slugs:
             c = coin_from_slug(s)
             _playwright_failures[c] = _playwright_failures.get(c, 0) + 1
