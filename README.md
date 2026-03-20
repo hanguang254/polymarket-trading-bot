@@ -233,22 +233,31 @@ All components now use SDK/REST API directly — no Polymarket CLI dependency.
 ### Prerequisites
 
 - Python 3.10+
+- **服务器最低配置**: 2核 2GB（2个币种串行PTB）/ 4核 4GB（3个币种并行PTB）
 - [py-clob-client](https://github.com/Polymarket/py-clob-client) (`pip install py-clob-client`)
 - [websocket-client](https://pypi.org/project/websocket-client/) (`pip install websocket-client`) — Binance WebSocket price stream
-- Chromium browser (for Playwright PTB extraction)
+- Chromium browser + 系统依赖 (for Playwright PTB extraction)
 
 ### Installation
+
+**一键部署（推荐）：**
 
 ```bash
 git clone https://github.com/youruser/polymarket-trading-bot.git
 cd polymarket-trading-bot
+bash setup.sh
+nano .env  # 填入钱包地址和 Telegram token
+```
 
+`setup.sh` 自动完成：Python 依赖 → Playwright Chromium + 系统库 → 日志目录 → .env 模板 → 验证测试。
+
+**手动安装：**
+
+```bash
 pip install -r requirements.txt
 playwright install chromium
-
+playwright install-deps chromium  # 安装 Chromium 系统依赖（libatk、libglib 等）
 cp .env.example .env
-# Edit .env with your wallet addresses and Telegram token
-
 ```
 
 ### Environment Variables
