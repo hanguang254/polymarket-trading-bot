@@ -15,6 +15,7 @@ import requests
 from ai_trader.polymarket_api import normalize_orderbook
 from ai_trader import clob_client
 from ai_trader.binance_api import price_stream as _price_stream
+from ai_trader.pyth_api import pyth_stream as _pyth_stream, get_pyth_price
 from ai_trader.polymarket_ws import poly_ws as _poly_ws
 from py_clob_client.order_builder.constants import BUY, SELL
 
@@ -691,12 +692,19 @@ def get_market_outcome(slug, direction):
     return None
 
 def get_current_crypto_price(coin):
-    """获取BTC/ETH当前实时价格 - 优先WebSocket(0ms)，fallback REST"""
-    # 优先从 WebSocket 内存读取
+    """获取BTC/ETH当前实时价格 - 优先Pyth链上价格，fallback Binance"""
+    # 优先从 Pyth 链上价格读取（更接近 Polymarket 结算价）
+    pyth_price = _pyth_stream.get_price(coin)
+    if pyth_price is not None:
+        return pyth_price
+    # Pyth REST fallback
+    pyth_rest = get_pyth_price(coin)
+    if pyth_rest is not None:
+        return pyth_rest
+    # 最终 fallback: Binance
     ws_price = _price_stream.get_price(coin)
     if ws_price is not None:
         return ws_price
-    # WebSocket 未就绪或超时，fallback REST
     try:
         symbol = "BTCUSDT" if coin == "BTC" else "ETHUSDT"
         resp = requests.get(
@@ -1486,7 +1494,9 @@ def sell_in_batches(token_id, total_size, base_price):
 
 def monitor():
     """主监控循环 - 重构版：提前卖、分批卖、确认成交"""
-    # 启动 Binance WebSocket 实时价格流
+    # 启动 Pyth 链上价格流（主数据源，更接近 Polymarket 结算价）
+    _pyth_stream.start()
+    # 启动 Binance WebSocket 实时价格流（fallback）
     _price_stream.start()
     # 启动 Polymarket WebSocket 实时 orderbook 流
     _poly_ws.start()
@@ -1582,13 +1592,14 @@ def monitor():
                         # 自动清理：优先用API查真实结算结果
                         settle_price = get_market_outcome(slug, direction)
                         if settle_price is None:
-                            # API无结果，回退Binance价格（可能不准）
+                            # API无结果，回退链上价格判断
                             ptb = pos.get("ptb") or pos.get("price_to_beat")
                             crypto = get_current_crypto_price(coin)
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                print(f"  ⚠️ API无outcome，用Binance回退判断(可能不准)")
+                                src = "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
+                                print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
                         close_position(pos, settle_price)
@@ -1614,7 +1625,8 @@ def monitor():
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                print(f"  ⚠️ API无outcome，用Binance回退判断(可能不准)")
+                                src = "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
+                                print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
@@ -1645,8 +1657,13 @@ def monitor():
 
                 status = "🟢赢" if is_winning else "🔴输" if is_losing else "⚪"
                 # 补充显示：用加密货币方向替代可能失真的 token 利润率
-                # 价格来源标记：WS=WebSocket, REST=REST API
-                price_source = "WS" if _price_stream.get_price(coin) is not None else "REST"
+                # 价格来源标记：Pyth=链上, WS=Binance WebSocket, REST=Binance REST
+                if _pyth_stream.get_price(coin) is not None:
+                    price_source = "Pyth"
+                elif _price_stream.get_price(coin) is not None:
+                    price_source = "WS"
+                else:
+                    price_source = "REST"
                 crypto_label = f" | {coin}=${crypto_price:,.2f}({price_source})" if crypto_price else ""
                 if direction_correct is not None:
                     dir_icon = "✅" if direction_correct else "❌"

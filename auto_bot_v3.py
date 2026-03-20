@@ -969,6 +969,10 @@ def main():
     # 初始化 CLOB SDK 客户端（全局单例，全程复用）
     clob_client.init_client()
 
+    # 启动 Pyth 链上价格流（持仓监控主数据源）
+    from ai_trader.pyth_api import pyth_stream
+    pyth_stream.start()
+
     # 启动 Binance WebSocket 实时价格流（预热+分析共用）
     from ai_trader.binance_api import price_stream
     price_stream.start()
