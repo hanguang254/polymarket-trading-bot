@@ -24,6 +24,7 @@ import time
 import json
 import os
 import subprocess
+import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -59,6 +60,10 @@ _api_failures = 0          # 连续 API 失败计数
 _circuit_open_until = 0    # 熔断恢复时间戳（Unix）
 CIRCUIT_BREAK_THRESHOLD = 5   # 连续失败N次触发熔断
 CIRCUIT_BREAK_DURATION = 300  # 熔断持续时间（秒）
+
+# 持仓数检查锁 + 预占计数：防止并行线程同时通过 MAX_OPEN_POSITIONS 检查
+_position_lock = threading.Lock()
+_pending_bets = 0  # 正在下注中（已通过检查但尚未写入positions.jsonl）
 
 
 def get_correlated_exposure(direction, coin):
@@ -768,23 +773,27 @@ class MarketTracker:
         
         logger.info(f"  ✅ 满足下注条件！")
 
-        # 检查最大同时持仓数（读 positions.jsonl 中未关闭的仓位）
+        # 检查最大同时持仓数（锁+预占计数，防止并行线程同时通过检查）
         MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "2"))
-        try:
-            positions_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
-            open_count = 0
-            if os.path.exists(positions_file):
-                with open(positions_file) as _f:
-                    for _line in _f:
-                        _p = json.loads(_line.strip())
-                        if not _p.get("closed", False):
-                            open_count += 1
-            if open_count >= MAX_OPEN_POSITIONS:
-                logger.warning(f"  ⏸️ 已有 {open_count} 个持仓，超过上限 {MAX_OPEN_POSITIONS}，跳过")
-                logger.info(f"{'='*60}\n")
-                return
-        except Exception as _e:
-            logger.warning(f"  ⚠️ 检查持仓数失败: {_e}")
+        global _pending_bets
+        with _position_lock:
+            try:
+                positions_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
+                open_count = 0
+                if os.path.exists(positions_file):
+                    with open(positions_file) as _f:
+                        for _line in _f:
+                            _p = json.loads(_line.strip())
+                            if not _p.get("closed", False):
+                                open_count += 1
+                total = open_count + _pending_bets
+                if total >= MAX_OPEN_POSITIONS:
+                    logger.warning(f"  ⏸️ 持仓{open_count}+下注中{_pending_bets}={total}，达上限{MAX_OPEN_POSITIONS}，跳过")
+                    logger.info(f"{'='*60}\n")
+                    return
+                _pending_bets += 1
+            except Exception as _e:
+                logger.warning(f"  ⚠️ 检查持仓数失败: {_e}")
 
         # 检查冷却期：满足下注条件时跳过冷却（EV模型已确认有edge）
         if not should_trade():
@@ -826,59 +835,63 @@ class MarketTracker:
         except Exception:
             pass  # fallback: execute_bet内部自行获取
 
-        success, entry_price, bet_size, output = execute_bet(
-            slug, direction, token_id,
-            confidence=confidence,
-            ev=details.get('expected_value', 0),
-            p_hat=p_hat,
-            entry_details=details,
-            kelly_reduction=kelly_reduction,
-            pre_balance=_balance,
-        )
-        
-        if success:
-            logger.info(f"  ✅ 下注成功！（{bet_size}份）")
-            self.analyzed.add(slug)  # 下注成功，阻止晚期窗口重复分析
-
-            # ★ 立即预扣下注成本到 daily_pnl（防止并行线程超限）
-            cost = round(entry_price * bet_size, 4)
-            new_pnl = record_bet_cost(slug, cost)
-            logger.info(f"  📉 预扣成本 ${cost:.2f} → 今日PnL: ${new_pnl:+.2f}")
-
-            # 记录持仓（使用实际下单价格和动态仓位）
-            position = Position(
-                slug, token_id, direction, entry_price, bet_size,
-                datetime.now(timezone.utc).isoformat()
+        try:
+            success, entry_price, bet_size, output = execute_bet(
+                slug, direction, token_id,
+                confidence=confidence,
+                ev=details.get('expected_value', 0),
+                p_hat=p_hat,
+                entry_details=details,
+                kelly_reduction=kelly_reduction,
+                pre_balance=_balance,
             )
-            self.positions[slug] = position
 
-            # 真实盈亏在 position_monitor close_position 时记录
+            if success:
+                logger.info(f"  ✅ 下注成功！（{bet_size}份）")
+                self.analyzed.add(slug)  # 下注成功，阻止晚期窗口重复分析
 
-            # 发送通知
-            send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
-        elif isinstance(output, str) and output.startswith("PENDING"):
-            logger.warning(f"  ⏳ 挂单待成交: {output} | 已记录待成交，交由 monitor 对账入仓")
-        elif isinstance(output, str) and output.startswith("SKIP_"):
-            # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
-            retry_n = self.trade_attempts.get(slug, 0)
-            logger.warning(f"  ⚠️ {output}，跳过（不计入统计）| 尝试{retry_n}次，等待重试")
-        elif isinstance(output, str) and ("Too Early" in output or "not ready" in output or "425" in output):
-            # API时序错误（市场未开始接单），不计为交易失败
-            logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
-        else:
-            output_str = str(output) if output else ""
-            if "fully filled" in output_str or "FOK" in output_str:
+                # ★ 立即预扣下注成本到 daily_pnl（防止并行线程超限）
+                cost = round(entry_price * bet_size, 4)
+                new_pnl = record_bet_cost(slug, cost)
+                logger.info(f"  📉 预扣成本 ${cost:.2f} → 今日PnL: ${new_pnl:+.2f}")
+
+                # 记录持仓（使用实际下单价格和动态仓位）
+                position = Position(
+                    slug, token_id, direction, entry_price, bet_size,
+                    datetime.now(timezone.utc).isoformat()
+                )
+                self.positions[slug] = position
+
+                # 真实盈亏在 position_monitor close_position 时记录
+
+                # 发送通知
+                send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
+            elif isinstance(output, str) and output.startswith("PENDING"):
+                logger.warning(f"  ⏳ 挂单待成交: {output} | 已记录待成交，交由 monitor 对账入仓")
+            elif isinstance(output, str) and output.startswith("SKIP_"):
+                # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
                 retry_n = self.trade_attempts.get(slug, 0)
-                logger.warning(f"  ⚠️ FOK未成交（流动性不足）| 尝试{retry_n}次，等待重试")
-            elif "Request exception" in output_str or "status_code=None" in output_str:
-                logger.warning(f"  ⚠️ 网络超时，跳过（不计入统计）: {output_str[:80]}")
+                logger.warning(f"  ⚠️ {output}，跳过（不计入统计）| 尝试{retry_n}次，等待重试")
+            elif isinstance(output, str) and ("Too Early" in output or "not ready" in output or "425" in output):
+                # API时序错误（市场未开始接单），不计为交易失败
+                logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
             else:
-                logger.error(f"  ❌ 下注失败: {output_str[:150]}")
-                self.analyzed.add(slug)
-                record_bet_result(False, slug)
-        
-        logger.info(f"  📊 {get_state_summary()}")
-        print(f"{'='*60}\n")
+                output_str = str(output) if output else ""
+                if "fully filled" in output_str or "FOK" in output_str:
+                    retry_n = self.trade_attempts.get(slug, 0)
+                    logger.warning(f"  ⚠️ FOK未成交（流动性不足）| 尝试{retry_n}次，等待重试")
+                elif "Request exception" in output_str or "status_code=None" in output_str:
+                    logger.warning(f"  ⚠️ 网络超时，跳过（不计入统计）: {output_str[:80]}")
+                else:
+                    logger.error(f"  ❌ 下注失败: {output_str[:150]}")
+                    self.analyzed.add(slug)
+                    record_bet_result(False, slug)
+
+            logger.info(f"  📊 {get_state_summary()}")
+            print(f"{'='*60}\n")
+        finally:
+            with _position_lock:
+                _pending_bets = max(0, _pending_bets - 1)
     
     def close_position(self, slug, position):
         """平仓"""
