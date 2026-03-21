@@ -1971,8 +1971,12 @@ def monitor():
                 # --- 方向降级：ATR趋零说明crypto逼近strike，方向随时可能翻转 ---
                 # direction_correct=True 但 ATR<0.3 且 token已大幅亏损 → 降级为False
                 # 让现有硬止损(-25%)和ATR危险区自然生效，避免方向"技术正确"时全程观望到归零
+                # [P0] 降级前保存BTC真实方向（不受任何修改影响），用于门控止损
+                true_direction_correct = direction_correct
                 ATR_DOWNGRADE_THRESHOLD = 0.3
+                # [P1] 末期60s内跳过ATR降级：结算结果已接近确定，BTC在正确侧即为赢单
                 if (direction_correct is True
+                        and remaining >= 60
                         and diff_atr is not None and diff_atr < ATR_DOWNGRADE_THRESHOLD
                         and profit_rate <= -PRICE_DROP_HARD_STOP):
                     print(f"  ⚠️ 方向降级: 方向✅但ATR={diff_atr:.2f}<{ATR_DOWNGRADE_THRESHOLD}(逼近strike) + 跌{profit_rate*100:+.1f}% → 视为方向❌")
@@ -1986,8 +1990,9 @@ def monitor():
                     prox_threshold = calc_proximity_threshold(remaining)
                     in_proximity = diff_atr < prox_threshold
 
-                    if in_proximity and direction_correct is False:
+                    if in_proximity and direction_correct is False and true_direction_correct is False:
                         # 极端安全阀：时间衰减收紧（>120s:-50%, 60-120s:-45%, <60s:-40%）
+                        # [P0] true_direction_correct is False 门控：BTC真在正确侧时不触发极端止损
                         if remaining > 120:
                             extreme_stop = PTB_PROXIMITY_EXTREME_STOP        # -50%
                         elif remaining > 60:
@@ -2032,9 +2037,11 @@ def monitor():
                         direction_wrong_streak[attempt_key] = max(0, cur_streak - 1)
 
                 # --- 1. -25% 硬止损线（方向错误/未知时触发，方向正确交给ATR矩阵）---
+                # [P0] true_direction_correct is not True 门控：BTC真在正确侧时不触发硬止损
                 if (current_price is not None and entry_price > 0
                         and profit_rate <= -PRICE_DROP_HARD_STOP
-                        and direction_correct is not True):
+                        and direction_correct is not True
+                        and true_direction_correct is not True):
                     print(f"  🚨 硬止损: {profit_rate*100:+.1f}%超过-{PRICE_DROP_HARD_STOP*100:.0f}% | {atr_str} | 剩余{remaining:.0f}s")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
