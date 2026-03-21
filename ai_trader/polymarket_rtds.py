@@ -53,6 +53,7 @@ class ChainlinkPriceStream:
         self._thread = None
         self._ws = None
         self._reconnect_delay = 2
+        self._price_event = threading.Event()  # 每次收到新价格时 set
 
     def start(self):
         if not _HAS_WEBSOCKET:
@@ -79,6 +80,13 @@ class ChainlinkPriceStream:
         if price and (time.time() - last) < STALE_THRESHOLD:
             return price
         return None
+
+    def wait_for_update(self, timeout=1.0):
+        """阻塞等待 Chainlink 推送新价格，或到 timeout 秒后返回。
+        返回 True 表示收到新价格，False 表示超时（兜底轮询）。"""
+        updated = self._price_event.wait(timeout=timeout)
+        self._price_event.clear()
+        return updated
 
     # ── WebSocket 内部 ──
 
@@ -149,6 +157,7 @@ class ChainlinkPriceStream:
             try:
                 self.prices[coin] = float(value)
                 self.last_update[coin] = time.time()
+                self._price_event.set()  # 通知监控循环有新价格
             except (ValueError, TypeError):
                 pass
 

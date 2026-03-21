@@ -2514,7 +2514,8 @@ def monitor():
         except Exception as e:
             print(f"❌ 监控错误: {e}")
 
-        time.sleep(1)
+        # [P2] Chainlink 推送新价格时立刻唤醒，否则最多等 1s（兜底轮询）
+        _chainlink_stream.wait_for_update(timeout=1.0)
 
 
 def self_notify(pos, sell_price, coin, direction, size, label):
