@@ -2154,9 +2154,11 @@ def monitor():
 
                     elif diff_atr is not None and diff_atr < ATR_DANGER_THRESHOLD and (
                             not direction_correct
-                            or (diff_atr < ATR_DIRECTION_CORRECT_STOP and profit_rate <= -0.20)):
+                            or (diff_atr < ATR_DIRECTION_CORRECT_STOP and profit_rate <= -0.20
+                                and true_direction_correct is not True)):
                         # 🔴 危险区: ATR < 1.0 且方向错误 → 立即止损
                         # 改进: ATR < 0.5 且 token跌>20% → 即使方向正确也止损（50:50赌局不值得）
+                        # [P0] true_direction_correct 门控：BTC真在正确侧时不触发（赢单不是50:50）
                         dir_label = "方向❌" if not direction_correct else f"方向✅但ATR={diff_atr:.2f}<{ATR_DIRECTION_CORRECT_STOP}"
                         print(f"  🔴 ATR止损: 跌{profit_rate*100:+.1f}% | {atr_str}<{ATR_DANGER_THRESHOLD} | {dir_label} | 剩余{remaining:.0f}s")
                         attempted_stop_loss = True
