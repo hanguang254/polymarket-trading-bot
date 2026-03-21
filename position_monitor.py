@@ -2515,7 +2515,11 @@ def monitor():
             print(f"❌ 监控错误: {e}")
 
         # [P2] Chainlink 推送新价格时立刻唤醒，否则最多等 1s（兜底轮询）
-        _chainlink_stream.wait_for_update(timeout=1.0)
+        _p2_woken = _chainlink_stream.wait_for_update(timeout=1.0)
+        if _p2_woken:
+            print("  [P2] Chainlink推送唤醒")
+        else:
+            print("  [P2] 1s超时兜底")
 
 
 def self_notify(pos, sell_price, coin, direction, size, label):
