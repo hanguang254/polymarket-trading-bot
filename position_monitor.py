@@ -19,6 +19,9 @@ from ai_trader.pyth_api import pyth_stream as _pyth_stream, get_pyth_price
 from ai_trader.polymarket_ws import poly_ws as _poly_ws
 from ai_trader.polymarket_rtds import chainlink_stream as _chainlink_stream
 from ai_trader.coins import coin_from_slug as _coin_from_slug, get_binance_symbol as _get_binance_symbol
+
+# 价格数据源配置: 1=Chainlink优先(官方结算价), 2=Pyth优先(链上预言机)
+PRICE_SOURCE = int(os.environ.get("PRICE_SOURCE", "1"))
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ═══ 日志：print 同时写入 logs/monitor.log ═══
@@ -731,19 +734,31 @@ def get_market_outcome(slug, direction):
     return None
 
 def get_current_crypto_price(coin):
-    """获取BTC/ETH当前实时价格 - 优先Chainlink结算价，fallback Pyth/Binance"""
-    # 优先从 RTDS Chainlink 读取（Polymarket 直接结算价，零延迟）
-    cl_price = _chainlink_stream.get_price(coin)
-    if cl_price is not None:
-        return cl_price
-    # Pyth 链上价格 fallback
-    pyth_price = _pyth_stream.get_price(coin)
-    if pyth_price is not None:
-        return pyth_price
-    # Pyth REST fallback
-    pyth_rest = get_pyth_price(coin)
-    if pyth_rest is not None:
-        return pyth_rest
+    """获取BTC/ETH当前实时价格 - PRICE_SOURCE=1 Chainlink优先, =2 Pyth优先"""
+    if PRICE_SOURCE == 2:
+        # Pyth优先模式
+        pyth_price = _pyth_stream.get_price(coin)
+        if pyth_price is not None:
+            return pyth_price
+        pyth_rest = get_pyth_price(coin)
+        if pyth_rest is not None:
+            return pyth_rest
+        # fallback Chainlink
+        cl_price = _chainlink_stream.get_price(coin)
+        if cl_price is not None:
+            return cl_price
+    else:
+        # Chainlink优先模式（默认，官方结算价）
+        cl_price = _chainlink_stream.get_price(coin)
+        if cl_price is not None:
+            return cl_price
+        # fallback Pyth
+        pyth_price = _pyth_stream.get_price(coin)
+        if pyth_price is not None:
+            return pyth_price
+        pyth_rest = get_pyth_price(coin)
+        if pyth_rest is not None:
+            return pyth_rest
     # 最终 fallback: Binance
     ws_price = _price_stream.get_price(coin)
     if ws_price is not None:
@@ -1561,7 +1576,8 @@ def monitor():
     # 启动 Polymarket WebSocket 实时 orderbook 流
     _poly_ws.start()
     _ws_subscribed = set()  # 已订阅的 token_ids
-    print("🔍 持仓监控 v9.8 启动（ATR三层决策 + Chainlink止损优化 + Proximity衰减streak）...")
+    _src_label = "Chainlink优先" if PRICE_SOURCE == 1 else "Pyth优先"
+    print(f"🔍 持仓监控 v9.8 启动（ATR三层决策 + {_src_label}止损优化 + Proximity衰减streak）...")
     print("   Exit Protocol: P0双曲止盈 | ATR衰减止损 | ATR加速下降 | -25%硬止损 | 方向翻转 | ATR≥2抄底 | ATR<1止损")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
     print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%(时间衰减) | streak衰减+8轮滑动窗口")
