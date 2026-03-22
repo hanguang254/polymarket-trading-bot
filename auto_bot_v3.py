@@ -466,8 +466,11 @@ class MarketTracker:
                 if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
                     try:
                         from ai_trader.binance_api import get_current_price
-                        symbol = f"{market['coin']}USDT"
-                        price = get_current_price(symbol)
+                        from ai_trader.polymarket_rtds import chainlink_stream
+                        coin = market['coin']
+                        cl_price = chainlink_stream.get_price(coin)
+                        price = cl_price or get_current_price(f"{coin}USDT")
+                        price_src = "CL" if cl_price else "BN"
                         if price and ptb_now:
                             gap = round(price - ptb_now, 2)
                             samples.append({"price": price, "gap": gap, "ts": time.time()})
@@ -478,11 +481,11 @@ class MarketTracker:
                             if updater:
                                 updater.update(price, ptb_now)
                                 direction, p_hat, conf = updater.get_direction_and_confidence()
-                                logger.info(f"  📍 采样#{len(samples)}: price={price:.2f} gap={gap} | 贝叶斯: {direction} p̂={p_hat:.4f} conf={conf:.3f}")
+                                logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap} | 贝叶斯: {direction} p̂={p_hat:.4f} conf={conf:.3f}")
                             else:
-                                logger.info(f"  📍 采样#{len(samples)}: price={price:.2f} gap={gap}")
+                                logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                         elif price and not ptb_now:
-                            logger.info(f"  ⏳ 等待PTB... price={price:.2f}")
+                            logger.info(f"  ⏳ 等待PTB... price={price:.2f}({price_src})")
                     except Exception as e:
                         logger.warning(f"  ⚠️ 预热采样失败: {e}")
 

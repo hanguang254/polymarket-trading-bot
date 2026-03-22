@@ -83,7 +83,9 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
 
     # ── 数据采集（30根K线，更稳定的ATR估算） ──
     klines_1m = get_klines(symbol, "1m", 30)
-    current_price = get_current_price(symbol)
+    # 决策时价格：优先 Chainlink RTDS（与PTB/结算同源），fallback Binance
+    from ai_trader.polymarket_rtds import chainlink_stream
+    current_price = chainlink_stream.get_price(coin) or get_current_price(symbol)
 
     if not klines_1m or not current_price or not price_to_beat:
         return None, 0, {"error": "数据不足"}
