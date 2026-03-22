@@ -1026,9 +1026,13 @@ def main():
     from ai_trader.pyth_api import pyth_stream
     pyth_stream.start()
 
-    # 启动 Binance WebSocket 实时价格流（预热+分析共用）
+    # 启动 Binance WebSocket 实时价格流（K线/ATR + 价格fallback）
     from ai_trader.binance_api import price_stream
     price_stream.start()
+
+    # 启动 Chainlink RTDS 价格流（预热采样 + 决策时价格，与结算同源）
+    from ai_trader.polymarket_rtds import chainlink_stream
+    chainlink_stream.start()
 
     # 启动 Polymarket WebSocket 实时 orderbook 流
     from ai_trader.polymarket_ws import poly_ws
