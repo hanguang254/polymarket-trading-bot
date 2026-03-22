@@ -18,7 +18,7 @@ except ImportError:
 
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 PING_INTERVAL = 5  # 文档要求每5秒 PING
-STALE_THRESHOLD = 5  # 超过5秒无更新视为过期
+STALE_THRESHOLD = 15  # 超过15秒无更新视为过期（短暂抖动/波动期Chainlink推送可能延迟）
 
 # Chainlink symbol 映射（从 coins.py 动态加载）
 def _load_chainlink_symbols():
@@ -74,7 +74,7 @@ class ChainlinkPriceStream:
                 pass
 
     def get_price(self, coin="BTC"):
-        """获取 Chainlink 链上实时价格，数据超过5秒未更新则返回 None"""
+        """获取 Chainlink 链上实时价格，数据超过15秒未更新则返回 None"""
         price = self.prices.get(coin)
         last = self.last_update.get(coin, 0)
         if price and (time.time() - last) < STALE_THRESHOLD:
@@ -123,13 +123,13 @@ class ChainlinkPriceStream:
             ]
         })
         ws.send(msg)
-        # 启动 PING 心跳
-        threading.Thread(target=self._ping_loop, daemon=True).start()
+        # 启动 PING 心跳（绑定当前ws实例，重连后旧线程自动退出）
+        threading.Thread(target=self._ping_loop, args=(ws,), daemon=True).start()
 
-    def _ping_loop(self):
-        while self._running and self._ws:
+    def _ping_loop(self, ws):
+        while self._running and self._ws is ws:
             try:
-                self._ws.send("PING")
+                ws.send("PING")
             except Exception:
                 break
             time.sleep(PING_INTERVAL)
