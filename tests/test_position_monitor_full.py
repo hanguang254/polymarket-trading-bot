@@ -751,6 +751,49 @@ class TestMarketSellImmediate(unittest.TestCase):
         success, actual = pm.market_sell_immediate("token1", 10, price=0.30, skip_cancel=True)
         self.assertTrue(success)
 
+    @patch.object(pm, "cancel_all_orders")
+    @patch.object(pm, "_check_and_adjust_size", return_value=10.0)
+    @patch.object(pm, "_get_fresh_exit_quote")
+    @patch.object(pm, "clob_client")
+    def test_refreshes_quote_after_request_exception(self, mock_clob, mock_quote, _, __):
+        mock_quote.side_effect = [
+            {"limit_price": 0.30, "best_bid": 0.30, "bid_depth": 20, "source": "ws_book", "snapshot_age_ms": 25},
+            {"limit_price": 0.27, "best_bid": 0.27, "bid_depth": 20, "source": "sdk_book", "snapshot_age_ms": None},
+        ]
+        mock_clob.place_fok_order.side_effect = [
+            {"matched": False, "status": "ERROR", "taking": 0, "making": 0, "raw": "", "error": "Request exception!", "elapsed_ms": 300},
+            {"matched": True, "status": "MATCHED", "taking": 2.7, "making": 0, "raw": "ok", "elapsed_ms": 90},
+        ]
+
+        success, actual = pm.market_sell_immediate("token1", 10, skip_cancel=True, max_retries=2)
+
+        self.assertTrue(success)
+        self.assertAlmostEqual(actual, 0.27, places=4)
+        self.assertEqual(mock_clob.place_fok_order.call_args_list[0].args[2], 0.30)
+        self.assertEqual(mock_clob.place_fok_order.call_args_list[1].args[2], 0.27)
+
+    @patch.object(pm, "cancel_all_orders")
+    @patch.object(pm, "_estimate_ghost_price")
+    @patch.object(pm, "_check_and_adjust_size", return_value=10.0)
+    @patch.object(pm, "_get_fresh_exit_quote", return_value={"limit_price": 0.30, "best_bid": 0.30, "bid_depth": 7, "source": "ws_book", "snapshot_age_ms": 15})
+    @patch.object(pm, "clob_client")
+    def test_explicit_fok_kill_skips_ghost_estimate(self, mock_clob, _, __, mock_ghost, ___):
+        mock_clob.place_fok_order.return_value = {
+            "matched": False,
+            "status": "ERROR",
+            "taking": 0,
+            "making": 0,
+            "raw": "",
+            "error": "order couldn't be fully filled. FOK orders are fully filled or killed.",
+            "elapsed_ms": 120,
+        }
+
+        success, actual = pm.market_sell_immediate("token1", 10, skip_cancel=True, max_retries=1)
+
+        self.assertFalse(success)
+        self.assertIsNone(actual)
+        mock_ghost.assert_not_called()
+
 
 class TestAnalyzeLiquidity(unittest.TestCase):
     """analyze_liquidity: 订单簿流动性分析"""
@@ -868,12 +911,45 @@ class TestExecuteDipBuy(unittest.TestCase):
         success, size, price = pm.execute_dip_buy("token1", 10, "BTC", "slug", {})
         self.assertTrue(success)
         self.assertEqual(size, max(1, int(10 * pm.DIP_BUY_SIZE_RATIO)))
+        mock_clob.update_token_allowance.assert_called_once_with("token1")
 
     @patch("trading_state.check_daily_loss_limit", return_value=(True, -10, 50))
     @patch.object(pm, "get_best_ask", return_value=0.96)
     def test_ask_too_high(self, _, __):
         success, size, price = pm.execute_dip_buy("token1", 10, "BTC", "slug", {})
         self.assertFalse(success)
+
+
+class TestMonitorExpiryCleanup(unittest.TestCase):
+    """过期持仓应先清理，不应卡在无 orderbook 的 current_price 拉取。"""
+
+    @patch.object(pm, "close_position")
+    @patch.object(pm, "get_market_outcome", return_value=1.0)
+    @patch.object(pm, "get_market_price", return_value=None)
+    @patch.object(pm, "get_open_positions")
+    @patch.object(pm, "reconcile_pending_orders")
+    def test_expired_position_closes_without_market_price(self, _, mock_positions, mock_price, __, mock_close):
+        stale_pos = {
+            "token_id": "token1",
+            "slug": "btc-updown-5m-1700000000",
+            "direction": "UP",
+            "entry_price": 0.5,
+            "size": 4,
+            "entry_time": "2023-11-14T22:14:20+00:00",
+            "closed": False,
+        }
+        mock_positions.return_value = [stale_pos]
+
+        with patch.object(pm._chainlink_stream, "start"), \
+             patch.object(pm._chainlink_stream, "wait_for_update", side_effect=KeyboardInterrupt), \
+             patch.object(pm._pyth_stream, "start"), \
+             patch.object(pm._price_stream, "start"), \
+             patch.object(pm._poly_ws, "start"):
+            with self.assertRaises(KeyboardInterrupt):
+                pm.monitor()
+
+        mock_close.assert_called_once_with(stale_pos, 1.0)
+        mock_price.assert_not_called()
 
 
 class TestSelfNotify(unittest.TestCase):

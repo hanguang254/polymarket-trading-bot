@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.3
+# Polymarket Trading Bot v10.4
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -67,6 +67,9 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
 - **Volatility-Triggered Re-Analysis**: Markets skipped due to low confidence are tracked in `skipped_markets`. When crypto price moves ≥1.5 ATR from the skip price (`REANALYZE_ATR_MULT`), the market re-enters the analysis pipeline with updated Bayesian state. Cooldown (`REANALYZE_COOLDOWN`, default 15s) and max retrigger cap (`MAX_REANALYZE`, default 1) prevent loops. Skipped markets are cleaned up on position entry or market cleanup.
 - **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
+- **方向化参数配置**: `MAX_BUY_PRICE`/`MIN_EV`/`MIN_CONFIDENCE` 支持 `_UP`/`_DOWN` 后缀按方向覆盖（如 `MIN_EV_UP=0.04`, `MIN_EV_DOWN=0.08`），早期窗口同理。未配置时使用统一阈值。
+- **FOK 入场重构**: 执行前基于 `_get_execution_quote()` 刷新盘口快照，`_plan_fok_entry()` 按 `price_cap`（p_win 限价上限）规划限价和份数。重试时再次刷新盘口，按价格漂移/深度不足分流处理，替代旧的固定 +2tick 提价策略。`_is_explicit_fok_kill()` 区分明确 FOK 拒绝 vs 网络超时，前者跳过链上余额回查。
+- **CLOB 价格校验增强**: `_is_valid_clob_price()` 统一校验价格有效性（0.01 < price < 0.99），替代分散的 `if price is None` 检查。
 
 ### Exit (P0-P1 + P4)
 - **PTB Proximity Buffer**: When `abs(crypto_price - ptb_price) / ATR < dynamic_threshold`, crypto is in the "noise zone" near PTB — direction signal is unreliable. Freezes `direction_correct = True` (trusts original bet), suppressing all direction-based stop-losses. Threshold decays with time: 0.7 ATR (first 2min) → 0.3 ATR (mid) → 0.15 ATR (last 1min). Extreme safety valve: token drop ≥50% (`PTB_PROXIMITY_EXTREME_STOP`) forces exit regardless. Configurable via `PTB_PROXIMITY_ATR`.
@@ -94,6 +97,9 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
 - **3-Stage Graduated Exit**: For remaining edge cases — Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) EV≥0 hold / EV<0 floor prices.
+- **平仓锁定机制 (Close Intent)**: 止损决策触发时，`_arm_close_intent()` 将平仓意图持久化到持仓记录（reason + timestamp）。若当轮卖出失败（网络/深度问题），下一轮循环检测到 `close_intent_active` 后直接进入卖出流程，跳过所有条件判断。确保止损决策不因轮询间歇而丢失。所有止损路径（ATR衰减/ATR加速/硬止损/方向翻转/ATR矩阵/方向错误）均已接入。
+- **止损卖出重试**: `market_sell_immediate()` 新增 `max_retries` 参数（默认3），每次重试调用 `_get_fresh_exit_quote()` 刷新盘口定价，替代旧的单次固定降价策略。
+- **抄底后 Allowance 刷新**: Dip-buy（50% 加仓）成交后立即调用 `update_token_allowance()`，避免后续卖出时因 allowance 不足报错。
 - **ATR衰减止损连续确认**: ATR 衰减止损（ATR < 0.5 且衰减 >70%）进入待确认状态后，需 `ATR_DECAY_CONFIRMATIONS`（默认 3）轮连续确认 + `true_direction_correct=False` 才触发平仓，防止单点插针误杀赢单。近邻冻结区内同样受此保护。
 - **方向降级开关**: `ENABLE_DIRECTION_DOWNGRADE=0`（默认关闭）— 不再把底层方向实际正确的单子强行降级为方向错误。仅当显式开启时，ATR < `ATR_DOWNGRADE_THRESHOLD` 才降级 direction_correct。
 - **收盘价冻结**: 收盘前 5s 冻结底层 crypto 价格到 `close_crypto_price`。当 API 无 outcome 需回退判断时，优先使用冻结价（而非实时价，实时价可能已漂移到下一个市场）。
@@ -101,6 +107,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Base Rate 方向校准**: outcome 记录区分 `directional_won`（方向对错，仅市场到期结算时可判）和 `won`（PnL盈亏）。Base rate 校准优先用 `directional_won`，跳过 `calibration_eligible=False` 的早退记录，避免早退盈利单污染方向胜率统计。
 - **API-Based Settlement**: Expiry cleanup uses Polymarket API real outcome (not Binance price guess) to determine $1.00/$0.00.
 - **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
+- **重启状态恢复**: `_restore_recent_market_state()` 启动时从 `positions.jsonl` 加载近期（2小时内）持仓和已结束的市场记录，恢复 `open_positions`/`recent_markets`/`restored_slugs`，防止重启后重复入场已有持仓的市场。
 
 ### Infrastructure
 - **链上价格统一入口 (`price_oracle.py`)**: `get_onchain_price(coin)` 统一 Chainlink / Pyth 双源 fallback，返回 `(price, source)` 用于日志追踪。默认 Chainlink 优先（与结算同源），可传 `prefer="pyth"` 切换。替代了各模块直接调用 `chainlink_stream` + `get_current_price` 的分散逻辑。
@@ -108,7 +115,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Chainlink RTDS Price Stream**: `ChainlinkStream` singleton in `polymarket_rtds.py` connects to Polymarket RTDS WebSocket (`wss://ws-live-data.polymarket.com`) for Chainlink on-chain settlement prices. This is the exact price Polymarket uses for settlement (UMA oracle references Chainlink feeds). Zero-latency WebSocket push (~1s update frequency), 5s staleness threshold. **Also used as primary price source for warmup sampling and decision-time `current_price` in `analyze_market()`** — ensures gap/ATR calculations are aligned with the same oracle as PTB and settlement. Binance WS serves as fallback when Chainlink is stale.
 - **Pyth Network On-Chain Price Stream**: `PythPriceStream` singleton in `pyth_api.py` receives BTC/ETH prices from Pyth Hermes v2 SSE stream (`hermes.pyth.network`). On-chain oracle prices independent of Polymarket. REST fallback when SSE is stale. No API key required, free tier is production-grade.
 - **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used for **K-line/ATR data** (Chainlink has no OHLCV). Serves as **fallback** for current price when Chainlink RTDS is stale. Serves as **final fallback** for position monitoring. Auto-reconnect with 2s backoff + 30s ping keepalive.
-- **Polymarket WebSocket Orderbook Stream**: `PolymarketOrderbookStream` singleton in `polymarket_ws.py` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` for real-time orderbook data. Handles `best_bid_ask`, `book`, and `price_change` events. FOK entry uses WS `best_ask` (0ms) instead of REST orderbook query (100-300ms), significantly reducing price staleness between read and order placement. Position monitor's `get_best_bid/get_best_ask/get_market_price` all use WS-first with REST fallback. Lazy connection: WS connects only on first `subscribe()` call (Polymarket requires immediate subscription after connect). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect with exponential backoff (2s→4s→8s→...→30s, resets on stable connection).
+- **Polymarket WebSocket Orderbook Stream**: `PolymarketOrderbookStream` singleton in `polymarket_ws.py` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` for real-time orderbook data. Handles `best_bid_ask`, `book`, and `price_change` events. FOK entry uses WS `best_ask` (0ms) instead of REST orderbook query (100-300ms), significantly reducing price staleness between read and order placement. Position monitor's `get_best_bid/get_best_ask/get_market_price` all use WS-first with REST fallback. Lazy connection: WS connects only on first `subscribe()` call (Polymarket requires immediate subscription after connect). Auto-subscribes token_ids during warmup, auto-unsubscribes on market cleanup. 9s PING heartbeat, auto-reconnect with exponential backoff (2s→4s→8s→...→30s, resets on stable connection). New `get_best_bid_ask_snapshot()`/`get_book_snapshot()` APIs return price data with `age_ms` for staleness-aware consumers.
+- **CLOB Keepalive 非阻塞**: `_keepalive` 线程使用 `_client_lock.acquire(blocking=False)` 获取锁，当下单/查簿正在执行时直接跳过本轮心跳，避免阻塞交易路径。
 - **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
 - **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior. Price sourced from Chainlink RTDS (same oracle as PTB/settlement) with Binance fallback. Sample log shows source tag `(CL)`/`(BN)` for traceability.
@@ -154,7 +162,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 
 All must be met (all configurable via `.env`):
 
-| Condition | Late Window | Early Window | Env Key |
+| Condition | Late Window | Early Window | Env Key (支持 `_UP`/`_DOWN` 后缀) |
 |-----------|-------------|--------------|---------|
 | EV | > `MIN_EV` (0.10) | > `EARLY_MIN_EV` (0.08) | `MIN_EV` / `EARLY_MIN_EV` |
 | Confidence | ≥ `MIN_CONFIDENCE` (0.70) | ≥ `EARLY_MIN_CONFIDENCE` (0.60) | `MIN_CONFIDENCE` / `EARLY_MIN_CONFIDENCE` |

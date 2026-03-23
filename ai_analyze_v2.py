@@ -23,6 +23,16 @@ from py_clob_client.order_builder.constants import BUY
 _bet_executor = ThreadPoolExecutor(max_workers=3)
 
 
+def _directional_env_float(base_key, direction, default):
+    """按方向读取环境变量，优先级: BASE_KEY_{DIR} -> BASE_KEY -> default."""
+    suffix = (direction or "").upper()
+    if suffix in ("UP", "DOWN"):
+        value = os.environ.get(f"{base_key}_{suffix}")
+        if value not in (None, ""):
+            return float(value)
+    return float(os.environ.get(base_key, str(default)))
+
+
 def _random_walk_p_win(gap, atr_val, remaining_seconds):
     """
     Random walk model: P(price stays on current side of PTB at expiry).
@@ -263,15 +273,15 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     # ── ATR 最低偏离门槛：过滤噪音信号 ──
     MIN_ATR_DEVIATION = float(os.environ.get("MIN_ATR_DEVIATION", "1.5"))
 
-    MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
-    MIN_EV = float(os.environ.get("MIN_EV", "0.05"))
-    MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.60"))
+    MAX_PRICE = _directional_env_float("MAX_BUY_PRICE", direction, 0.92)
+    MIN_EV = _directional_env_float("MIN_EV", direction, 0.05)
+    MIN_CONFIDENCE = _directional_env_float("MIN_CONFIDENCE", direction, 0.60)
 
     # 早期窗口放宽门槛：优势是CLOB价格好，不需要那么高的置信度/EV
     is_early = extra_info.get("early_window", False) if extra_info else False
     if is_early:
-        MIN_EV = float(os.environ.get("EARLY_MIN_EV", "0.03"))
-        MIN_CONFIDENCE = float(os.environ.get("EARLY_MIN_CONFIDENCE", "0.40"))
+        MIN_EV = _directional_env_float("EARLY_MIN_EV", direction, 0.03)
+        MIN_CONFIDENCE = _directional_env_float("EARLY_MIN_CONFIDENCE", direction, 0.40)
 
     # ── 5分钟趋势过滤（与市场周期同频） ──
     # 弱信号(1.5-2.0ATR) + 5m反向趋势 → 直接跳过
@@ -310,6 +320,9 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     liq_label = f"LMSR:{liquidity_info['liquidity_score']:.2f}" if liquidity_info else "fallback"
     details["liquidity"] = liq_label
     details["discount_threshold"] = discount_threshold
+    details["max_buy_price_threshold"] = round(MAX_PRICE, 4)
+    details["min_ev_threshold"] = round(MIN_EV, 4)
+    details["min_confidence_threshold"] = round(MIN_CONFIDENCE, 4)
     early_label = " [早期窗口]" if is_early else ""
     trend_label = f" 5m:{trend_5m_align}" if trend_5m_align != "neutral" else ""
     filter_label = f" [{details.get('trend_15m_filter', '')}]" if details.get("trend_15m_filter") else ""
@@ -439,6 +452,218 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
     return max(0, size)
 
 
+def _is_valid_clob_price(price):
+    return price is not None and 0.01 < float(price) < 0.99
+
+
+def _extract_orderbook_levels(book):
+    if not book:
+        return [], []
+    from ai_trader.polymarket_api import normalize_orderbook
+    raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
+    raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
+    return normalize_orderbook(raw_bids, raw_asks)
+
+
+def _build_quote_from_levels(bids, asks, source, age_ms=None):
+    quote = {
+        "best_bid": None,
+        "best_ask": None,
+        "bids": bids or [],
+        "asks": asks or [],
+        "bid_depth": None,
+        "source": source,
+        "age_ms": age_ms,
+    }
+    if bids:
+        quote["best_bid"] = float(bids[0]["price"])
+        quote["bid_depth"] = sum(float(b["size"]) for b in bids)
+    if asks:
+        quote["best_ask"] = float(asks[0]["price"])
+    if quote["best_bid"] is not None and quote["best_ask"] is not None:
+        if quote["best_bid"] >= quote["best_ask"]:
+            quote["best_bid"] = None
+            quote["best_ask"] = None
+            quote["asks"] = []
+    return quote
+
+
+def _get_execution_quote(token_id, fallback_book=None, force_fresh=False):
+    ws_max_age_ms = float(os.environ.get("ENTRY_WS_MAX_AGE_MS", "400"))
+    ws_quote = None
+    try:
+        from ai_trader.polymarket_ws import poly_ws
+        ws_book = poly_ws.get_book_snapshot(token_id)
+        if ws_book and ws_book.get("age_ms", ws_max_age_ms + 1) <= ws_max_age_ms:
+            bids = ws_book.get("bids", [])
+            asks = ws_book.get("asks", [])
+            ws_quote = _build_quote_from_levels(bids, asks, "ws_book", ws_book.get("age_ms"))
+            if _is_valid_clob_price(ws_quote.get("best_ask")) and ws_quote.get("asks"):
+                return ws_quote
+
+        ws_bba = poly_ws.get_best_bid_ask_snapshot(token_id)
+        if ws_bba and ws_bba.get("age_ms", ws_max_age_ms + 1) <= ws_max_age_ms:
+            best_bid = ws_bba.get("best_bid")
+            best_ask = ws_bba.get("best_ask")
+            if _is_valid_clob_price(best_ask) and (best_bid is None or best_bid < best_ask):
+                ws_quote = {
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "bids": [],
+                    "asks": [],
+                    "bid_depth": None,
+                    "source": "ws_best_ask",
+                    "age_ms": ws_bba.get("age_ms"),
+                }
+    except Exception:
+        ws_quote = None
+
+    rest_book = None
+    try:
+        rest_book = clob_client.get_orderbook(token_id, max_age=0 if force_fresh else 1)
+    except Exception:
+        rest_book = None
+
+    if rest_book:
+        bids, asks = _extract_orderbook_levels(rest_book)
+        quote = _build_quote_from_levels(bids, asks, "rest_book", 0.0)
+        if _is_valid_clob_price(quote.get("best_ask")):
+            return quote
+
+    if fallback_book:
+        bids, asks = _extract_orderbook_levels(fallback_book)
+        quote = _build_quote_from_levels(bids, asks, "prefetched_book", None)
+        if _is_valid_clob_price(quote.get("best_ask")):
+            return quote
+
+    return ws_quote or {
+        "best_bid": None,
+        "best_ask": None,
+        "bids": [],
+        "asks": [],
+        "bid_depth": None,
+        "source": "none",
+        "age_ms": None,
+    }
+
+
+def _derive_entry_price_cap(max_price, entry_details=None):
+    caps = [round(max_price, 2)]
+    p_win_cap = entry_details.get("p_win_final") if entry_details else None
+    if p_win_cap and p_win_cap > 0.10:
+        caps.append(round(p_win_cap, 2))
+    return max(0.01, min(caps))
+
+
+def _compute_chase_price_cap(price, price_cap, ev):
+    price = round(price, 2)
+    price_cap = round(price_cap, 2)
+    if price >= price_cap:
+        return price_cap
+
+    available_ticks = max(0, int(round((price_cap - price) * 100)))
+    if available_ticks == 0:
+        return price_cap
+
+    chase_ticks = 2
+    if ev >= 0.03:
+        chase_ticks += 1
+    if ev >= 0.06:
+        chase_ticks += 1
+    if ev >= 0.10:
+        chase_ticks += 1
+    if (price_cap - price) >= 0.05:
+        chase_ticks = max(chase_ticks, 5)
+
+    chase_ticks = min(chase_ticks, available_ticks)
+    return round(min(price + chase_ticks * 0.01, price_cap), 2)
+
+
+def _measure_ask_depth(asks, target_size=None, max_price=None):
+    top3_size = sum(float(level.get("size", 0)) for level in (asks or [])[:3])
+    cumulative = 0.0
+    cover_price = None
+    levels = 0
+
+    for level in asks or []:
+        ask_price = float(level["price"])
+        ask_size = float(level["size"])
+        if max_price is not None and ask_price > max_price + 1e-9:
+            break
+        cumulative += ask_size
+        cover_price = ask_price
+        levels += 1
+        if target_size is not None and cumulative >= target_size:
+            break
+
+    return {
+        "top3_size": round(top3_size, 4),
+        "cover_size": round(cumulative, 4),
+        "cover_price": cover_price,
+        "levels": levels,
+        "covered": bool(target_size is not None and cumulative >= target_size),
+    }
+
+
+def _plan_fok_entry(asks, desired_size, best_ask, price_cap, ev, min_size):
+    if desired_size <= 0:
+        return None
+
+    best_ask = round(best_ask, 2)
+    price_cap = round(price_cap, 2)
+    if best_ask > price_cap:
+        return None
+
+    chase_cap = _compute_chase_price_cap(best_ask, price_cap, ev)
+    coverage = _measure_ask_depth(asks, desired_size, max_price=chase_cap)
+    cover_price = coverage.get("cover_price") or best_ask
+    limit_price = min(round(cover_price + 0.01, 2), price_cap)
+
+    if coverage["covered"]:
+        return {
+            "size": int(desired_size),
+            "limit_price": limit_price,
+            "coverage": coverage,
+            "mode": "full",
+            "chase_cap": chase_cap,
+        }
+
+    available_size = int(coverage["cover_size"])
+    if available_size >= min_size:
+        return {
+            "size": min(available_size, int(desired_size)),
+            "limit_price": limit_price,
+            "coverage": coverage,
+            "mode": "reduced",
+            "chase_cap": chase_cap,
+        }
+
+    return {
+        "size": 0,
+        "limit_price": limit_price,
+        "coverage": coverage,
+        "mode": "skip",
+        "chase_cap": chase_cap,
+    }
+
+
+def _is_explicit_fok_kill(info):
+    err = f"{info.get('error', '')} {info.get('raw', '')}".lower()
+    return "fully filled" in err or "killed" in err
+
+
+def _detect_ghost_fill(token_id):
+    try:
+        from position_monitor import get_token_balance
+        ghost_balance = get_token_balance(token_id)
+        if ghost_balance is not None and ghost_balance >= 1.0:
+            print(f"  ⚡ 幽灵成交检测: 链上余额={ghost_balance:.2f}份，订单实际已成交")
+            return round(ghost_balance, 4)
+    except Exception as e_ghost:
+        print(f"  ⚠️ 幽灵成交检测失败: {e_ghost}")
+    return None
+
+
 def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                  p_hat=None, entry_details=None, kelly_reduction=1.0, pre_balance=None):
     """执行下注（通过 Polymarket CLI）
@@ -474,65 +699,25 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print(f"  ⚠️ 余额不足: ${balance:.2f} < ${MIN_BALANCE:.2f}，跳过下注")
         return False, 0, 0, "SKIP_NO_BALANCE"
 
-    # 从已获取的orderbook提取best_ask和bid_depth（0次额外HTTP）
-    # P0优化: 优先用 Polymarket WebSocket 实时 best_ask（0ms延迟）
     SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))
-    price = None
-    price_source = "unknown"
-    bid_depth = None
+    MAX_PRICE = _directional_env_float("MAX_BUY_PRICE", direction, 0.92)
+    MIN_BET = int(os.environ.get("MIN_BET_SIZE", "5"))
+    p_win_final = entry_details.get("p_win_final") if entry_details else None
+    price_cap = _derive_entry_price_cap(MAX_PRICE, entry_details)
 
-    sorted_asks_full = []  # 保留完整 asks 用于 FOK 深度感知滑点
+    quote = _get_execution_quote(token_id, fallback_book=book, force_fresh=True)
+    price = quote.get("best_ask")
+    price_source = quote.get("source", "unknown")
+    bid_depth = quote.get("bid_depth")
+    sorted_asks_full = quote.get("asks", [])
+    snapshot_age_ms = quote.get("age_ms")
 
-    # 优先尝试 WebSocket 实时 best_ask
-    try:
-        from ai_trader.polymarket_ws import poly_ws
-        ws_bid, ws_ask = poly_ws.get_best_bid_ask(token_id)
-        if ws_ask is not None and 0.01 < ws_ask < 0.99:
-            # 倒挂校验
-            if ws_bid is not None and ws_bid >= ws_ask:
-                print(f"  ⚠️ WS订单簿倒挂: bid=${ws_bid:.2f} >= ask=${ws_ask:.2f}，走REST回退")
-            else:
-                price = ws_ask
-                price_source = "ws_best_ask"
-                print(f"  📡 WS best_ask: ${ws_ask:.2f} (实时推送)")
-        # WS orderbook 用于 FOK 深度感知
-        ws_bids, ws_asks = poly_ws.get_book(token_id)
-        if ws_asks:
-            sorted_asks_full = ws_asks  # 已排序
-        if ws_bids:
-            bid_depth = sum(float(b.get("size", 0)) for b in ws_bids)
-    except Exception:
-        pass
-
-    # REST fallback: WS 未命中时用 SDK orderbook
-    if book and (price is None or not sorted_asks_full):
-        # best_ask + 倒挂校验
-        if book.asks:
-            from ai_trader.polymarket_api import normalize_orderbook
-            raw_bids_chk = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
-            raw_asks_chk = [{"price": a.price, "size": a.size} for a in book.asks]
-            sorted_bids_chk, sorted_asks_rest = normalize_orderbook(raw_bids_chk, raw_asks_chk)
-            # 倒挂校验：best_bid >= best_ask 说明数据异常
-            if sorted_bids_chk and sorted_asks_rest:
-                _chk_bid = float(sorted_bids_chk[0]["price"])
-                _chk_ask = float(sorted_asks_rest[0]["price"])
-                if _chk_bid >= _chk_ask:
-                    print(f"  ⚠️ 订单簿倒挂: bid=${_chk_bid:.2f} >= ask=${_chk_ask:.2f}，跳过best_ask")
-                    sorted_asks_rest = []  # 清空，走 fallback
-            if not sorted_asks_full:
-                sorted_asks_full = sorted_asks_rest
-            if price is None and sorted_asks_rest:
-                best_ask = float(sorted_asks_rest[0]["price"])
-                if 0.01 < best_ask < 0.99:
-                    price = best_ask
-                    price_source = "best_ask"
-                    print(f"  📡 REST best_ask: ${best_ask:.2f} → 限价${price:.2f}")
-        # bid_depth（从同一个book提取，不再额外HTTP）
-        if bid_depth is None and book.bids:
-            bid_depth = sum(float(b.size) for b in book.bids)
+    if _is_valid_clob_price(price):
+        age_label = f" | age={snapshot_age_ms:.0f}ms" if snapshot_age_ms is not None else ""
+        print(f"  📡 执行前刷新: {price_source} ask=${float(price):.2f}{age_label}")
 
     # 2. last-trade-price + 滑点 回退
-    if price is None:
+    if not _is_valid_clob_price(price):
         last_price = clob_client.get_last_trade_price(token_id)
         if last_price and 0.01 < last_price < 0.99:
             price = min(round(last_price + SLIPPAGE, 2), 0.99)
@@ -540,7 +725,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             print(f"  📡 last-trade回退: ${last_price:.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
 
     # 3. midpoint + 滑点 回退
-    if price is None:
+    if not _is_valid_clob_price(price):
         mid = clob_client.get_midpoint(token_id)
         if mid and 0.01 < mid < 0.99:
             price = min(round(mid + SLIPPAGE, 2), 0.99)
@@ -548,7 +733,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             print(f"  📡 midpoint回退: ${mid:.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
 
     # 安全检查：全部失败
-    if price is None:
+    if not _is_valid_clob_price(price):
         print(f"  ⚠️ 无法获取真实价格（last-trade+midpoint均失败），跳过下注")
         return False, 0, 0, "SKIP_NO_PRICE"
 
@@ -556,17 +741,13 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     price = round(price, 2)
 
     # 安全检查：实际买入价不能超过上限（env可配置，默认0.92）
-    MAX_PRICE = float(os.environ.get("MAX_BUY_PRICE", "0.92"))
     if price >= MAX_PRICE:
         print(f"  ⚠️ 实际买入价${price:.2f}≥${MAX_PRICE}，上行空间不足，跳过下注")
         return False, 0, 0, "SKIP_PRICE_TOO_HIGH"
 
-    # 限价上限保护：买入价不应超过 p_win（理论公允价），防止出价过高
-    p_win_cap = entry_details.get("p_win_final") if entry_details else None
-    if p_win_cap and p_win_cap > 0.10 and price > p_win_cap:
-        capped_price = round(p_win_cap, 2)
-        print(f"  🛡️ 限价保护: ${price:.2f} > p_win=${p_win_cap:.3f}，降至${capped_price:.2f}")
-        price = capped_price
+    if price > price_cap:
+        print(f"  ⚠️ 执行前刷新后 ask=${price:.2f} > 限价上限${price_cap:.2f}，跳过下注")
+        return False, 0, 0, "SKIP_REQUOTE_PRICE_TOO_HIGH"
 
     # P2: 退出流动性检查（已从上面的book提取，无额外HTTP）
     if bid_depth is not None:
@@ -576,7 +757,6 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             return False, 0, 0, "SKIP_NO_EXIT_LIQUIDITY"
 
     # Kelly动态仓位（修正公式 + base_rate/相关性缩减 + P3流动性上限）
-    p_win_final = entry_details.get("p_win_final") if entry_details else None
     size = calculate_kelly_size(
         confidence, ev, balance, target_price=price, p_hat=p_hat,
         p_win=p_win_final, kelly_reduction=kelly_reduction,
@@ -587,39 +767,40 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         print("  ⚠️ 风险预算不足，计算仓位小于最小可执行值，跳过下注")
         return False, 0, 0, "SKIP_SIZE_TOO_SMALL"
 
-    # FOK 深度感知：遍历 asks 计算能覆盖 size 的限价
+    quoted_price = price
+    requested_size = size
+
+    # FOK 深度感知：基于执行前刷新后的最新 asks 规划限价和份数
     fok_price = price
-    original_size = size
-    if sorted_asks_full and price_source == "best_ask" and size > 0:
-        cumulative = 0.0
-        cover_price = price
-        MAX_SLIPPAGE = 0.05  # 最多允许 5 tick 滑点
-        for level in sorted_asks_full:
-            lv_price = float(level["price"])
-            lv_size = float(level["size"])
-            if lv_price > price + MAX_SLIPPAGE:
-                break
-            cumulative += lv_size
-            cover_price = lv_price
-            if cumulative >= size:
-                break
-        if cumulative >= size:
-            # 深度够：限价始终 +1 tick（防止 best_ask 被抢导致 FOK 失败）
-            fok_price = min(round(cover_price + 0.01, 2), MAX_PRICE - 0.01)
-            if fok_price > price:
-                print(f"  📡 FOK深度滑点: 覆盖{size}份需到${cover_price:.2f}，限价${price:.2f}→${fok_price:.2f}")
-            else:
-                # 一档就够，仍然 +1 tick 确保成交
-                fok_price = min(round(price + 0.01, 2), MAX_PRICE - 0.01)
-                print(f"  📡 FOK限价+1tick安全余量: ${price:.2f}→${fok_price:.2f}")
-        elif cumulative >= 5:
-            # 深度不够但≥5份：缩减 size + 限价到最远档
-            size = int(cumulative)
-            fok_price = min(round(cover_price + 0.01, 2), MAX_PRICE - 0.01)
-            print(f"  ⚠️ ask深度不足: 缩减为{size}份，限价${price:.2f}→${fok_price:.2f}")
-        else:
-            print(f"  ⚠️ ask深度极低({cumulative:.1f}<5)，跳过下注")
+    if sorted_asks_full and size > 0:
+        entry_depth = _measure_ask_depth(sorted_asks_full, size, max_price=price_cap)
+        print(
+            f"  📊 入场流动性: ask_top3={entry_depth['top3_size']:.1f}份 "
+            f"| cap内可买={entry_depth['cover_size']:.1f}份 | 限价上限=${price_cap:.2f}"
+        )
+        plan = _plan_fok_entry(sorted_asks_full, size, price, price_cap, ev, MIN_BET)
+        if not plan or plan["mode"] == "skip":
+            print(f"  ⚠️ cap内 ask 深度不足({entry_depth['cover_size']:.1f}<{MIN_BET})，跳过下注")
             return False, 0, 0, "SKIP_NO_ASK_DEPTH"
+        size = plan["size"]
+        fok_price = plan["limit_price"]
+        cover_price = plan["coverage"].get("cover_price") or price
+        if plan["mode"] == "reduced":
+            print(
+                f"  ⚠️ ask深度不足: cap内仅{plan['coverage']['cover_size']:.1f}份，"
+                f"缩减为{size}份 @ ${fok_price:.2f}"
+            )
+        elif fok_price > price:
+            print(
+                f"  📡 FOK执行计划: 覆盖{size}份需到${cover_price:.2f}，"
+                f"限价${price:.2f}→${fok_price:.2f} (追价上限=${plan['chase_cap']:.2f})"
+            )
+        else:
+            print(f"  📡 FOK限价+1tick安全余量: ${price:.2f}→${fok_price:.2f}")
+    else:
+        fok_price = min(round(price + 0.01, 2), price_cap)
+        if fok_price > price:
+            print(f"  📡 缺少完整 asks，按best_ask+1tick执行: ${price:.2f}→${fok_price:.2f}")
 
     print(f"  💸 SDK下单: FOK BUY {size}@{fok_price} token={token_id[:16]}...")
     info = clob_client.place_fok_order(token_id, BUY, fok_price, size)
@@ -629,56 +810,117 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     success = info.get("matched", False)
     pending = False
 
-    # FOK 失败重试：提价 +2tick 重试，再失败则缩量 80% 重试
+    executed_limit_price = fok_price
+
+    # FOK 失败重试：刷新盘口，按价格漂移 / 深度不足分流处理
     if not success:
         print(f"  ❌ FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
-        # 回查链上余额：网络超时不代表订单未执行（幽灵成交）
-        ghost_filled = False
-        try:
-            from position_monitor import get_token_balance
-            ghost_balance = get_token_balance(token_id)
-            if ghost_balance is not None and ghost_balance >= 1.0:
-                print(f"  ⚡ 幽灵成交检测: 链上余额={ghost_balance:.2f}份，订单实际已成交")
+        explicit_fok_kill = _is_explicit_fok_kill(info)
+        if explicit_fok_kill:
+            print("  ↻ 明确 FOK kill，跳过链上余额回查")
+        else:
+            ghost_balance = _detect_ghost_fill(token_id)
+            if ghost_balance:
                 success = True
-                size = round(ghost_balance, 4)
-                ghost_filled = True
-        except Exception as e_ghost:
-            print(f"  ⚠️ 幽灵成交检测失败: {e_ghost}")
+                size = ghost_balance
 
-        if not ghost_filled:
-            # 重试1：提价 +2 tick
-            retry_price = min(round(fok_price + 0.02, 2), MAX_PRICE - 0.01)
-            print(f"  🔄 重试1: 提价${fok_price:.2f}→${retry_price:.2f} | {size}份")
-            info2 = clob_client.place_fok_order(token_id, BUY, retry_price, size)
-            if info2.get("matched", False):
-                info = info2
-                success = True
-                fok_price = retry_price
-                print(f"  ✅ 重试1成交 | {info2.get('elapsed_ms', 0):.0f}ms")
-            else:
-                # 重试2：缩量 80%
-                retry_size = max(int(original_size * 0.8), 5)
-                if retry_size < size:
-                    print(f"  🔄 重试2: 缩量{size}→{retry_size}份 @ ${retry_price:.2f}")
-                    info3 = clob_client.place_fok_order(token_id, BUY, retry_price, retry_size)
-                    if info3.get("matched", False):
-                        info = info3
-                        success = True
-                        size = retry_size
-                        fok_price = retry_price
-                        print(f"  ✅ 重试2成交 | {info3.get('elapsed_ms', 0):.0f}ms")
-                    else:
-                        print(f"  ❌ 重试2仍未成交 | {info3.get('elapsed_ms', 0):.0f}ms")
+        retry_size = size
+        retry_limit = fok_price
+        if not success:
+            for retry_idx in range(1, 3):
+                retry_quote = _get_execution_quote(token_id, force_fresh=True)
+                retry_price = retry_quote.get("best_ask")
+                retry_asks = retry_quote.get("asks", [])
+                retry_age_ms = retry_quote.get("age_ms")
+                retry_source = retry_quote.get("source", price_source)
+
+                if not _is_valid_clob_price(retry_price):
+                    print(f"  ⚠️ 重试{retry_idx}: 无法刷新到可执行 ask，停止重试")
+                    break
+
+                retry_price = round(retry_price, 2)
+                if retry_price > price_cap:
+                    print(f"  ⚠️ 重试{retry_idx}: ask=${retry_price:.2f} 已高于上限${price_cap:.2f}，停止追价")
+                    break
+
+                if retry_asks:
+                    retry_plan = _plan_fok_entry(retry_asks, retry_size, retry_price, price_cap, ev, MIN_BET)
+                    if not retry_plan or retry_plan["mode"] == "skip":
+                        available = _measure_ask_depth(retry_asks, retry_size, max_price=price_cap)
+                        print(
+                            f"  ⚠️ 重试{retry_idx}: cap内仅剩{available['cover_size']:.1f}份，"
+                            f"不足最小{MIN_BET}份，停止重试"
+                        )
+                        break
+                    next_size = retry_plan["size"]
+                    next_limit = retry_plan["limit_price"]
+                    reason_bits = []
+                    if retry_price > retry_limit:
+                        reason_bits.append(f"价格漂移${retry_limit:.2f}→${retry_price:.2f}")
+                    if next_size < retry_size:
+                        reason_bits.append(f"深度不足{retry_size}→{next_size}份")
+                    if not reason_bits:
+                        reason_bits.append("刷新盘口重试")
+                    age_label = f" | age={retry_age_ms:.0f}ms" if retry_age_ms is not None else ""
+                    print(
+                        f"  🔄 重试{retry_idx}: {' | '.join(reason_bits)}{age_label} "
+                        f"@ ${next_limit:.2f}"
+                    )
+                else:
+                    next_size = retry_size
+                    next_limit = min(round(retry_price + 0.01, 2), price_cap)
+                    print(
+                        f"  🔄 重试{retry_idx}: 仅有 best_ask 快照 ask=${retry_price:.2f} "
+                        f"| {next_size}份 @ ${next_limit:.2f}"
+                    )
+
+                if next_limit == retry_limit and next_size == retry_size and retry_price <= retry_limit:
+                    print(f"  ⚠️ 重试{retry_idx}: 刷新盘口未改善，停止重试")
+                    break
+
+                info_retry = clob_client.place_fok_order(token_id, BUY, next_limit, next_size)
+                output = info_retry.get("raw", output)
+                price_source = retry_source
+                snapshot_age_ms = retry_age_ms
+                if info_retry.get("matched", False):
+                    info = info_retry
+                    success = True
+                    size = next_size
+                    executed_limit_price = next_limit
+                    print(f"  ✅ 重试{retry_idx}成交 | {info_retry.get('elapsed_ms', 0):.0f}ms")
+                    break
+
+                info = info_retry
+                retry_limit = next_limit
+                retry_size = next_size
+                executed_limit_price = next_limit
+                print(f"  ❌ 重试{retry_idx}未成交 | {info_retry.get('elapsed_ms', 0):.0f}ms")
+
+                if _is_explicit_fok_kill(info_retry):
+                    print("  ↻ 明确 FOK kill，继续刷新盘口")
+                    continue
+
+                ghost_balance = _detect_ghost_fill(token_id)
+                if ghost_balance:
+                    success = True
+                    size = ghost_balance
+                    break
 
     # 计算实际成交价和实际份数
     actual_size = size
-    if success and size > 0 and info.get("making", 0) > 0:
-        actual_price = round(info["making"] / size, 4)
-        if info.get("taking", 0) > 0:
-            actual_size = round(info["taking"], 4)
-        print(f"  📊 FOK成交: Making=${info['making']:.4f} | Taking={actual_size} | 实际价=${actual_price:.4f} (限价=${price}) | {info.get('elapsed_ms', 0):.0f}ms")
+    if success and info.get("making", 0) > 0:
+        actual_taking = info.get("taking", 0) or actual_size
+        if actual_taking and actual_taking > 0:
+            actual_size = round(actual_taking, 4)
+            actual_price = round(info["making"] / actual_taking, 4)
+        else:
+            actual_price = executed_limit_price
+        print(
+            f"  📊 FOK成交: Making=${info['making']:.4f} | Taking={actual_size} "
+            f"| 实际价=${actual_price:.4f} (限价=${executed_limit_price:.2f}) | {info.get('elapsed_ms', 0):.0f}ms"
+        )
     else:
-        actual_price = price
+        actual_price = executed_limit_price
 
     # 记录下注结果（使用实际成交价）
     log_entry = {
@@ -687,9 +929,12 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         "direction": direction,
         "token_id": token_id,
         "price": actual_price,
-        "limit_price": price,
+        "quoted_price": quoted_price,
+        "limit_price": executed_limit_price,
+        "price_source": price_source,
+        "snapshot_age_ms": snapshot_age_ms,
         "size": actual_size,
-        "requested_size": size,
+        "requested_size": requested_size,
         "amount": actual_price * actual_size,
         "success": success,
         "pending": False,

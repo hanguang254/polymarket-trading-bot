@@ -69,8 +69,12 @@ def _start_keepalive():
         while True:
             time.sleep(30)
             try:
-                with _client_lock:
-                    _client.get_server_time()
+                # 不阻塞交易路径：下单/查簿正在占用锁时，本轮 keepalive 直接跳过
+                if _client_lock.acquire(blocking=False):
+                    try:
+                        _client.get_server_time()
+                    finally:
+                        _client_lock.release()
             except Exception:
                 pass
     t = threading.Thread(target=_keepalive_loop, daemon=True)

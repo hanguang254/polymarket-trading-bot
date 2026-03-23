@@ -64,6 +64,69 @@ _runtime_max_reanalyze = None
 # 持仓数检查锁 + 预占计数：防止并行线程同时通过 MAX_OPEN_POSITIONS 检查
 _position_lock = threading.Lock()
 _pending_bets = 0  # 正在下注中（已通过检查但尚未写入positions.jsonl）
+POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
+
+
+def _slug_end_timestamp(slug, market_seconds=300):
+    try:
+        return int(str(slug).split("-")[-1]) + market_seconds
+    except Exception:
+        return None
+
+
+def _coerce_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return int(raw)
+        try:
+            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            return None
+    return None
+
+
+def _load_recent_position_records(now_ts=None, grace_seconds=None):
+    now_ts = int(now_ts or time.time())
+    grace_seconds = grace_seconds or int(os.environ.get("RESTORE_MARKET_GRACE_SECONDS", "180"))
+    records = []
+    if not os.path.exists(POSITIONS_FILE):
+        return records
+    try:
+        with open(POSITIONS_FILE) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                slug = record.get("slug")
+                if not slug:
+                    continue
+                end_ts = _slug_end_timestamp(slug)
+                if end_ts is None:
+                    continue
+                if end_ts + grace_seconds < now_ts:
+                    continue
+                if record.get("closed", False):
+                    exit_ts = (
+                        _coerce_timestamp(record.get("exit_time"))
+                        or _coerce_timestamp(record.get("updated_time"))
+                        or _coerce_timestamp(record.get("entry_time"))
+                    )
+                    if exit_ts is not None and exit_ts + grace_seconds < now_ts and end_ts < now_ts:
+                        continue
+                records.append(record)
+    except Exception as e:
+        logger.warning(f"♻️ 恢复positions失败: {e}")
+    return records
 
 
 def get_correlated_exposure(direction, coin):
@@ -73,10 +136,9 @@ def get_correlated_exposure(direction, coin):
     返回 0.5（Kelly 减半），否则返回 1.0。
     """
     try:
-        positions_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
-        if not os.path.exists(positions_file):
+        if not os.path.exists(POSITIONS_FILE):
             return 1.0
-        with open(positions_file) as f:
+        with open(POSITIONS_FILE) as f:
             for line in f:
                 if not line.strip():
                     continue
@@ -363,6 +425,46 @@ class MarketTracker:
         self.trade_attempts = {}  # slug -> 晚期窗口交易尝试次数（FOK失败后允许重试）
         self.last_analysis_time = {}  # slug -> 上次晚期分析时间戳（冷却用）
         self._ptb_pending = {}  # slug -> coin, 待并行获取PTB的市场
+        self.restored_slugs = set()
+        self._restore_recent_market_state()
+
+    def _restore_recent_market_state(self):
+        restored_open = 0
+        restored_recent = 0
+        seen_open = set()
+        seen_recent = set()
+
+        for record in _load_recent_position_records():
+            slug = record.get("slug")
+            if not slug:
+                continue
+            self.analyzed.add(slug)
+            self.restored_slugs.add(slug)
+
+            if record.get("closed", False):
+                if slug not in seen_recent:
+                    restored_recent += 1
+                    seen_recent.add(slug)
+                continue
+
+            if slug in seen_open:
+                continue
+            seen_open.add(slug)
+            restored_open += 1
+
+            token_id = record.get("token_id")
+            direction = record.get("direction", "UP")
+            entry_price = float(record.get("entry_price", 0) or 0)
+            size = float(record.get("token_balance") or record.get("size") or 0)
+            entry_time = record.get("entry_time") or datetime.now(timezone.utc).isoformat()
+
+            if token_id:
+                self.positions[slug] = Position(
+                    slug, token_id, direction, entry_price, size, entry_time
+                )
+
+        if restored_open or restored_recent:
+            logger.info(f"♻️ 启动恢复: open={restored_open} | recent_closed={restored_recent}")
     
     def update_markets(self):
         """更新市场列表"""
@@ -386,9 +488,13 @@ class MarketTracker:
                 _playwright_failures.pop(market["coin"], None)
                 end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
                 remaining = (end_dt - now).total_seconds()
-                logger.info(f"\n🆕 新市场: {market['coin']} | {slug}")
-                et_dt = end_dt - timedelta(hours=5)  # UTC-5 (EST)
-                logger.info(f"   结束: {et_dt.strftime('%H:%M:%S')} ET | 剩余: {remaining:.0f}s")
+                if slug in self.restored_slugs:
+                    logger.info(f"\n♻️ 恢复市场: {market['coin']} | {slug}")
+                    logger.info(f"   已恢复上下文，阻止重复入场 | 剩余: {remaining:.0f}s")
+                else:
+                    logger.info(f"\n🆕 新市场: {market['coin']} | {slug}")
+                    et_dt = end_dt - timedelta(hours=5)  # UTC-5 (EST)
+                    logger.info(f"   结束: {et_dt.strftime('%H:%M:%S')} ET | 剩余: {remaining:.0f}s")
             else:
                 self.tracked[slug]["up_odds"] = market["up_odds"]
                 self.tracked[slug]["down_odds"] = market["down_odds"]
@@ -833,10 +939,9 @@ class MarketTracker:
         global _pending_bets
         with _position_lock:
             try:
-                positions_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
                 open_count = 0
-                if os.path.exists(positions_file):
-                    with open(positions_file) as _f:
+                if os.path.exists(POSITIONS_FILE):
+                    with open(POSITIONS_FILE) as _f:
                         for _line in _f:
                             _p = json.loads(_line.strip())
                             if not _p.get("closed", False):
@@ -916,6 +1021,11 @@ class MarketTracker:
                     datetime.now(timezone.utc).isoformat()
                 )
                 self.positions[slug] = position
+                try:
+                    clob_client.update_token_allowance(token_id)
+                    logger.info("  🔓 入场后刷新卖出allowance")
+                except Exception:
+                    pass
 
                 # 真实盈亏在 position_monitor close_position 时记录
 
@@ -1026,6 +1136,7 @@ class MarketTracker:
                 self.trade_attempts.pop(slug, None)
                 self.analyzed.discard(slug)
                 self.early_analyzed.discard(slug)
+                self.restored_slugs.discard(slug)
 
 
 def main():

@@ -9,7 +9,7 @@ import time
 import unittest
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 # Mock 所有外部依赖
 for mod in [
@@ -87,6 +87,38 @@ class TestSkippedMarketsInit(unittest.TestCase):
         tracker = bot.MarketTracker()
         self.assertIsInstance(tracker.skipped_markets, dict)
         self.assertEqual(len(tracker.skipped_markets), 0)
+
+
+class TestStartupRestore(unittest.TestCase):
+    """启动时从 positions.jsonl 恢复最近 market，避免重启后重复入场。"""
+
+    @patch.object(bot, "POSITIONS_FILE", "/tmp/test_positions.jsonl")
+    @patch.object(bot.os.path, "exists", return_value=True)
+    @patch.object(bot.time, "time", return_value=1_700_000_120)
+    def test_restores_recent_open_slug(self, _, __):
+        data = (
+            '{"slug":"btc-updown-5m-1700000000","token_id":"tok1","direction":"UP","entry_price":0.45,"size":7,"entry_time":"2023-11-14T22:14:20+00:00","closed":false}\n'
+        )
+        with patch("builtins.open", mock_open(read_data=data)):
+            tracker = bot.MarketTracker()
+
+        self.assertIn("btc-updown-5m-1700000000", tracker.analyzed)
+        self.assertIn("btc-updown-5m-1700000000", tracker.restored_slugs)
+        self.assertIn("btc-updown-5m-1700000000", tracker.positions)
+
+    @patch.object(bot, "POSITIONS_FILE", "/tmp/test_positions.jsonl")
+    @patch.object(bot.os.path, "exists", return_value=True)
+    @patch.object(bot.time, "time", return_value=1_700_000_360)
+    def test_restores_recent_closed_slug_without_open_position(self, _, __):
+        data = (
+            '{"slug":"btc-updown-5m-1700000000","token_id":"tok1","direction":"UP","entry_price":0.45,"size":7,"entry_time":"2023-11-14T22:14:20+00:00","exit_time":"2023-11-14T22:19:40+00:00","closed":true}\n'
+        )
+        with patch("builtins.open", mock_open(read_data=data)):
+            tracker = bot.MarketTracker()
+
+        self.assertIn("btc-updown-5m-1700000000", tracker.analyzed)
+        self.assertIn("btc-updown-5m-1700000000", tracker.restored_slugs)
+        self.assertNotIn("btc-updown-5m-1700000000", tracker.positions)
 
 
 class TestSkipRecording(unittest.TestCase):

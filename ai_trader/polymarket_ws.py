@@ -139,6 +139,22 @@ class PolymarketOrderbookStream:
             return data.get("best_bid"), data.get("best_ask")
         return None, None
 
+    def get_best_bid_ask_snapshot(self, asset_id):
+        """获取 best_bid/best_ask + age_ms，过期返回 None"""
+        with self._lock:
+            data = self._bba.get(asset_id)
+        if not data:
+            return None
+        age_sec = time.time() - data["ts"]
+        if age_sec >= STALE_THRESHOLD:
+            return None
+        return {
+            "best_bid": data.get("best_bid"),
+            "best_ask": data.get("best_ask"),
+            "spread": data.get("spread"),
+            "age_ms": round(age_sec * 1000, 1),
+        }
+
     def get_book(self, asset_id):
         """获取完整 orderbook snapshot，返回 (bids, asks) 或 (None, None)
         bids: [{"price": "0.48", "size": "30"}, ...] 降序
@@ -149,6 +165,21 @@ class PolymarketOrderbookStream:
         if data and (time.time() - data["ts"]) < STALE_THRESHOLD:
             return data.get("bids", []), data.get("asks", [])
         return None, None
+
+    def get_book_snapshot(self, asset_id):
+        """获取完整订单簿 + age_ms，过期返回 None"""
+        with self._lock:
+            data = self._books.get(asset_id)
+        if not data:
+            return None
+        age_sec = time.time() - data["ts"]
+        if age_sec >= STALE_THRESHOLD:
+            return None
+        return {
+            "bids": data.get("bids", []),
+            "asks": data.get("asks", []),
+            "age_ms": round(age_sec * 1000, 1),
+        }
 
     # ── WebSocket 内部 ──
 
