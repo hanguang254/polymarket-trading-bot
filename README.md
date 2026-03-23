@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.2
+# Polymarket Trading Bot v10.3
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -94,7 +94,11 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
 - **3-Stage Graduated Exit**: For remaining edge cases — Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) EV≥0 hold / EV<0 floor prices.
+- **ATR衰减止损连续确认**: ATR 衰减止损（ATR < 0.5 且衰减 >70%）进入待确认状态后，需 `ATR_DECAY_CONFIRMATIONS`（默认 3）轮连续确认 + `true_direction_correct=False` 才触发平仓，防止单点插针误杀赢单。近邻冻结区内同样受此保护。
+- **方向降级开关**: `ENABLE_DIRECTION_DOWNGRADE=0`（默认关闭）— 不再把底层方向实际正确的单子强行降级为方向错误。仅当显式开启时，ATR < `ATR_DOWNGRADE_THRESHOLD` 才降级 direction_correct。
+- **收盘价冻结**: 收盘前 5s 冻结底层 crypto 价格到 `close_crypto_price`。当 API 无 outcome 需回退判断时，优先使用冻结价（而非实时价，实时价可能已漂移到下一个市场）。
 - **Realized PnL 聚合**: `_calculate_total_realized_pnl()` 聚合部分成交 + 最终平仓的真实盈亏。胜负判定改为基于 total realized PnL（替代简单 entry vs exit 价格比较），对加仓/减仓场景更准确。
+- **Base Rate 方向校准**: outcome 记录区分 `directional_won`（方向对错，仅市场到期结算时可判）和 `won`（PnL盈亏）。Base rate 校准优先用 `directional_won`，跳过 `calibration_eligible=False` 的早退记录，避免早退盈利单污染方向胜率统计。
 - **API-Based Settlement**: Expiry cleanup uses Polymarket API real outcome (not Binance price guess) to determine $1.00/$0.00.
 - **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
 
@@ -318,6 +322,9 @@ See `.env.example` for all configurable parameters:
 | `REANALYZE_COOLDOWN` | No | Min seconds before retrigger allowed (default: 15) |
 | `MAX_REANALYZE` | No | Max retrigger attempts per market (default: 1) |
 | `MAX_TRADE_RETRIES` | No | Max FOK retry attempts in late window (default: 3) |
+| `ATR_DECAY_CONFIRMATIONS` | No | ATR衰减止损连续确认轮数 (default: 3) |
+| `ENABLE_DIRECTION_DOWNGRADE` | No | 方向降级开关，0=关闭 1=开启 (default: 0) |
+| `ATR_DOWNGRADE_THRESHOLD` | No | 方向降级 ATR 阈值，仅降级开启时生效 (default: 0.15) |
 
 ### Running
 

@@ -20,8 +20,11 @@ sys.modules.setdefault("ai_trader.polymarket_api", MagicMock())
 sys.modules.setdefault("ai_trader.clob_client", MagicMock())
 sys.modules.setdefault("ai_trader.binance_api", MagicMock())
 sys.modules.setdefault("ai_trader.binance_api.price_stream", MagicMock())
+sys.modules.setdefault("ai_trader.pyth_api", MagicMock())
 sys.modules.setdefault("ai_trader.polymarket_ws", MagicMock())
 sys.modules.setdefault("ai_trader.polymarket_ws.poly_ws", MagicMock())
+sys.modules.setdefault("ai_trader.polymarket_rtds", MagicMock())
+sys.modules.setdefault("ai_trader.coins", MagicMock())
 sys.modules.setdefault("ai_trader.base_rate", MagicMock())
 sys.modules.setdefault("py_clob_client", MagicMock())
 sys.modules.setdefault("py_clob_client.order_builder", MagicMock())
@@ -61,6 +64,90 @@ class TestCalcProximityThreshold(unittest.TestCase):
         self.assertEqual(pm.calc_proximity_threshold(59), 0.15)
         self.assertEqual(pm.calc_proximity_threshold(30), 0.15)
         self.assertEqual(pm.calc_proximity_threshold(0), 0.15)
+
+
+class TestAtrDecayArming(unittest.TestCase):
+    """ATR衰减止损进入待确认状态的条件"""
+
+    def test_armed_when_atr_collapses_and_position_is_losing(self):
+        self.assertTrue(pm.should_arm_atr_decay_exit(0.08, 2.1, -0.49))
+
+    def test_not_armed_when_atr_not_low_enough(self):
+        self.assertFalse(pm.should_arm_atr_decay_exit(pm.ATR_DECAY_EXIT_THRESHOLD + 0.01, 2.1, -0.49))
+
+    def test_not_armed_when_loss_is_too_small(self):
+        self.assertFalse(pm.should_arm_atr_decay_exit(0.08, 2.1, -0.01))
+
+    def test_not_armed_when_entry_atr_missing(self):
+        self.assertFalse(pm.should_arm_atr_decay_exit(0.08, None, -0.49))
+
+
+class TestProximityGuardRelease(unittest.TestCase):
+    """proximity 保护在不同亏损级别下的释放条件"""
+
+    def test_extreme_loss_releases_immediately(self):
+        released, extreme_stop, threshold = pm.should_release_proximity_guard(-0.51, 130, 1, 0.25)
+        self.assertTrue(released)
+        self.assertEqual(extreme_stop, pm.PTB_PROXIMITY_EXTREME_STOP)
+        self.assertEqual(threshold, 0)
+
+    def test_hard_stop_drawdown_still_needs_confirmation(self):
+        released, _, threshold = pm.should_release_proximity_guard(-0.30, 130, 1, 0.25)
+        self.assertFalse(released)
+        self.assertEqual(threshold, 2)
+
+    def test_hard_stop_drawdown_releases_after_two_false_reads(self):
+        released, _, threshold = pm.should_release_proximity_guard(-0.30, 130, 2, 0.25)
+        self.assertTrue(released)
+        self.assertEqual(threshold, 2)
+
+    def test_regular_drawdown_requires_higher_streak(self):
+        released, _, threshold = pm.should_release_proximity_guard(-0.20, 130, 3, 0.50)
+        self.assertFalse(released)
+        self.assertEqual(threshold, 4)
+
+    def test_ratio_can_release_guard(self):
+        released, _, threshold = pm.should_release_proximity_guard(-0.20, 130, 1, 0.75)
+        self.assertTrue(released)
+        self.assertEqual(threshold, 4)
+
+
+class TestDirectionDowngrade(unittest.TestCase):
+    """方向降级默认关闭，只有显式启用才允许把底层正确方向改成错误。"""
+
+    def test_disabled_by_default(self):
+        self.assertFalse(pm.should_direction_downgrade(True, 120, 0.10, -0.30))
+
+    def test_enabled_and_meets_thresholds(self):
+        with patch.object(pm, "ENABLE_DIRECTION_DOWNGRADE", True):
+            self.assertTrue(pm.should_direction_downgrade(True, 120, 0.10, -0.30))
+
+    def test_enabled_but_atr_not_low_enough(self):
+        with patch.object(pm, "ENABLE_DIRECTION_DOWNGRADE", True):
+            self.assertFalse(pm.should_direction_downgrade(True, 120, 0.20, -0.30))
+
+    def test_enabled_but_remaining_too_low(self):
+        with patch.object(pm, "ENABLE_DIRECTION_DOWNGRADE", True):
+            self.assertFalse(pm.should_direction_downgrade(True, 45, 0.10, -0.30))
+
+
+class TestDirectionFlipConfirms(unittest.TestCase):
+    """方向翻转确认轮数在低ATR且时间充裕时更保守。"""
+
+    def test_large_atr_flips_fast(self):
+        self.assertEqual(pm.get_direction_flip_required_confirms(1.6, 150), 1)
+
+    def test_medium_atr_uses_two_confirms(self):
+        self.assertEqual(pm.get_direction_flip_required_confirms(1.1, 150), 2)
+
+    def test_small_atr_and_long_time_need_four_confirms(self):
+        self.assertEqual(pm.get_direction_flip_required_confirms(0.3, 150), 4)
+
+    def test_small_atr_midgame_need_three_confirms(self):
+        self.assertEqual(pm.get_direction_flip_required_confirms(0.3, 90), 3)
+
+    def test_final_minute_relaxes_to_two_confirms(self):
+        self.assertEqual(pm.get_direction_flip_required_confirms(0.3, 45), 2)
 
 
 class TestComputeP0ProfitThreshold(unittest.TestCase):
@@ -646,8 +733,9 @@ class TestMarketSellImmediate(unittest.TestCase):
 
     @patch.object(pm, "cancel_all_orders")
     @patch.object(pm, "_check_and_adjust_size", return_value=10.0)
+    @patch.object(pm, "_estimate_ghost_price", return_value=0.30)
     @patch.object(pm, "clob_client")
-    def test_ghost_fill_detection(self, mock_clob, mock_check, _):
+    def test_ghost_fill_detection(self, mock_clob, _, mock_check, __):
         # FOK says ERROR, but balance is now 0 → ghost fill
         mock_clob.place_fok_order.return_value = {
             "matched": False,

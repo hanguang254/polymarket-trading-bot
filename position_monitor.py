@@ -93,6 +93,9 @@ PTB_PROXIMITY_EXTREME_STOP = float(os.environ.get("PTB_PROXIMITY_EXTREME_STOP", 
 ATR_DECAY_EXIT_THRESHOLD = float(os.environ.get("ATR_DECAY_EXIT_THRESHOLD", "0.5"))  # ATR降到此值以下触发
 ATR_DECAY_RATIO = float(os.environ.get("ATR_DECAY_RATIO", "0.30"))  # ATR降到入场值的此比例以下触发
 ATR_DIRECTION_CORRECT_STOP = float(os.environ.get("ATR_DIRECTION_CORRECT_STOP", "0.5"))  # 方向正确但ATR<此值+token跌>20%也止损
+ATR_DECAY_CONFIRMATIONS = int(os.environ.get("ATR_DECAY_CONFIRMATIONS", "3"))  # 需连续确认，防止单点插针误杀
+ENABLE_DIRECTION_DOWNGRADE = os.environ.get("ENABLE_DIRECTION_DOWNGRADE", "0").lower() in ("1", "true", "yes", "on")
+ATR_DOWNGRADE_THRESHOLD = float(os.environ.get("ATR_DOWNGRADE_THRESHOLD", "0.15"))
 
 def calc_proximity_threshold(remaining):
     """proximity zone 宽度随时间衰减：越接近到期 buffer 越窄"""
@@ -102,6 +105,60 @@ def calc_proximity_threshold(remaining):
         return 0.3 + 0.4 * (remaining - 60) / 120  # 0.7→0.3 线性衰减
     else:
         return 0.15                        # 最后1分钟极窄
+
+
+def should_arm_atr_decay_exit(diff_atr, entry_atr, profit_rate):
+    """ATR衰减止损只在确实逼近PTB且token已显著亏损时进入待确认状态。"""
+    if diff_atr is None or entry_atr is None or entry_atr <= 0:
+        return False
+    if profit_rate is None or profit_rate >= -0.05:
+        return False
+    if diff_atr >= ATR_DECAY_EXIT_THRESHOLD:
+        return False
+    return (diff_atr / entry_atr) < ATR_DECAY_RATIO
+
+
+def should_release_proximity_guard(profit_rate, remaining, wrong_streak, wrong_ratio):
+    """决定 proximity 保护是否解除。深亏时加快解除，但不再单点立即失效。"""
+    if remaining > 120:
+        extreme_stop = PTB_PROXIMITY_EXTREME_STOP
+    elif remaining > 60:
+        extreme_stop = PTB_PROXIMITY_EXTREME_STOP - 0.05
+    else:
+        extreme_stop = PTB_PROXIMITY_EXTREME_STOP - 0.10
+
+    if profit_rate is not None and profit_rate <= -extreme_stop:
+        return True, extreme_stop, 0
+
+    streak_threshold = 2 if profit_rate is not None and profit_rate <= -PRICE_DROP_HARD_STOP else 4
+    released = wrong_streak >= streak_threshold or wrong_ratio >= 0.75
+    return released, extreme_stop, streak_threshold
+
+
+def should_direction_downgrade(direction_correct, remaining, diff_atr, profit_rate):
+    """仅在显式开启时，才允许用 token 风险去降级仍在正确侧的底层方向。"""
+    if not ENABLE_DIRECTION_DOWNGRADE:
+        return False
+    if direction_correct is not True:
+        return False
+    if remaining < 60:
+        return False
+    if diff_atr is None or diff_atr >= ATR_DOWNGRADE_THRESHOLD:
+        return False
+    return profit_rate is not None and profit_rate <= -PRICE_DROP_HARD_STOP
+
+
+def get_direction_flip_required_confirms(diff_atr, remaining):
+    """小ATR且离结算还早时，要求更多连续确认，避免在PTB附近被噪音扫掉。"""
+    if diff_atr is not None and diff_atr >= 1.5:
+        return 1
+    if diff_atr is not None and diff_atr >= 1.0:
+        return 2
+    if remaining > 120:
+        return 4
+    if remaining > 60:
+        return 3
+    return 2
 
 # 链上余额预缓存（止损时避免临时查链增加延迟）
 # {token_id: (balance, timestamp)}
@@ -592,18 +649,24 @@ def close_position(position, exit_price):
         from ai_trader.base_rate import record_outcome
         entry = position.get("entry_price", 0)
         total_pnl = _calculate_total_realized_pnl(position, exit_price)
-        won = total_pnl > 0
+        realized_won = total_pnl > 0
+        exit_price_val = _safe_float(exit_price)
+        calibration_eligible = exit_price_val is not None and (exit_price_val <= 0.01 or exit_price_val >= 0.99)
+        directional_won = (exit_price_val > 0.5) if calibration_eligible else None
         diff_in_atr = position.get("diff_in_atr", 0)
         record_outcome(
             slug=position.get("slug", "unknown"),
             direction=position.get("direction", "UP"),
             diff_in_atr=diff_in_atr,
-            won=won,
+            won=realized_won,
             extra={
                 "entry_price": entry,
                 "exit_price": exit_price,
                 "size": position.get("size", 0),
                 "realized_pnl": total_pnl,
+                "realized_won": realized_won,
+                "directional_won": directional_won,
+                "calibration_eligible": calibration_eligible,
             }
         )
     except Exception:
@@ -645,7 +708,8 @@ def update_position(position, new_size=None, partial_exit=None):
                                     pos["last_partial_exit"] = partial_exit
                                 # 同步调用方修改的字段（如抄底后的entry_price/original_size等）
                                 for sync_key in ("entry_price", "original_entry_price", "original_size",
-                                                 "dip_buy_price", "dip_buy_size"):
+                                                 "dip_buy_price", "dip_buy_size",
+                                                 "close_crypto_price", "close_crypto_time"):
                                     if sync_key in position:
                                         pos[sync_key] = position[sync_key]
                                 pos["updated_time"] = datetime.now(timezone.utc).isoformat()
@@ -766,6 +830,34 @@ def get_market_outcome(slug, direction):
     except Exception:
         pass
     return None
+
+
+def freeze_settlement_reference_price(position, crypto_price):
+    """在收盘前后冻结一份底层价格，供 API 无 outcome 时回退使用。"""
+    price = _safe_float(crypto_price)
+    if not isinstance(position, dict) or price is None or price <= 0:
+        return False
+
+    prev = _safe_float(position.get("close_crypto_price"))
+    if prev is not None and abs(prev - price) < 1e-9:
+        return False
+
+    position["close_crypto_price"] = round(price, 2)
+    position["close_crypto_time"] = datetime.now(timezone.utc).isoformat()
+    return update_position(position)
+
+
+def get_settlement_reference_price(position, coin):
+    """结算回退优先使用收盘前冻结价，避免误用收盘后漂移的实时价。"""
+    frozen = _safe_float(position.get("close_crypto_price")) if isinstance(position, dict) else None
+    if frozen is not None and frozen > 0:
+        return frozen, "冻结价"
+
+    live = get_current_crypto_price(coin)
+    if live is not None:
+        src = "CL" if _chainlink_stream.get_price(coin) is not None else "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
+        return live, src
+    return None, None
 
 def get_current_crypto_price(coin):
     """获取BTC/ETH当前实时价格 - PRICE_SOURCE=1 Chainlink优先, =2 Pyth优先"""
@@ -1642,6 +1734,7 @@ def monitor():
     direction_history = {}  # (slug, entry_time) -> deque(maxlen=8) 最近8轮方向记录
     atr_history = {}  # (slug, entry_time) -> deque(maxlen=5) 最近5轮ATR值（速度检测用）
     entry_atr = {}  # (slug, entry_time) -> 入场时的ATR值
+    atr_decay_confirm_streak = {}  # (slug, entry_time) -> ATR衰减止损连续确认次数
     
     while True:
         try:
@@ -1663,6 +1756,7 @@ def monitor():
             direction_history = {k: v for k, v in direction_history.items() if k in open_keys}
             atr_history = {k: v for k, v in atr_history.items() if k in open_keys}
             entry_atr = {k: v for k, v in entry_atr.items() if k in open_keys}
+            atr_decay_confirm_streak = {k: v for k, v in atr_decay_confirm_streak.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -1716,6 +1810,11 @@ def monitor():
                 end_time = datetime.fromtimestamp(end_timestamp, tz=timezone.utc)
                 remaining = (end_time - now).total_seconds()
                 
+                ptb_price = pos.get("ptb") or pos.get("price_to_beat")
+                crypto_price = get_current_crypto_price(coin)
+                if ptb_price and crypto_price and remaining <= 5:
+                    freeze_settlement_reference_price(pos, crypto_price)
+
                 # 市场已关闭（remaining <= 0）→ 只做结算/清理
                 if remaining <= 0:
                     if remaining < -30:
@@ -1723,12 +1822,11 @@ def monitor():
                         settle_price = get_market_outcome(slug, direction)
                         if settle_price is None:
                             # API无结果，回退链上价格判断
-                            ptb = pos.get("ptb") or pos.get("price_to_beat")
-                            crypto = get_current_crypto_price(coin)
+                            ptb = ptb_price
+                            crypto, src = get_settlement_reference_price(pos, coin)
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                src = "CL" if _chainlink_stream.get_price(coin) is not None else "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
                                 print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
@@ -1750,12 +1848,11 @@ def monitor():
                         # 优先用API查真实结算结果
                         settle_price = get_market_outcome(slug, direction)
                         if settle_price is None:
-                            ptb = pos.get("ptb") or pos.get("price_to_beat")
-                            crypto = get_current_crypto_price(coin)
+                            ptb = ptb_price
+                            crypto, src = get_settlement_reference_price(pos, coin)
                             if ptb and crypto:
                                 won = (direction == "UP" and crypto > ptb) or (direction == "DOWN" and crypto < ptb)
                                 settle_price = 1.00 if won else 0.00
-                                src = "CL" if _chainlink_stream.get_price(coin) is not None else "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
                                 print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
                                 settle_price = current_price if current_price else entry_price
@@ -1770,8 +1867,6 @@ def monitor():
                     continue
 
                 # PTB 在下注时已记录，直接从持仓数据读取
-                ptb_price = pos.get("ptb") or pos.get("price_to_beat")
-                crypto_price = get_current_crypto_price(coin)
                 is_losing = is_losing_direction(direction, crypto_price, ptb_price, remaining) if ptb_price and crypto_price else False
                 # 只有在 remaining <= 60 且方向正确时才算"必赢"，避免 is_losing_direction 在 >60s 时返回 False 导致误判
                 if ptb_price and crypto_price and remaining <= 60:
@@ -1948,13 +2043,93 @@ def monitor():
                     atr_history[attempt_key].append(diff_atr)
 
                 # --- 0A. ATR衰减止损: crypto快速逼近PTB，不等token崩盘 ---
-                # 条件: ATR < 0.5 且 ATR降到入场值的30%以下 且 token已亏损
-                if (diff_atr is not None and diff_atr < ATR_DECAY_EXIT_THRESHOLD
-                        and attempt_key in entry_atr and entry_atr[attempt_key] > 0
-                        and diff_atr / entry_atr[attempt_key] < ATR_DECAY_RATIO
-                        and profit_rate < -0.05):
-                    decay_pct = (1 - diff_atr / entry_atr[attempt_key]) * 100
-                    print(f"  🚨 ATR衰减止损: {diff_atr:.2f}ATR (入场{entry_atr[attempt_key]:.1f}ATR, 衰减{decay_pct:.0f}%) + 跌{profit_rate*100:+.1f}% | 剩余{remaining:.0f}s")
+                entry_atr_val = entry_atr.get(attempt_key)
+                atr_decay_armed = should_arm_atr_decay_exit(diff_atr, entry_atr_val, profit_rate)
+                decay_pct = (1 - diff_atr / entry_atr_val) * 100 if atr_decay_armed else None
+
+                # --- 0B. ATR加速下降止损: 3轮内ATR连续下降且已低于0.5 ---
+                atr_accel_armed = False
+                atr_accel_speed = None
+                if diff_atr is not None and attempt_key in atr_history:
+                    hist = atr_history[attempt_key]
+                    if len(hist) >= 3 and profit_rate < -0.10:
+                        recent = list(hist)[-3:]
+                        # 连续下降 且 当前ATR低
+                        if recent[0] > recent[1] > recent[2] and recent[2] < ATR_DECAY_EXIT_THRESHOLD:
+                            atr_accel_armed = True
+                            atr_accel_speed = recent[0] - recent[2]
+
+                # --- 方向降级：ATR趋零说明crypto逼近strike，方向随时可能翻转 ---
+                # direction_correct=True 但 ATR<0.3 且 token已大幅亏损 → 降级为False
+                # 让现有硬止损(-25%)和ATR危险区自然生效，避免方向"技术正确"时全程观望到归零
+                # [P0] 降级前保存BTC真实方向（不受任何修改影响），用于门控止损
+                true_direction_correct = direction_correct
+                if should_direction_downgrade(direction_correct, remaining, diff_atr, profit_rate):
+                    print(f"  ⚠️ 方向降级: 方向✅但ATR={diff_atr:.2f}<{ATR_DOWNGRADE_THRESHOLD}(逼近strike) + 跌{profit_rate*100:+.1f}% → 视为方向❌")
+                    direction_correct = False
+
+                # --- PTB Proximity Buffer: crypto在PTB附近时冻结方向信号 ---
+                # 保存 proximity override 前的原始方向，用于 streak 计数
+                raw_direction_correct = direction_correct
+                in_proximity = False
+                if diff_atr is not None and crypto_price and ptb_price:
+                    prox_threshold = calc_proximity_threshold(remaining)
+                    in_proximity = diff_atr < prox_threshold
+
+                    if in_proximity and direction_correct is False and true_direction_correct is False:
+                        cur_streak = direction_wrong_streak.get(attempt_key, 0)
+                        projected_streak = cur_streak + 1
+                        hist = list(direction_history.get(attempt_key, deque(maxlen=8)))
+                        hist.append(False)
+                        projected_hist = hist[-8:]
+                        wrong_ratio = sum(1 for d in projected_hist if d is False) / len(projected_hist) if len(projected_hist) >= 4 else 0
+                        released, extreme_stop, prox_streak_threshold = should_release_proximity_guard(
+                            profit_rate, remaining, projected_streak, wrong_ratio
+                        )
+
+                        if released and profit_rate <= -extreme_stop:
+                            print(f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<{prox_threshold:.2f} 但跌{profit_rate*100:+.1f}%>{-extreme_stop*100:.0f}% → 不冻结")
+                            in_proximity = False
+                        elif released:
+                            print(f"  🔶→🚨 Proximity保护解除: streak={projected_streak}≥{prox_streak_threshold} or ratio={wrong_ratio:.0%}≥75% | {diff_atr:.2f}ATR | 剩余{remaining:.0f}s")
+                            in_proximity = False
+                        else:
+                            print(f"  🔶 PTB临近区: {diff_atr:.2f}ATR<{prox_threshold:.2f} | 方向冻结✅ | streak={projected_streak} ratio={wrong_ratio:.0%} | 剩余{remaining:.0f}s")
+                            direction_correct = True  # 冻结方向，信任原始bet
+
+                # --- 更新方向错误计数（衰减式 + 滑动窗口）---
+                # 使用 raw_direction（proximity override 前的真实方向）来更新计数
+                if raw_direction_correct is not None:
+                    # 滑动窗口：记录最近8轮原始方向
+                    if attempt_key not in direction_history:
+                        direction_history[attempt_key] = deque(maxlen=8)
+                    direction_history[attempt_key].append(raw_direction_correct)
+
+                    # streak 衰减：❌+1, ✅-1（不清零）
+                    cur_streak = direction_wrong_streak.get(attempt_key, 0)
+                    if raw_direction_correct is False:
+                        direction_wrong_streak[attempt_key] = cur_streak + 1
+                    else:
+                        direction_wrong_streak[attempt_key] = max(0, cur_streak - 1)
+
+                if atr_decay_armed and true_direction_correct is False:
+                    atr_decay_confirm_streak[attempt_key] = atr_decay_confirm_streak.get(attempt_key, 0) + 1
+                else:
+                    atr_decay_confirm_streak.pop(attempt_key, None)
+                decay_confirm_count = atr_decay_confirm_streak.get(attempt_key, 0)
+
+                if atr_decay_armed and true_direction_correct is False and direction_correct is True:
+                    print(
+                        f"  🔶 ATR衰减冻结: {diff_atr:.2f}ATR/{entry_atr_val:.1f}ATR | "
+                        f"streak={decay_confirm_count}/{ATR_DECAY_CONFIRMATIONS} | 剩余{remaining:.0f}s"
+                    )
+                elif atr_decay_armed and true_direction_correct is False and decay_confirm_count < ATR_DECAY_CONFIRMATIONS:
+                    print(
+                        f"  ⏸️ ATR衰减待确认: {diff_atr:.2f}ATR/{entry_atr_val:.1f}ATR | "
+                        f"{decay_confirm_count}/{ATR_DECAY_CONFIRMATIONS}轮 | 剩余{remaining:.0f}s"
+                    )
+                elif atr_decay_armed and true_direction_correct is False:
+                    print(f"  🚨 ATR衰减止损: {diff_atr:.2f}ATR (入场{entry_atr_val:.1f}ATR, 衰减{decay_pct:.0f}%) + 跌{profit_rate*100:+.1f}% | 剩余{remaining:.0f}s")
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
                     best_bid_sl = get_best_bid_raw(token_id)
@@ -1965,7 +2140,7 @@ def monitor():
                     if ok:
                         sold = True
                         sold_price = actual_price
-                        self_notify(pos, sold_price, coin, direction, size, f"ATR衰减止损({diff_atr:.1f}/{entry_atr[attempt_key]:.1f})")
+                        self_notify(pos, sold_price, coin, direction, size, f"ATR衰减止损({diff_atr:.1f}/{entry_atr_val:.1f})")
                     elif actual_price == "NO_BALANCE":
                         self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR衰减(余额已清)")
                         close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
@@ -1984,107 +2159,35 @@ def monitor():
                         direction_history.pop(attempt_key, None)
                         continue
 
-                # --- 0B. ATR加速下降止损: 3轮内ATR连续下降且已低于0.5 ---
-                if diff_atr is not None and attempt_key in atr_history:
-                    hist = atr_history[attempt_key]
-                    if len(hist) >= 3 and profit_rate < -0.10:
-                        recent = list(hist)[-3:]
-                        # 连续下降 且 当前ATR低
-                        if recent[0] > recent[1] > recent[2] and recent[2] < ATR_DECAY_EXIT_THRESHOLD:
-                            speed = recent[0] - recent[2]
-                            print(f"  🚨 ATR加速下降: {recent[0]:.2f}→{recent[1]:.2f}→{recent[2]:.2f} (Δ{speed:.2f}) + 跌{profit_rate*100:+.1f}% | 剩余{remaining:.0f}s")
-                            attempted_stop_loss = True
-                            cancel_all_orders(token_id)
-                            best_bid_sl = get_best_bid_raw(token_id)
-                            if best_bid_sl and best_bid_sl >= 0.05:
-                                ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl, position=pos, skip_cancel=True)
-                            else:
-                                ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
-                            if ok:
-                                sold = True
-                                sold_price = actual_price
-                                self_notify(pos, sold_price, coin, direction, size, f"ATR加速下降({speed:.1f})")
-                            elif actual_price == "NO_BALANCE":
-                                self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR加速(余额已清)")
-                                close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
-                                close_attempts.pop(attempt_key, None)
-                                continue
-                            if sold:
-                                close_position(pos, sold_price)
-                                close_attempts.pop(attempt_key, None)
-                                stop_loss_attempts.pop(attempt_key, None)
-                                dip_bought.pop(attempt_key, None)
-                                direction_wrong_streak.pop(attempt_key, None)
-                                direction_history.pop(attempt_key, None)
-                                continue
-
-                # --- 方向降级：ATR趋零说明crypto逼近strike，方向随时可能翻转 ---
-                # direction_correct=True 但 ATR<0.3 且 token已大幅亏损 → 降级为False
-                # 让现有硬止损(-25%)和ATR危险区自然生效，避免方向"技术正确"时全程观望到归零
-                # [P0] 降级前保存BTC真实方向（不受任何修改影响），用于门控止损
-                true_direction_correct = direction_correct
-                ATR_DOWNGRADE_THRESHOLD = 0.3
-                # [P1] 末期60s内跳过ATR降级：结算结果已接近确定，BTC在正确侧即为赢单
-                if (direction_correct is True
-                        and remaining >= 60
-                        and diff_atr is not None and diff_atr < ATR_DOWNGRADE_THRESHOLD
-                        and profit_rate <= -PRICE_DROP_HARD_STOP):
-                    print(f"  ⚠️ 方向降级: 方向✅但ATR={diff_atr:.2f}<{ATR_DOWNGRADE_THRESHOLD}(逼近strike) + 跌{profit_rate*100:+.1f}% → 视为方向❌")
-                    direction_correct = False
-
-                # --- PTB Proximity Buffer: crypto在PTB附近时冻结方向信号 ---
-                # 保存 proximity override 前的原始方向，用于 streak 计数
-                raw_direction_correct = direction_correct
-                in_proximity = False
-                if diff_atr is not None and crypto_price and ptb_price:
-                    prox_threshold = calc_proximity_threshold(remaining)
-                    in_proximity = diff_atr < prox_threshold
-
-                    if in_proximity and direction_correct is False and true_direction_correct is False:
-                        # 极端安全阀：时间衰减收紧（>120s:-50%, 60-120s:-45%, <60s:-40%）
-                        # [P0] true_direction_correct is False 门控：BTC真在正确侧时不触发极端止损
-                        if remaining > 120:
-                            extreme_stop = PTB_PROXIMITY_EXTREME_STOP        # -50%
-                        elif remaining > 60:
-                            extreme_stop = PTB_PROXIMITY_EXTREME_STOP - 0.05  # -45%
-                        else:
-                            extreme_stop = PTB_PROXIMITY_EXTREME_STOP - 0.10  # -40%
-
-                        if profit_rate <= -extreme_stop:
-                            print(f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<{prox_threshold:.2f} 但跌{profit_rate*100:+.1f}%>{-extreme_stop*100:.0f}% → 不冻结")
-                            in_proximity = False
-                        elif profit_rate <= -PRICE_DROP_HARD_STOP:
-                            # token跌超硬止损线(-25%) → proximity立即解除，不等streak
-                            print(f"  🚨 Proximity快速解除: 跌{profit_rate*100:+.1f}%超硬止损线-{PRICE_DROP_HARD_STOP*100:.0f}% | {diff_atr:.2f}ATR → 不冻结")
-                            in_proximity = False
-                        else:
-                            # 检查 streak/滑动窗口是否已累计确认方向错误 → 解除保护
-                            streak = direction_wrong_streak.get(attempt_key, 0)
-                            hist = direction_history.get(attempt_key, deque(maxlen=8))
-                            wrong_ratio = sum(1 for d in hist if d is False) / len(hist) if len(hist) >= 4 else 0
-                            # proximity 内 streak 阈值稍高（需要更强确认才解除保护）
-                            prox_streak_threshold = 4
-                            if streak >= prox_streak_threshold or wrong_ratio >= 0.75:
-                                print(f"  🔶→🚨 Proximity保护解除: streak={streak}≥{prox_streak_threshold} or ratio={wrong_ratio:.0%}≥75% | {diff_atr:.2f}ATR | 剩余{remaining:.0f}s")
-                                in_proximity = False  # 解除保护，让正常止损生效
-                            else:
-                                print(f"  🔶 PTB临近区: {diff_atr:.2f}ATR<{prox_threshold:.2f} | 方向冻结✅ | streak={streak} ratio={wrong_ratio:.0%} | 剩余{remaining:.0f}s")
-                                direction_correct = True  # 冻结方向，信任原始bet
-
-                # --- 更新方向错误计数（衰减式 + 滑动窗口）---
-                # 使用 raw_direction（proximity override 前的真实方向）来更新计数
-                if raw_direction_correct is not None:
-                    # 滑动窗口：记录最近8轮原始方向
-                    if attempt_key not in direction_history:
-                        direction_history[attempt_key] = deque(maxlen=8)
-                    direction_history[attempt_key].append(raw_direction_correct)
-
-                    # streak 衰减：❌+1, ✅-1（不清零）
-                    cur_streak = direction_wrong_streak.get(attempt_key, 0)
-                    if raw_direction_correct is False:
-                        direction_wrong_streak[attempt_key] = cur_streak + 1
+                if atr_accel_armed and true_direction_correct is False and direction_correct is True:
+                    print(f"  🔶 ATR加速下降冻结: Δ{atr_accel_speed:.2f} | proximity保护中 | 剩余{remaining:.0f}s")
+                elif atr_accel_armed and true_direction_correct is False:
+                    recent = list(atr_history[attempt_key])[-3:]
+                    print(f"  🚨 ATR加速下降: {recent[0]:.2f}→{recent[1]:.2f}→{recent[2]:.2f} (Δ{atr_accel_speed:.2f}) + 跌{profit_rate*100:+.1f}% | 剩余{remaining:.0f}s")
+                    attempted_stop_loss = True
+                    cancel_all_orders(token_id)
+                    best_bid_sl = get_best_bid_raw(token_id)
+                    if best_bid_sl and best_bid_sl >= 0.05:
+                        ok, actual_price = market_sell_immediate(token_id, size, price=best_bid_sl, position=pos, skip_cancel=True)
                     else:
-                        direction_wrong_streak[attempt_key] = max(0, cur_streak - 1)
+                        ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
+                    if ok:
+                        sold = True
+                        sold_price = actual_price
+                        self_notify(pos, sold_price, coin, direction, size, f"ATR加速下降({atr_accel_speed:.1f})")
+                    elif actual_price == "NO_BALANCE":
+                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR加速(余额已清)")
+                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                        close_attempts.pop(attempt_key, None)
+                        continue
+                    if sold:
+                        close_position(pos, sold_price)
+                        close_attempts.pop(attempt_key, None)
+                        stop_loss_attempts.pop(attempt_key, None)
+                        dip_bought.pop(attempt_key, None)
+                        direction_wrong_streak.pop(attempt_key, None)
+                        direction_history.pop(attempt_key, None)
+                        continue
 
                 # --- 1. -25% 硬止损线（方向错误/未知时触发，方向正确交给ATR矩阵）---
                 # [P0] true_direction_correct is not True 门控：BTC真在正确侧时不触发硬止损
@@ -2126,13 +2229,7 @@ def monitor():
                     prev_direction_correct[attempt_key] = raw_direction_correct
                 if prev_dir is True and direction_correct is False:
                     streak = direction_wrong_streak.get(attempt_key, 0)
-                    # 偏离越大 → 需要越少确认轮次
-                    if diff_atr is not None and diff_atr >= 1.5:
-                        required_confirms = 1  # 偏离大，快速清仓
-                    elif diff_atr is not None and diff_atr >= 1.0:
-                        required_confirms = 2
-                    else:
-                        required_confirms = 2  # 偏离小，多确认
+                    required_confirms = get_direction_flip_required_confirms(diff_atr, remaining)
                     if streak < required_confirms:
                         print(f"  ⏸️ 方向翻转待确认: {streak}/{required_confirms}轮 | {atr_str} | 剩余{remaining:.0f}s")
                         # 恢复prev为True，下轮仍能检测到翻转（否则prev被更新为False，#2永远不再触发）

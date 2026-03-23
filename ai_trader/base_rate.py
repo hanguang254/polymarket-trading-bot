@@ -114,7 +114,7 @@ def record_outcome(slug: str, direction: str, diff_in_atr: float, won: bool, ext
         slug: 市场 slug
         direction: UP / DOWN
         diff_in_atr: 入场时的 ATR 偏离
-        won: 是否盈利
+        won: 是否盈利（兼容旧字段；base rate 校准优先看 directional_won）
         extra: 额外信息（entry_price, exit_price 等）
     """
     record = {
@@ -163,11 +163,16 @@ def calibrate() -> dict:
                     continue
                 try:
                     rec = json.loads(line)
+                    if rec.get("calibration_eligible") is False:
+                        continue
                     band = rec.get("atr_band", _atr_band(rec.get("diff_in_atr", 0)))
                     if band not in bands:
                         bands[band] = {"wins": 0, "total": 0}
                     bands[band]["total"] += 1
-                    if rec.get("won"):
+                    won_flag = rec.get("directional_won")
+                    if won_flag is None:
+                        won_flag = rec.get("won")
+                    if won_flag:
                         bands[band]["wins"] += 1
                 except Exception:
                     continue

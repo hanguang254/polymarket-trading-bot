@@ -64,7 +64,7 @@ class TestAutoRedeemProfitEstimate(unittest.TestCase):
                 "market_slug": "btc-updown-5m-1774232400",
                 "balance": 7069700,
             }
-        ])
+        ], settled_amount=7.0697)
 
         self.assertEqual(matched, 1)
         self.assertAlmostEqual(profit, 0.2828, places=4)
@@ -88,7 +88,7 @@ class TestAutoRedeemProfitEstimate(unittest.TestCase):
                 "market_slug": "btc-updown-5m-1774232700",
                 "balance": 12255300,
             }
-        ])
+        ], settled_amount=12.2553)
 
         self.assertEqual(matched, 1)
         self.assertAlmostEqual(profit, 0.4902, places=4)

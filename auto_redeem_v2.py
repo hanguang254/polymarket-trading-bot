@@ -225,9 +225,9 @@ def _load_closed_position_indexes() -> tuple[dict[str, dict], dict[str, dict]]:
     return by_token_id, by_slug
 
 
-def estimate_redeem_profit(redeemed_positions: list[dict]) -> tuple[float | None, int]:
+def estimate_redeem_profit(redeemed_positions: list[dict], settled_amount: float | None) -> tuple[float | None, int]:
     """
-    用本地已关闭持仓估算本次链上结算的净收益。
+    用本地已关闭持仓成本估算本次链上结算的净收益。
     返回: (net_profit, matched_count)
     """
     if not redeemed_positions:
@@ -237,7 +237,7 @@ def estimate_redeem_profit(redeemed_positions: list[dict]) -> tuple[float | None
     if not by_token_id and not by_slug:
         return None, 0
 
-    net_profit = 0.0
+    matched_cost = 0.0
     matched_count = 0
 
     for pos in redeemed_positions:
@@ -248,18 +248,21 @@ def estimate_redeem_profit(redeemed_positions: list[dict]) -> tuple[float | None
             continue
 
         entry_price = _safe_float(local_pos.get("entry_price"))
-        settle_price = _safe_float(local_pos.get("exit_price"))
         balance_raw = _safe_float(pos.get("balance"))
-        if entry_price is None or settle_price is None or balance_raw is None or balance_raw <= 0:
+        if entry_price is None or balance_raw is None or balance_raw <= 0:
             continue
 
         redeemed_size = balance_raw / 1e6
-        net_profit += redeemed_size * (settle_price - entry_price)
+        matched_cost += redeemed_size * entry_price
         matched_count += 1
 
-    if matched_count == 0:
+    if matched_count == 0 or settled_amount is None or settled_amount < 0:
         return None, 0
 
+    if matched_count != len(redeemed_positions):
+        return None, matched_count
+
+    net_profit = settled_amount - matched_cost
     return round(net_profit, 4), matched_count
 
 # ==============================================================================
@@ -925,7 +928,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     elif usdc_after >= 0 and usdc_now >= 0:
         settled_amount = usdc_after - usdc_now
 
-    net_profit, matched_profit_count = estimate_redeem_profit(successful_positions)
+    net_profit, matched_profit_count = estimate_redeem_profit(successful_positions, settled_amount)
 
     if settled_amount <= 0.001 and success_count > 0:
         log.info("  💡 全部为输的 token（$0 到账），已清理链上残余余额")
@@ -939,6 +942,8 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     if net_profit is not None:
         match_label = f"{matched_profit_count}/{success_count}" if success_count > 0 else "0/0"
         log.info(f"📈 估算净收益: {net_profit:+.2f} USDC | 已匹配本地持仓 {match_label}")
+    elif matched_profit_count > 0 and success_count > 0:
+        log.info(f"📈 净收益未显示：本地成本只匹配到 {matched_profit_count}/{success_count} 笔")
 
     # 6. Telegram 通知
     if success_count > 0 and settled_amount > 0:

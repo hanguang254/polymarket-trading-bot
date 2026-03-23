@@ -52,6 +52,13 @@ class TestPositionMonitor(unittest.TestCase):
         mock_run.return_value = DummyResult(stdout="Token balances:\n- token_id=xyz balance: 1.00")
         self.assertTrue(pm.check_balance_changed("abc", 5))
 
+    @patch("position_monitor.get_current_crypto_price")
+    def test_get_settlement_reference_price_prefers_frozen_close_price(self, mock_price):
+        mock_price.return_value = 99999.0
+        price, source = pm.get_settlement_reference_price({"close_crypto_price": 68671.2}, "BTC")
+        self.assertEqual(price, 68671.2)
+        self.assertEqual(source, "冻结价")
+
 
 if __name__ == "__main__":
     unittest.main()
