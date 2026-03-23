@@ -10,6 +10,8 @@ import json
 import threading
 import time
 
+from ai_trader.ws_ssl import get_websocket_sslopt
+
 try:
     import websocket
     _HAS_WEBSOCKET = True
@@ -161,7 +163,10 @@ class PolymarketOrderbookStream:
                     on_open=self._on_open,
                 )
                 # 不使用 websocket 库的 ping，我们自己发 PING 文本
-                self._ws.run_forever(ping_interval=0)
+                self._ws.run_forever(
+                    sslopt=get_websocket_sslopt(),
+                    ping_interval=0,
+                )
             except Exception as e:
                 print(f"  ⚠️ Polymarket WS 连接异常: {e}")
             if self._running:

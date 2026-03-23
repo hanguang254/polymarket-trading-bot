@@ -7,6 +7,8 @@ import threading
 import time
 from datetime import datetime
 
+from ai_trader.ws_ssl import get_websocket_sslopt
+
 try:
     import websocket
     _HAS_WEBSOCKET = True
@@ -60,7 +62,11 @@ class BinancePriceStream:
                     on_close=self._on_close,
                     on_open=self._on_open,
                 )
-                self._ws.run_forever(ping_interval=30, ping_timeout=10)
+                self._ws.run_forever(
+                    sslopt=get_websocket_sslopt(),
+                    ping_interval=30,
+                    ping_timeout=10,
+                )
             except Exception as e:
                 print(f"  ⚠️ WebSocket 连接异常: {e}")
             if self._running:

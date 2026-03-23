@@ -17,7 +17,7 @@ AI 评分模型 v2.1 - 折价套利策略
   T+120s token价格反映偏离 → 卖出（不等结算）
   利润 = 卖出价 - 买入价（与结算结果无关）
 """
-from ai_trader.binance_api import get_klines, get_current_price
+from ai_trader.binance_api import get_klines
 from ai_trader.indicators import ema, rsi, atr
 
 
@@ -79,13 +79,12 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
 
     返回: (direction, confidence, details)
     """
-    symbol = f"{coin}USDT"
-
     # ── 数据采集（30根K线，更稳定的ATR估算） ──
+    symbol = f"{coin}USDT"
     klines_1m = get_klines(symbol, "1m", 30)
-    # 决策时价格：优先 Chainlink RTDS（与PTB/结算同源），fallback Binance
-    from ai_trader.polymarket_rtds import chainlink_stream
-    current_price = chainlink_stream.get_price(coin) or get_current_price(symbol)
+    # 决策时价格：优先 Chainlink（与PTB/结算同源），fallback Pyth
+    from ai_trader.price_oracle import get_onchain_price
+    current_price = get_onchain_price(coin)
 
     if not klines_1m or not current_price or not price_to_beat:
         return None, 0, {"error": "数据不足"}

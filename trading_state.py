@@ -17,6 +17,53 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "t
 _LOCK_FILE = STATE_FILE + ".lock"
 
 
+def _today_str():
+    return str(date.today())
+
+
+def _normalize_pending_costs(state):
+    """兼容旧格式 pending_costs，并保留开仓日期避免跨天回补污染新交易日。"""
+    pending = state.get("pending_costs", {})
+    normalized = {}
+
+    if isinstance(pending, dict):
+        fallback_date = str(state.get("daily_pnl_date") or _today_str())
+        for slug, value in pending.items():
+            try:
+                if isinstance(value, dict):
+                    cost = float(value.get("cost", 0) or 0)
+                    session_date = str(value.get("session_date") or value.get("date") or fallback_date)
+                else:
+                    cost = float(value or 0)
+                    session_date = fallback_date
+            except (TypeError, ValueError):
+                continue
+
+            if cost > 0:
+                normalized[slug] = {
+                    "cost": round(cost, 4),
+                    "session_date": session_date,
+                }
+
+    state["pending_costs"] = normalized
+    return normalized
+
+
+def _get_pending_entry(pending, slug):
+    entry = pending.get(slug)
+    if not entry:
+        return 0.0, None
+    if isinstance(entry, dict):
+        try:
+            return float(entry.get("cost", 0) or 0), entry.get("session_date")
+        except (TypeError, ValueError):
+            return 0.0, entry.get("session_date")
+    try:
+        return float(entry or 0), None
+    except (TypeError, ValueError):
+        return 0.0, None
+
+
 class _StateLock:
     """线程锁 + 文件锁，保证跨线程和跨进程的原子性"""
     def __enter__(self):
@@ -46,7 +93,7 @@ def load_state():
         "total_wins": 0,
         "total_losses": 0,
         "daily_pnl": 0.0,
-        "daily_pnl_date": str(date.today()),
+        "daily_pnl_date": _today_str(),
     }
 
 def save_state(state):
@@ -57,7 +104,7 @@ def save_state(state):
 
 def _reset_daily_if_needed(state):
     """日期切换时重置当日PnL，返回是否发生了重置"""
-    today = str(date.today())
+    today = _today_str()
     if state.get("daily_pnl_date") != today:
         state["daily_pnl"] = 0.0
         state["daily_pnl_date"] = today
@@ -67,10 +114,11 @@ def _reset_daily_if_needed(state):
 def should_trade():
     """检查是否应该交易（考虑冷却期 + 日亏损上限）"""
     state = load_state()
+    _normalize_pending_costs(state)
     if state["cooldown_remaining"] > 0:
         return False
     # 日期切换时重置当日PnL
-    today = str(date.today())
+    today = _today_str()
     if state.get("daily_pnl_date") != today:
         return True
     daily_pnl = state.get("daily_pnl", 0.0)
@@ -85,6 +133,7 @@ def check_daily_loss_limit():
     """
     with _StateLock():
         state = load_state()
+        _normalize_pending_costs(state)
         if _reset_daily_if_needed(state):
             save_state(state)
             return True, 0.0, MAX_DAILY_LOSS
@@ -103,8 +152,12 @@ def record_bet_cost(slug, cost):
         _reset_daily_if_needed(state)
         state["daily_pnl"] = round(state.get("daily_pnl", 0.0) - cost, 4)
         # 累加而非覆盖（支持抄底加仓追加成本）
-        pending = state.setdefault("pending_costs", {})
-        pending[slug] = round(pending.get(slug, 0.0) + cost, 4)
+        pending = _normalize_pending_costs(state)
+        prev_cost, _ = _get_pending_entry(pending, slug)
+        pending[slug] = {
+            "cost": round(prev_cost + cost, 4),
+            "session_date": state.get("daily_pnl_date", _today_str()),
+        }
         save_state(state)
         return state["daily_pnl"]
 
@@ -115,10 +168,14 @@ def settle_bet_cost(slug, actual_pnl):
     """
     with _StateLock():
         state = load_state()
-        pending = state.get("pending_costs", {})
-        cost = pending.pop(slug, 0.0)
-        # 先回补预扣的成本，再加上实际盈亏
-        state["daily_pnl"] = round(state.get("daily_pnl", 0.0) + cost + actual_pnl, 4)
+        pending = _normalize_pending_costs(state)
+        _reset_daily_if_needed(state)
+        cost, entry_session = _get_pending_entry(pending, slug)
+        pending.pop(slug, None)
+        current_session = state.get("daily_pnl_date", _today_str())
+        refund = cost if entry_session == current_session else 0.0
+        # 同日开仓的预扣成本需要回补；隔夜持仓只把实际PnL记入新交易日。
+        state["daily_pnl"] = round(state.get("daily_pnl", 0.0) + refund + actual_pnl, 4)
         state["pending_costs"] = pending
         save_state(state)
         return state["daily_pnl"]
@@ -132,13 +189,24 @@ def record_partial_pnl(slug, sold_price, sold_count, entry_price):
     partial_pnl = (sold_price - entry_price) * sold_count  # 这些份额的盈亏
     with _StateLock():
         state = load_state()
+        pending = _normalize_pending_costs(state)
         _reset_daily_if_needed(state)
-        # 回补这些份额的预扣成本 + 加上实际盈亏
-        state["daily_pnl"] = round(state.get("daily_pnl", 0.0) + partial_cost + partial_pnl, 4)
+        pending_cost, entry_session = _get_pending_entry(pending, slug)
+        settled_cost = min(partial_cost, pending_cost)
+        current_session = state.get("daily_pnl_date", _today_str())
+        refund = settled_cost if entry_session == current_session else 0.0
+        # 隔夜仓位的成本不回补到今天，只记录今天实际实现的PnL。
+        state["daily_pnl"] = round(state.get("daily_pnl", 0.0) + refund + partial_pnl, 4)
         # 减少 pending_costs（这些份额已结算）
-        pending = state.get("pending_costs", {})
         if slug in pending:
-            pending[slug] = round(max(0, pending[slug] - partial_cost), 4)
+            remaining_cost = round(max(0.0, pending_cost - settled_cost), 4)
+            if remaining_cost > 0:
+                pending[slug] = {
+                    "cost": remaining_cost,
+                    "session_date": entry_session or current_session,
+                }
+            else:
+                pending.pop(slug, None)
         state["pending_costs"] = pending
         save_state(state)
         return state["daily_pnl"]
@@ -148,6 +216,7 @@ def record_bet_result(success, slug, pnl=0.0):
     """记录下注结果，pnl 为本次盈亏（正=盈利，负=亏损）"""
     with _StateLock():
         state = load_state()
+        _normalize_pending_costs(state)
         state["total_bets"] += 1
         state["last_bet_time"] = datetime.now(timezone.utc).isoformat()
         state["last_bet_result"] = "win" if success else "loss"

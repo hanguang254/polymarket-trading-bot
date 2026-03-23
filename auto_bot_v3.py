@@ -30,8 +30,6 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from ai_trader.polymarket_api import normalize_orderbook
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
 # --- 新增日志配置 ---
 LOG_FILE = "logs/polymarket-bot.log"
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True) # 确保logs目录存在
@@ -61,6 +59,7 @@ _api_failures = 0          # 连续 API 失败计数
 _circuit_open_until = 0    # 熔断恢复时间戳（Unix）
 CIRCUIT_BREAK_THRESHOLD = 5   # 连续失败N次触发熔断
 CIRCUIT_BREAK_DURATION = 300  # 熔断持续时间（秒）
+_runtime_max_reanalyze = None
 
 # 持仓数检查锁 + 预占计数：防止并行线程同时通过 MAX_OPEN_POSITIONS 检查
 _position_lock = threading.Lock()
@@ -465,12 +464,9 @@ class MarketTracker:
                 sample_interval = 3 if elapsed >= 80 else 5
                 if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
                     try:
-                        from ai_trader.binance_api import get_current_price
-                        from ai_trader.polymarket_rtds import chainlink_stream
+                        from ai_trader.price_oracle import get_onchain_price
                         coin = market['coin']
-                        cl_price = chainlink_stream.get_price(coin)
-                        price = cl_price or get_current_price(f"{coin}USDT")
-                        price_src = "CL" if cl_price else "BN"
+                        price, price_src = get_onchain_price(coin, with_source=True)
                         if price and ptb_now:
                             gap = round(price - ptb_now, 2)
                             samples.append({"price": price, "gap": gap, "ts": time.time()})
@@ -486,13 +482,15 @@ class MarketTracker:
                                 logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                         elif price and not ptb_now:
                             logger.info(f"  ⏳ 等待PTB... price={price:.2f}({price_src})")
+                        elif not price:
+                            logger.info(f"  ⏳ 等待链上价格... coin={coin}")
                     except Exception as e:
                         logger.warning(f"  ⚠️ 预热采样失败: {e}")
 
                 # === 波动重触发：跳过的市场检测价格大幅偏离 ===
                 REANALYZE_ATR_MULT = float(os.environ.get("REANALYZE_ATR_MULT", "1.5"))
                 REANALYZE_COOLDOWN = float(os.environ.get("REANALYZE_COOLDOWN", "15"))
-                MAX_REANALYZE = int(os.environ.get("MAX_REANALYZE", "1"))
+                MAX_REANALYZE = _runtime_max_reanalyze if _runtime_max_reanalyze is not None else 1
                 if slug in self.skipped_markets and slug not in self.positions:
                     skip_info = self.skipped_markets[slug]
                     updater = self.bayesian_updaters.get(slug)
@@ -506,6 +504,7 @@ class MarketTracker:
                         move = abs(latest_price - skip_info["price_at_skip"])
                         atr = updater.atr_val
                         if move >= atr * REANALYZE_ATR_MULT:
+                            skip_info["move_atr"] = round(move / atr, 2)
                             logger.info(
                                 f"\n🔄 波动重触发: {market['coin']} "
                                 f"移动{move:.0f} ({move/atr:.1f}ATR ≥ {REANALYZE_ATR_MULT}ATR) "
@@ -513,6 +512,7 @@ class MarketTracker:
                             )
                             self.analyzed.discard(slug)
                             self.early_analyzed.discard(slug)
+                            self.last_analysis_time.pop(slug, None)
                             skip_info["reanalyze_count"] += 1
 
             # === 早期下注窗口：90-95s（API 在前60-80s返回425 Too Early） ===
@@ -589,6 +589,16 @@ class MarketTracker:
 
                     # 贝叶斯置信度太低（<15%），方向不确定，跳过（等冷却后重试）
                     if b_conf < 0.15:
+                        if not is_reanalyze and _skip_price:
+                            self.skipped_markets[slug] = {
+                                "skip_time": time.time(),
+                                "price_at_skip": _skip_price,
+                                "reason": "low_conf",
+                                "reanalyze_count": 0,
+                            }
+                            # 成熟样本下的极低置信度不再每轮重扫，交给波动重触发重新放行。
+                            if gap_trend == "穿越" or len(samples) >= 8:
+                                self.analyzed.add(slug)
                         logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，等待变化")
                         continue
                 else:
@@ -614,6 +624,7 @@ class MarketTracker:
 
                 self.trade_attempts[slug] = self.trade_attempts.get(slug, 0) + 1
                 self.skipped_markets.pop(slug, None)
+                self.analyzed.add(slug)  # 本轮已入分析队列，避免重复调度
                 pending_trades.append((slug, market, extra_info))
 
         # 并行获取 PTB（每个币种独立 Chromium 进程，4H4G服务器可并行）
@@ -810,6 +821,7 @@ class MarketTracker:
             else:
                 self.skipped_markets.pop(slug, None)
             # 分析拒绝不加入 analyzed，允许冷却后重新分析
+            self.analyzed.discard(slug)
             decrease_cooldown()
             logger.info(f"{'='*60}\n")
             return
@@ -914,16 +926,20 @@ class MarketTracker:
             elif isinstance(output, str) and output.startswith("SKIP_"):
                 # 所有 SKIP 类型（余额不足/价格获取失败/价格过高/流动性不足）都不算失败，不影响统计
                 retry_n = self.trade_attempts.get(slug, 0)
+                self.analyzed.discard(slug)
                 logger.warning(f"  ⚠️ {output}，跳过（不计入统计）| 尝试{retry_n}次，等待重试")
             elif isinstance(output, str) and ("Too Early" in output or "not ready" in output or "425" in output):
                 # API时序错误（市场未开始接单），不计为交易失败
+                self.analyzed.discard(slug)
                 logger.warning(f"  ⚠️ API时序错误，跳过（不计入统计）: {output[:100]}")
             else:
                 output_str = str(output) if output else ""
                 if "fully filled" in output_str or "FOK" in output_str:
                     retry_n = self.trade_attempts.get(slug, 0)
+                    self.analyzed.discard(slug)
                     logger.warning(f"  ⚠️ FOK未成交（流动性不足）| 尝试{retry_n}次，等待重试")
                 elif "Request exception" in output_str or "status_code=None" in output_str:
+                    self.analyzed.discard(slug)
                     logger.warning(f"  ⚠️ 网络超时，跳过（不计入统计）: {output_str[:80]}")
                 else:
                     logger.error(f"  ❌ 下注失败: {output_str[:150]}")
@@ -1013,6 +1029,9 @@ class MarketTracker:
 
 
 def main():
+    global _runtime_max_reanalyze
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    _runtime_max_reanalyze = int(os.environ.get("MAX_REANALYZE", "1"))
     print("🤖 Polymarket 全自动交易机器人 v3.4 启动")
     print("   策略: PTB预获取 → 贝叶斯预热 → 趋势确认下注")
     print("   新增: SDK直连下单(延迟<50ms) | FOK即时平仓 | LMSR流动性评估")

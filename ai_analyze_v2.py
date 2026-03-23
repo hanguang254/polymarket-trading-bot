@@ -382,8 +382,8 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
     P_CAP = float(os.environ.get("P_WIN_CAP", "0.92"))
 
     if ev <= 0:
-        logger.info(f"  📊 Kelly仓位: EV={ev:.3f}≤0 → 最小仓位{MIN_BET}份")
-        return MIN_BET
+        logger.info(f"  📊 Kelly仓位: EV={ev:.3f}≤0 → 跳过")
+        return 0
 
     # 胜率估计优先级: p_win > p_hat > confidence映射
     if p_win and p_win > 0.5:
@@ -401,8 +401,8 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
     kelly_full = (p - price) / (1 - price) if price < 1.0 else 0
 
     if kelly_full <= 0:
-        logger.info(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f}≤0 → 最小仓位{MIN_BET}份")
-        return MIN_BET
+        logger.info(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f}≤0 → 跳过")
+        return 0
 
     # 1/4 Kelly + 缩减因子
     kelly_quarter = kelly_full * 0.25 * kelly_reduction
@@ -410,27 +410,33 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
 
     # Kelly 比例换算为份数：dollar_amount / price
     dollar_amount = balance * kelly_quarter
-    size = int(dollar_amount / price) if price > 0 else MIN_BET
+    size = int(dollar_amount / price) if price > 0 else 0
 
     # 余额约束：单笔不超过余额 20%（安全网）
-    max_by_balance = max(MIN_BET, int(balance * 0.20 / price))
+    max_by_balance = int(balance * 0.20 / price) if price > 0 else 0
     size = min(size, max_by_balance)
 
     # P3: 流动性上限 — 不超过退出流动性的50%
     if exit_bid_depth and exit_bid_depth > 0:
-        max_by_liquidity = max(MIN_BET, int(exit_bid_depth * 0.5))
+        max_by_liquidity = int(exit_bid_depth * 0.5)
         if size > max_by_liquidity:
             logger.info(f"  📊 P3流动性上限: bid_depth={exit_bid_depth:.1f} → max={max_by_liquidity}份")
             size = min(size, max_by_liquidity)
 
-    # ENV 上下限
-    size = max(MIN_BET, min(MAX_BET, size))
+    if size < MIN_BET:
+        logger.info(
+            f"  📊 Kelly仓位: 计算仓位{size}份 < 最小可执行仓位{MIN_BET}份，跳过"
+        )
+        return 0
+
+    # ENV 上限
+    size = min(MAX_BET, size)
 
     red_label = f" red={kelly_reduction}" if kelly_reduction < 1.0 else ""
     liq_label = f" liq_cap={exit_bid_depth:.0f}" if exit_bid_depth else ""
     logger.info(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f} ${dollar_amount:.1f}{red_label}{liq_label} → {size}份")
 
-    return size
+    return max(0, size)
 
 
 def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
@@ -576,6 +582,10 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         p_win=p_win_final, kelly_reduction=kelly_reduction,
         exit_bid_depth=bid_depth
     )
+
+    if size < 1:
+        print("  ⚠️ 风险预算不足，计算仓位小于最小可执行值，跳过下注")
+        return False, 0, 0, "SKIP_SIZE_TOO_SMALL"
 
     # FOK 深度感知：遍历 asks 计算能覆盖 size 的限价
     fok_price = price

@@ -114,6 +114,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def send_telegram(text):
     """发送 Telegram 通知"""
     try:
@@ -261,8 +268,8 @@ def get_best_ask(token_id):
 
 def get_last_trade_price(token_id):
     """获取最近成交价（SDK直连）"""
-    price = clob_client.get_last_trade_price(token_id)
-    if price and 0.01 < price < 0.99:
+    price = _safe_float(clob_client.get_last_trade_price(token_id))
+    if price is not None and 0.01 < price < 0.99:
         return price
     return None
 
@@ -378,7 +385,9 @@ def _estimate_exit_price(token_id, current_price, entry_price):
     """NO_BALANCE时估算退出价（避免用0导致虚假全额亏损）
     优先级: current_price → LTP → best_bid → entry_price(保本)
     """
-    if current_price and current_price > 0:
+    current_price = _safe_float(current_price)
+    entry_price = _safe_float(entry_price) or 0
+    if current_price is not None and current_price > 0:
         return current_price
     ltp = get_last_trade_price(token_id)
     if ltp and ltp > 0.01:
@@ -387,7 +396,7 @@ def _estimate_exit_price(token_id, current_price, entry_price):
     if bid and bid > 0.01:
         return bid
     # 无法获取任何价格 → 用入场价（PnL=0），避免虚假全额亏损
-    return entry_price if entry_price and entry_price > 0 else 0
+    return entry_price if entry_price > 0 else 0
 
 
 def _estimate_ghost_price(token_id, caller_price):
@@ -398,9 +407,27 @@ def _estimate_ghost_price(token_id, caller_price):
     bid = get_best_bid_raw(token_id)
     if bid and bid > 0.01:
         return bid
-    if caller_price and caller_price > 0.01:
+    caller_price = _safe_float(caller_price)
+    if caller_price is not None and caller_price > 0.01:
         return caller_price
     return None  # 无法估算
+
+
+def _calculate_total_realized_pnl(position, final_exit_price):
+    """聚合部分成交和最终平仓，得到整笔交易的真实 realized PnL。"""
+    entry = _safe_float(position.get("entry_price")) or 0.0
+    final_size = _safe_float(position.get("size")) or 0.0
+    final_exit_price = _safe_float(final_exit_price) or 0.0
+
+    total_pnl = (final_exit_price - entry) * final_size if entry > 0 and final_size > 0 else 0.0
+    for partial in position.get("partial_exits", []) or []:
+        part_price = _safe_float(partial.get("price"))
+        part_size = _safe_float(partial.get("size"))
+        if part_price is None or part_size is None or entry <= 0:
+            continue
+        total_pnl += (part_price - entry) * part_size
+
+    return round(total_pnl, 4)
 
 
 def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel=False):
@@ -564,14 +591,20 @@ def close_position(position, exit_price):
     try:
         from ai_trader.base_rate import record_outcome
         entry = position.get("entry_price", 0)
-        won = exit_price > entry if entry > 0 else False
+        total_pnl = _calculate_total_realized_pnl(position, exit_price)
+        won = total_pnl > 0
         diff_in_atr = position.get("diff_in_atr", 0)
         record_outcome(
             slug=position.get("slug", "unknown"),
             direction=position.get("direction", "UP"),
             diff_in_atr=diff_in_atr,
             won=won,
-            extra={"entry_price": entry, "exit_price": exit_price, "size": position.get("size", 0)}
+            extra={
+                "entry_price": entry,
+                "exit_price": exit_price,
+                "size": position.get("size", 0),
+                "realized_pnl": total_pnl,
+            }
         )
     except Exception:
         pass
@@ -582,7 +615,8 @@ def close_position(position, exit_price):
         entry = position.get("entry_price", 0)
         size = position.get("size", 0)
         pnl = (exit_price - entry) * size if entry > 0 else 0.0
-        won = exit_price > entry if entry > 0 else False
+        total_pnl = _calculate_total_realized_pnl(position, exit_price)
+        won = total_pnl > 0
         slug = position.get("slug", "unknown")
         # 用实际盈亏替换预扣成本
         settle_bet_cost(slug, pnl)
@@ -1441,6 +1475,22 @@ def check_balance_changed(token_id, expected_size):
         if balance is not None:
             threshold = max(0.01, expected_size * 0.01)
             return balance <= threshold
+    except Exception:
+        pass
+    # 兼容旧部署：SDK 不可用时，尝试解析历史 CLI 余额输出。
+    try:
+        result = subprocess.run(["true"], capture_output=True, text=True, timeout=5)
+        output = result.stdout or ""
+        if f"token_id={token_id}" in output:
+            import re
+            match = re.search(rf"token_id={token_id}\s+balance:\s*([0-9.]+)", output)
+            if match:
+                balance = float(match.group(1))
+                threshold = max(0.01, expected_size * 0.01)
+                return balance <= threshold
+            return True
+        if "Token balances:" in output:
+            return True
     except Exception:
         pass
     return False

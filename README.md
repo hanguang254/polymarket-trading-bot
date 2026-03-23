@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.1
+# Polymarket Trading Bot v10.2
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -58,7 +58,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **LMSR Liquidity Assessment**: Orderbook spread/depth/slippage scoring → dynamic discount threshold (8%-20%).
 - **Exit Liquidity Gate (P2)**: Before entering, checks bid-side depth of the chosen token. `bid_depth < 5` → skip entry entirely. Prevents entering positions that can't be exited.
 - **Correlated Exposure Control**: BTC/ETH correlation ~0.85. Same-direction position halves Kelly sizing.
-- **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds.
+- **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds. EV≤0 或 Kelly≤0 返回 0（跳过），不再兜底 MIN_BET 强制下注。
 - **Liquidity-Capped Sizing (P3)**: Kelly size capped at 50% of exit bid depth. Works with P2 — P2 gates entry, P3 adjusts size.
 - **Balance Auto-Retry**: When balance insufficient, automatically retries with reduced size (98%/95%/90%) instead of skipping entirely.
 - **Post-Buy Allowance Refresh**: After successful buy (both direct and pending fill), queries actual on-chain `token_balance` and calls `update_balance_allowance` to ensure sell authorization is pre-set. Prevents "not enough balance / allowance" errors at exit time.
@@ -94,11 +94,13 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
 - **3-Stage Graduated Exit**: For remaining edge cases — Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) EV≥0 hold / EV<0 floor prices.
+- **Realized PnL 聚合**: `_calculate_total_realized_pnl()` 聚合部分成交 + 最终平仓的真实盈亏。胜负判定改为基于 total realized PnL（替代简单 entry vs exit 价格比较），对加仓/减仓场景更准确。
 - **API-Based Settlement**: Expiry cleanup uses Polymarket API real outcome (not Binance price guess) to determine $1.00/$0.00.
 - **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
 
 ### Infrastructure
-- **价格数据源可配置 (`PRICE_SOURCE`)**: `PRICE_SOURCE=1`（默认）Chainlink优先，`PRICE_SOURCE=2` Pyth优先。无论选哪个，另一个自动作为fallback，最终fallback为Binance WS/REST。Chainlink是Polymarket官方结算价（零差异），Pyth是独立链上预言机。
+- **链上价格统一入口 (`price_oracle.py`)**: `get_onchain_price(coin)` 统一 Chainlink / Pyth 双源 fallback，返回 `(price, source)` 用于日志追踪。默认 Chainlink 优先（与结算同源），可传 `prefer="pyth"` 切换。替代了各模块直接调用 `chainlink_stream` + `get_current_price` 的分散逻辑。
+- **WebSocket TLS 证书修复 (`ws_ssl.py`)**: 所有 WSS 连接（Binance / Chainlink RTDS / Polymarket Orderbook）统一使用 `get_websocket_sslopt()` 传入显式 CA 证书路径。解决 macOS Python 环境下 websocket-client 找不到系统 CA 导致 WSS 握手失败的问题。优先 certifi，支持 `SSL_CERT_FILE` 等环境变量覆盖。
 - **Chainlink RTDS Price Stream**: `ChainlinkStream` singleton in `polymarket_rtds.py` connects to Polymarket RTDS WebSocket (`wss://ws-live-data.polymarket.com`) for Chainlink on-chain settlement prices. This is the exact price Polymarket uses for settlement (UMA oracle references Chainlink feeds). Zero-latency WebSocket push (~1s update frequency), 5s staleness threshold. **Also used as primary price source for warmup sampling and decision-time `current_price` in `analyze_market()`** — ensures gap/ATR calculations are aligned with the same oracle as PTB and settlement. Binance WS serves as fallback when Chainlink is stale.
 - **Pyth Network On-Chain Price Stream**: `PythPriceStream` singleton in `pyth_api.py` receives BTC/ETH prices from Pyth Hermes v2 SSE stream (`hermes.pyth.network`). On-chain oracle prices independent of Polymarket. REST fallback when SSE is stale. No API key required, free tier is production-grade.
 - **Binance WebSocket Price Stream**: Shared `BinancePriceStream` singleton in `binance_api.py` receives BTC/ETH trade prices via `wss://stream.binance.com` (~10ms push latency). `get_current_price()` reads from memory (0ms), auto-fallback to REST if WebSocket data is stale (>5s). Used for **K-line/ATR data** (Chainlink has no OHLCV). Serves as **fallback** for current price when Chainlink RTDS is stale. Serves as **final fallback** for position monitoring. Auto-reconnect with 2s backoff + 30s ping keepalive.
@@ -112,7 +114,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Volatility Re-Trigger**: Skipped markets monitored for large price moves — piggybacks on existing sampling loop (no extra API calls), re-enters analysis when volatility exceeds threshold
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
-- **Auto Redeem**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`), shows USDC balance after each round
+- **隔夜仓位 PnL 隔离**: `pending_costs` 存储 `{cost, session_date}`，跨天结算的仓位成本不回补到新交易日的 daily_pnl，防止隔夜仓位污染当日风控额度。旧格式自动兼容迁移。
+- **Auto Redeem + PnL 匹配**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`)，结算后匹配 `positions.jsonl` 计算真实成本基准和净收益，shows USDC balance + PnL stats after each round
 - **Watchdog**: `watchdog_v3.sh` monitors all 3 services and auto-restarts on failure
 - **systemd Management**: Auto-restart on crash, boot-start
 
@@ -134,9 +137,13 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | `ai_trader/binance_api.py` | Binance market data: WebSocket real-time price stream + REST klines/stats (fallback for position monitor) |
 | `ai_trader/polymarket_ws.py` | Polymarket Market Channel WebSocket: real-time orderbook/best_bid_ask stream |
 | `ai_trader/indicators.py` | Technical indicators (EMA, RSI, ATR, Bollinger Bands) |
+| `ai_trader/price_oracle.py` | 链上价格统一入口: Chainlink/Pyth 双源 fallback |
+| `ai_trader/ws_ssl.py` | WebSocket TLS helpers: 显式 CA 证书路径 |
 | `ai_trader/polymarket_api.py` | Polymarket API + PTB HTML scraper |
 | `ai_trader/playwright_ptb.py` | PTB extraction via headless Chromium |
-| `trading_state.py` | State management: cooldown, daily PnL, win/loss tracking |
+| `trading_state.py` | State management: cooldown, daily PnL, win/loss tracking, 隔夜仓位隔离 |
+| `backtest.py` | PnL-based 回测报告: 从本地日志重建真实交易绩效 |
+| `backtest_accuracy.py` | 兼容性包装器 (redirects to backtest.py) |
 | `watchdog_v3.sh` | Process watchdog: monitors and auto-restarts all services |
 
 ## Betting Conditions

@@ -10,6 +10,8 @@ import json
 import threading
 import time
 
+from ai_trader.ws_ssl import get_websocket_sslopt
+
 try:
     import websocket
     _HAS_WEBSOCKET = True
@@ -100,7 +102,10 @@ class ChainlinkPriceStream:
                     on_close=self._on_close,
                     on_open=self._on_open,
                 )
-                self._ws.run_forever(ping_interval=0)
+                self._ws.run_forever(
+                    sslopt=get_websocket_sslopt(),
+                    ping_interval=0,
+                )
             except Exception as e:
                 if self._running:
                     print(f"  ⚠️ RTDS Chainlink 连接异常: {e}")

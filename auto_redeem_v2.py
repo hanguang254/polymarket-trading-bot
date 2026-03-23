@@ -42,6 +42,7 @@ REDEEM_INTERVAL = int(os.environ.get("REDEEM_INTERVAL", 600))  # 默认10分钟
 
 # 已 redeem 记录文件
 REDEEMED_FILE = os.path.join(SCRIPT_DIR, "logs", "redeemed_conditions.json")
+POSITIONS_FILE = os.path.join(SCRIPT_DIR, "logs", "positions.jsonl")
 
 # ==============================================================================
 # 合约地址 (Polygon mainnet)
@@ -164,6 +165,102 @@ def mark_redeemed(redeemed: dict, condition_id: str, slug: str, value: float,
         "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     save_redeemed(redeemed)
+
+
+def _safe_float(value) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_jsonl(path: str) -> list[dict]:
+    records = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    records.append(item)
+    except FileNotFoundError:
+        pass
+    return records
+
+
+def _position_sort_key(position: dict | None) -> str:
+    if not position:
+        return ""
+    return str(
+        position.get("exit_time")
+        or position.get("updated_time")
+        or position.get("entry_time")
+        or ""
+    )
+
+
+def _load_closed_position_indexes() -> tuple[dict[str, dict], dict[str, dict]]:
+    by_token_id: dict[str, dict] = {}
+    by_slug: dict[str, dict] = {}
+
+    for pos in _load_jsonl(POSITIONS_FILE):
+        if pos.get("closed") is not True:
+            continue
+
+        token_id = str(pos.get("token_id") or "").strip()
+        market_slug = str(pos.get("slug") or "").strip()
+
+        if token_id and _position_sort_key(pos) >= _position_sort_key(by_token_id.get(token_id)):
+            by_token_id[token_id] = pos
+        if market_slug and _position_sort_key(pos) >= _position_sort_key(by_slug.get(market_slug)):
+            by_slug[market_slug] = pos
+
+    return by_token_id, by_slug
+
+
+def estimate_redeem_profit(redeemed_positions: list[dict]) -> tuple[float | None, int]:
+    """
+    用本地已关闭持仓估算本次链上结算的净收益。
+    返回: (net_profit, matched_count)
+    """
+    if not redeemed_positions:
+        return None, 0
+
+    by_token_id, by_slug = _load_closed_position_indexes()
+    if not by_token_id and not by_slug:
+        return None, 0
+
+    net_profit = 0.0
+    matched_count = 0
+
+    for pos in redeemed_positions:
+        token_id = str(pos.get("token_id") or "").strip()
+        market_slug = str(pos.get("market_slug") or "").strip()
+        local_pos = by_token_id.get(token_id) or (by_slug.get(market_slug) if market_slug else None)
+        if not local_pos:
+            continue
+
+        entry_price = _safe_float(local_pos.get("entry_price"))
+        settle_price = _safe_float(local_pos.get("exit_price"))
+        balance_raw = _safe_float(pos.get("balance"))
+        if entry_price is None or settle_price is None or balance_raw is None or balance_raw <= 0:
+            continue
+
+        redeemed_size = balance_raw / 1e6
+        net_profit += redeemed_size * (settle_price - entry_price)
+        matched_count += 1
+
+    if matched_count == 0:
+        return None, 0
+
+    return round(net_profit, 4), matched_count
 
 # ==============================================================================
 # Telegram 通知
@@ -301,7 +398,8 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
     for p in positions:
         cond_id = p.get("conditionId") or p.get("condition_id", "")
         token_id = p.get("asset") or p.get("token_id", "")
-        title = p.get("title", p.get("slug", p.get("market_slug", cond_id[:16])))
+        market_slug = p.get("slug", p.get("market_slug", ""))
+        title = p.get("title", market_slug or cond_id[:16])
         neg_risk = p.get("negativeRisk", p.get("neg_risk", p.get("negRisk", False)))
         cur_value = float(p.get("currentValue", p.get("current_value", p.get("value", 0))) or 0)
         size = float(p.get("size", 0) or 0)
@@ -357,6 +455,7 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
             "balance": bal,
             "holder": holder,
             "slug": (title or "unknown")[:50],
+            "market_slug": market_slug,
             "value": cur_value,
             "neg_risk": neg_risk,
             "size": size,
@@ -733,7 +832,7 @@ def cleanup_false_redeemed(w3: Web3, wallet, ctf_contract) -> int:
 
 
 def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
-    """执行一轮领取，返回实际 USDC 收益"""
+    """执行一轮领取，返回实际 USDC 到账金额"""
 
     # 0. 当前余额
     usdc_now = get_usdc_balance(wallet, usdc_contract)
@@ -783,7 +882,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     # 5. 链上验证 + 标记
     success_count = 0
     fail_count = 0
-    zero_payout_count = 0
+    successful_positions = []
 
     for br in batch_results:
         r = br["position"]
@@ -815,36 +914,51 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
             actually_redeemed = True
 
         success_count += 1
+        successful_positions.append(r)
         mark_redeemed(redeemed, cid, slug, r.get("value", 0), r.get("size", 0), br.get("tx_hash", ""))
 
-    # 6. USDC 余额（领取后）+ 统计赢/输
+    # 6. USDC 余额（领取后）+ 统计到账/净收益
     usdc_after = get_usdc_balance(wallet, usdc_contract)
-    gained = (usdc_after - (usdc_now if usdc_now >= 0 else 0)) if usdc_after >= 0 else 0
+    settled_amount = 0.0
+    if usdc_after >= 0 and usdc_before >= 0:
+        settled_amount = usdc_after - usdc_before
+    elif usdc_after >= 0 and usdc_now >= 0:
+        settled_amount = usdc_after - usdc_now
 
-    if gained <= 0.001 and success_count > 0:
-        zero_payout_count = success_count
-        log.info(f"  💡 全部为输的token（$0收益），已清理链上残余余额")
+    net_profit, matched_profit_count = estimate_redeem_profit(successful_positions)
+
+    if settled_amount <= 0.001 and success_count > 0:
+        log.info("  💡 全部为输的 token（$0 到账），已清理链上残余余额")
 
     log.info(
         f"{'✅' if success_count > 0 else '⚠️'} 领取完成: "
         f"{success_count} 成功 / {fail_count} 失败 / {len(pending)} 总计"
     )
     if usdc_after >= 0:
-        log.info(f"💵 USDC 变化: +${gained:.2f}  |  余额: ${usdc_after:.2f}")
+        log.info(f"💸 USDC 到账: +${settled_amount:.2f}  |  余额: ${usdc_after:.2f}")
+    if net_profit is not None:
+        match_label = f"{matched_profit_count}/{success_count}" if success_count > 0 else "0/0"
+        log.info(f"📈 估算净收益: {net_profit:+.2f} USDC | 已匹配本地持仓 {match_label}")
 
     # 6. Telegram 通知
-    if success_count > 0 and gained > 0:
+    if success_count > 0 and settled_amount > 0:
         balance_line = f"💰 余额: ${usdc_after:.2f} USDC\n" if usdc_after >= 0 else ""
+        payout_line = f"💸 到账: +${settled_amount:.2f} USDC\n"
+        profit_line = ""
+        if net_profit is not None:
+            profit_label = "📈 净收益" if matched_profit_count == success_count else f"📈 净收益(已匹配{matched_profit_count}/{success_count})"
+            profit_line = f"{profit_label}: {net_profit:+.2f} USDC\n"
         send_telegram(
             f"💰 <b>Polymarket 链上自动结算</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"✅ 成功: {success_count}/{len(pending)} 笔\n"
-            f"💵 收益: +${gained:.2f} USDC\n"
+            f"{payout_line}"
+            f"{profit_line}"
             f"{balance_line}"
             f"📅 时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         )
 
-    return gained
+    return settled_amount
 
 # ==============================================================================
 # 主循环
