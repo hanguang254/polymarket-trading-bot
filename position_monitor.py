@@ -107,6 +107,12 @@ TAIL_ORACLE_RECOVER_RATIO = 0.5
 TAIL_ORACLE_VOL_MULT = 3.0
 TAIL_ORACLE_PRICE_BPS_FLOOR = 0.00005
 
+# 快市场领先观测（仅告警，不改变任何交易决策）
+ENABLE_ORACLE_STALE_WATCH = os.environ.get("ENABLE_ORACLE_STALE_WATCH", "1").lower() in ("1", "true", "yes", "on")
+ORACLE_STALE_WATCH_MAX_REMAINING = float(os.environ.get("ORACLE_STALE_WATCH_MAX_REMAINING", "60"))
+ORACLE_STALE_WATCH_ATR = float(os.environ.get("ORACLE_STALE_WATCH_ATR", "0.5"))
+ORACLE_STALE_WATCH_CONFIRMATIONS = int(os.environ.get("ORACLE_STALE_WATCH_CONFIRMATIONS", "3"))
+
 def calc_proximity_threshold(remaining):
     """proximity zone 宽度随时间衰减：越接近到期 buffer 越窄"""
     if remaining > 180:
@@ -847,6 +853,64 @@ def _format_price_observability(crypto_debug, market_obs, atr_val, wake_context=
         if wake_label:
             parts.append(f"wake={wake_label}({wake_detail})" if wake_detail else f"wake={wake_label}")
     return " | ".join(parts)
+
+
+def evaluate_oracle_stale_watch(crypto_debug, atr_val, remaining, streak=0, was_active=False):
+    """观测官方价(CL)是否明显落后于快市场(Binance)，仅返回告警状态。"""
+    state = {
+        "eligible": False,
+        "condition": False,
+        "active": False,
+        "triggered": False,
+        "recovered": bool(was_active),
+        "next_streak": 0,
+        "required_confirms": ORACLE_STALE_WATCH_CONFIRMATIONS,
+        "skew": None,
+        "skew_atr": None,
+        "cl_age_ms": None,
+        "cl_source_age_ms": None,
+        "bn_age_ms": None,
+        "bn_source_age_ms": None,
+    }
+    if not ENABLE_ORACLE_STALE_WATCH:
+        state["recovered"] = False
+        return state
+    if remaining is None or remaining > ORACLE_STALE_WATCH_MAX_REMAINING:
+        return state
+    if atr_val is None or atr_val <= 0:
+        return state
+
+    cl_snapshot = crypto_debug.get("chainlink") if isinstance(crypto_debug, dict) else None
+    bn_snapshot = crypto_debug.get("binance") if isinstance(crypto_debug, dict) else None
+    if not isinstance(cl_snapshot, dict) or not isinstance(bn_snapshot, dict):
+        return state
+
+    cl_price = _safe_float(cl_snapshot.get("price"))
+    bn_price = _safe_float(bn_snapshot.get("price"))
+    if cl_price is None or bn_price is None:
+        return state
+
+    skew = cl_price - bn_price
+    skew_atr = abs(skew) / atr_val
+    condition = skew_atr >= ORACLE_STALE_WATCH_ATR
+    next_streak = streak + 1 if condition else 0
+    active = condition and next_streak >= ORACLE_STALE_WATCH_CONFIRMATIONS
+
+    state.update({
+        "eligible": True,
+        "condition": condition,
+        "active": active,
+        "triggered": (not was_active) and active,
+        "recovered": was_active and not active,
+        "next_streak": next_streak,
+        "skew": skew,
+        "skew_atr": skew_atr,
+        "cl_age_ms": cl_snapshot.get("age_ms"),
+        "cl_source_age_ms": cl_snapshot.get("source_age_ms"),
+        "bn_age_ms": bn_snapshot.get("age_ms"),
+        "bn_source_age_ms": bn_snapshot.get("source_age_ms"),
+    })
+    return state
 
 
 def _get_fresh_exit_quote(token_id, price_hint=None):
@@ -2371,6 +2435,11 @@ def monitor():
     print("   Exit Protocol: P0双曲止盈 | ATR衰减止损 | ATR加速下降 | -25%硬止损 | 方向翻转 | ATR≥2抄底 | ATR<1止损 | 尾盘Oracle状态机")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
     print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%(时间衰减) | streak衰减+8轮滑动窗口")
+    if ENABLE_ORACLE_STALE_WATCH:
+        print(
+            f"   Oracle Lead Watch: <= {ORACLE_STALE_WATCH_MAX_REMAINING:.0f}s | "
+            f"|CL-BN|≥{ORACLE_STALE_WATCH_ATR:.2f}ATR × {ORACLE_STALE_WATCH_CONFIRMATIONS} | 仅告警"
+        )
 
     close_attempts = {}  # (slug, entry_time) -> attempts count
     stop_loss_attempts = {}  # (slug, entry_time) -> stop loss attempts
@@ -2386,6 +2455,8 @@ def monitor():
     close_intents = {}  # (slug, entry_time) -> {"reason": str}
     tail_oracle_prices = {}  # (slug, entry_time) -> deque(maxlen=7) 最近oracle价格
     tail_oracle_wrong_streak = {}  # (slug, entry_time) -> 尾盘oracle错误确认计数
+    oracle_stale_watch_streak = {}  # (slug, entry_time) -> CL-BN 持续偏离确认轮数（仅告警）
+    oracle_stale_watch_active = {}  # (slug, entry_time) -> 是否已进入快市场领先告警态
     last_wake_context = {"label": "startup", "detail": None}
     
     while True:
@@ -2412,6 +2483,8 @@ def monitor():
             close_intents = {k: v for k, v in close_intents.items() if k in open_keys}
             tail_oracle_prices = {k: v for k, v in tail_oracle_prices.items() if k in open_keys}
             tail_oracle_wrong_streak = {k: v for k, v in tail_oracle_wrong_streak.items() if k in open_keys}
+            oracle_stale_watch_streak = {k: v for k, v in oracle_stale_watch_streak.items() if k in open_keys}
+            oracle_stale_watch_active = {k: v for k, v in oracle_stale_watch_active.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -2525,6 +2598,21 @@ def monitor():
                 
                 profit_rate = (current_price - entry_price) / entry_price if entry_price > 0 else 0
                 atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
+                oracle_watch = evaluate_oracle_stale_watch(
+                    crypto_debug,
+                    atr_val,
+                    remaining,
+                    oracle_stale_watch_streak.get(attempt_key, 0),
+                    oracle_stale_watch_active.get(attempt_key, False),
+                )
+                if oracle_watch["next_streak"] > 0:
+                    oracle_stale_watch_streak[attempt_key] = oracle_watch["next_streak"]
+                else:
+                    oracle_stale_watch_streak.pop(attempt_key, None)
+                if oracle_watch["active"]:
+                    oracle_stale_watch_active[attempt_key] = True
+                else:
+                    oracle_stale_watch_active.pop(attempt_key, None)
 
                 # 用加密货币价格判断实际方向（不依赖可能失真的 token 价格）
                 if ptb_price and crypto_price:
@@ -2580,6 +2668,20 @@ def monitor():
                 observability = _format_price_observability(crypto_debug, market_obs, atr_val, last_wake_context)
                 if observability:
                     print(f"  📡 源观测: {observability}")
+                if oracle_watch["triggered"]:
+                    print(
+                        f"  ⚠️ 快市场领先告警(CL-BN): {oracle_watch['skew']:+.2f} "
+                        f"({oracle_watch['skew_atr']:+.2f}ATR) | "
+                        f"{oracle_watch['next_streak']}/{oracle_watch['required_confirms']}轮确认 | "
+                        f"CL={_format_age_ms(oracle_watch.get('cl_age_ms'))}/src={_format_age_ms(oracle_watch.get('cl_source_age_ms'))} "
+                        f"BN={_format_age_ms(oracle_watch.get('bn_age_ms'))}/src={_format_age_ms(oracle_watch.get('bn_source_age_ms'))} | "
+                        f"剩余{remaining:.0f}s"
+                    )
+                elif oracle_watch["recovered"]:
+                    skew_label = "N/A"
+                    if oracle_watch["skew"] is not None and oracle_watch["skew_atr"] is not None:
+                        skew_label = f"{oracle_watch['skew']:+.2f} ({oracle_watch['skew_atr']:+.2f}ATR)"
+                    print(f"  ✅ 快市场领先恢复(CL-BN): {skew_label} | 剩余{remaining:.0f}s")
                 if tail_info and tail_info["active"]:
                     median_gap = tail_info["median_gap"]
                     enter_margin = tail_info["enter_margin"]

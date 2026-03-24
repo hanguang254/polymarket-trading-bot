@@ -725,6 +725,47 @@ class TestCryptoPriceObservability(unittest.TestCase):
         self.assertIn("wake=chainlink_push(BTC/18ms)", line)
 
 
+class TestOracleStaleWatch(unittest.TestCase):
+    def test_oracle_stale_watch_triggers_after_required_confirmations(self):
+        crypto_debug = {
+            "chainlink": {"price": 71240.0, "age_ms": 420.0, "source_age_ms": 1600.0},
+            "binance": {"price": 71265.0, "age_ms": 80.0, "source_age_ms": 120.0},
+        }
+
+        info1 = pm.evaluate_oracle_stale_watch(crypto_debug, atr_val=40.0, remaining=35, streak=0, was_active=False)
+        info2 = pm.evaluate_oracle_stale_watch(crypto_debug, atr_val=40.0, remaining=35, streak=info1["next_streak"], was_active=info1["active"])
+        info3 = pm.evaluate_oracle_stale_watch(crypto_debug, atr_val=40.0, remaining=35, streak=info2["next_streak"], was_active=info2["active"])
+
+        self.assertTrue(info1["condition"])
+        self.assertEqual(info1["next_streak"], 1)
+        self.assertFalse(info1["active"])
+        self.assertFalse(info1["triggered"])
+
+        self.assertEqual(info2["next_streak"], 2)
+        self.assertFalse(info2["active"])
+
+        self.assertEqual(info3["next_streak"], pm.ORACLE_STALE_WATCH_CONFIRMATIONS)
+        self.assertTrue(info3["active"])
+        self.assertTrue(info3["triggered"])
+        self.assertAlmostEqual(info3["skew"], -25.0)
+        self.assertAlmostEqual(info3["skew_atr"], 25.0 / 40.0)
+
+    def test_oracle_stale_watch_recovers_when_skew_falls_back(self):
+        crypto_debug = {
+            "chainlink": {"price": 71240.0, "age_ms": 420.0, "source_age_ms": 1600.0},
+            "binance": {"price": 71248.0, "age_ms": 70.0, "source_age_ms": 100.0},
+        }
+
+        info = pm.evaluate_oracle_stale_watch(crypto_debug, atr_val=40.0, remaining=34, streak=3, was_active=True)
+
+        self.assertTrue(info["eligible"])
+        self.assertFalse(info["condition"])
+        self.assertEqual(info["next_streak"], 0)
+        self.assertFalse(info["active"])
+        self.assertFalse(info["triggered"])
+        self.assertTrue(info["recovered"])
+
+
 class TestGetBestBid(unittest.TestCase):
     """get_best_bid: 止盈卖出价（含0.99折扣）"""
 
