@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.6
+# Polymarket Trading Bot v10.6.1
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -99,6 +99,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Empty Book Fallback (Monitor)**: `get_best_bid()` / `get_best_ask()` fall back to `last-trade-price ± SLIPPAGE` when CLOB is empty (bid ≤ 0.02 or ask ≥ 0.95). Enables hedge and stop-loss decisions with real market prices instead of $0.01/$0.99.
 - **EV Sanity Check (Stage 3/4)**: When EV says "hold" but `last-trade-price < entry_price × 0.5` (market price halved), overrides EV to negative — prevents holding to settlement on fake positive EV.
 - **Post-Close Safety**: No sell logic runs after market close (remaining < 0), preventing direction flicker from causing unwanted trades.
+- **尾盘 Oracle 确认状态机**: 剩余 ≤60s 时方向判定切换为 `classify_tail_oracle_state()`：收集最近 7 个 oracle 价格（`TAIL_ORACLE_WINDOW`），用 median 去单点 Chainlink spike，MAD × 3.0 + ATR floor 做 hysteresis 阈值。状态机: warming → correct/noise/wrong_pending → wrong_confirmed。仅 `wrong_confirmed`（连续确认轮数达标：≤30s 需 3 轮，30-60s 需 2 轮）时才触发止损，防止单个 tick 插针误杀赢单。尾盘期间 proximity buffer 不再覆盖方向信号。
 - **3-Stage Graduated Exit**: For remaining edge cases — Stage 2 (120-60s) with batch orders, Stage 3 (60-30s) aggressive, Stage 4 (30-0s) EV≥0 hold / EV<0 floor prices.
 - **平仓锁定机制 (Close Intent)**: 止损决策触发时，`_arm_close_intent()` 将平仓意图持久化到持仓记录（reason + timestamp）。若当轮卖出失败（网络/深度问题），下一轮循环检测到 `close_intent_active` 后直接进入卖出流程，跳过所有条件判断。确保止损决策不因轮询间歇而丢失。所有止损路径（ATR衰减/ATR加速/硬止损/方向翻转/ATR矩阵/方向错误）均已接入。
 - **止损卖出重试**: `market_sell_immediate()` 新增 `max_retries` 参数（默认3），每次重试调用 `_get_fresh_exit_quote()` 刷新盘口定价，替代旧的单次固定降价策略。

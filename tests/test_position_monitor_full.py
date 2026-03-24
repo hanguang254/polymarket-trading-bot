@@ -162,6 +162,91 @@ class TestDirectionFlipConfirms(unittest.TestCase):
         self.assertEqual(pm.get_direction_flip_required_confirms(0.3, 45), 2)
 
 
+class TestTailOracleState(unittest.TestCase):
+    """尾盘 oracle 状态机: median 去 spike + hysteresis + 连续确认。"""
+
+    def test_warming_state_requires_minimum_samples(self):
+        state = pm.classify_tail_oracle_state(
+            "DOWN",
+            100.0,
+            1.0,
+            [100.4, 100.6],
+            20,
+            wrong_streak=2,
+        )
+        self.assertTrue(state["active"])
+        self.assertEqual(state["state"], "warming")
+        self.assertTrue(state["effective_direction_correct"])
+        self.assertEqual(state["wrong_streak"], 0)
+
+    def test_single_tail_spike_is_filtered(self):
+        state = pm.classify_tail_oracle_state(
+            "DOWN",
+            100.0,
+            1.0,
+            [99.8, 99.7, 100.9],
+            20,
+            wrong_streak=0,
+        )
+        self.assertEqual(state["state"], "correct")
+        self.assertTrue(state["effective_direction_correct"])
+        self.assertFalse(state["wrong_signal"])
+
+    def test_final_30s_needs_three_confirms(self):
+        state = pm.classify_tail_oracle_state(
+            "DOWN",
+            100.0,
+            1.0,
+            [100.4, 100.6, 100.8, 100.7, 100.9],
+            25,
+            wrong_streak=1,
+        )
+        self.assertEqual(state["required_confirms"], 3)
+        self.assertEqual(state["state"], "wrong_pending")
+        self.assertTrue(state["effective_direction_correct"])
+        self.assertFalse(state["raw_direction_correct"])
+        self.assertEqual(state["wrong_streak"], 2)
+
+    def test_final_30s_confirms_after_third_read(self):
+        state = pm.classify_tail_oracle_state(
+            "DOWN",
+            100.0,
+            1.0,
+            [100.4, 100.6, 100.8, 100.7, 100.9],
+            25,
+            wrong_streak=2,
+        )
+        self.assertEqual(state["state"], "wrong_confirmed")
+        self.assertFalse(state["effective_direction_correct"])
+        self.assertEqual(state["wrong_streak"], 3)
+
+    def test_30_to_60s_confirms_faster(self):
+        state = pm.classify_tail_oracle_state(
+            "DOWN",
+            100.0,
+            1.0,
+            [100.4, 100.6, 100.8, 100.7, 100.9],
+            45,
+            wrong_streak=1,
+        )
+        self.assertEqual(state["required_confirms"], 2)
+        self.assertEqual(state["state"], "wrong_confirmed")
+        self.assertFalse(state["effective_direction_correct"])
+
+    def test_noise_decays_existing_wrong_streak(self):
+        state = pm.classify_tail_oracle_state(
+            "DOWN",
+            100.0,
+            1.0,
+            [99.95, 100.05, 100.00, 99.98, 100.02],
+            20,
+            wrong_streak=2,
+        )
+        self.assertEqual(state["state"], "noise")
+        self.assertEqual(state["wrong_streak"], 1)
+        self.assertTrue(state["effective_direction_correct"])
+
+
 class TestComputeP0ProfitThreshold(unittest.TestCase):
     """compute_p0_profit_threshold: 双曲贴现止盈阈值"""
 

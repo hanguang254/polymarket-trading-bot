@@ -11,6 +11,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
+from statistics import median
 import requests
 from ai_trader.polymarket_api import normalize_orderbook, get_price_to_beat_api
 from ai_trader import clob_client
@@ -98,6 +99,14 @@ ATR_DECAY_CONFIRMATIONS = int(os.environ.get("ATR_DECAY_CONFIRMATIONS", "3"))  #
 ENABLE_DIRECTION_DOWNGRADE = os.environ.get("ENABLE_DIRECTION_DOWNGRADE", "0").lower() in ("1", "true", "yes", "on")
 ATR_DOWNGRADE_THRESHOLD = float(os.environ.get("ATR_DOWNGRADE_THRESHOLD", "0.15"))
 
+# 尾盘（<=60s）改用 oracle 确认状态机，避免单个 Chainlink tick 插针误杀
+TAIL_ORACLE_WINDOW = 7
+TAIL_ORACLE_MIN_SAMPLES = 3
+TAIL_ORACLE_ENTER_ATR_FLOOR = 0.25
+TAIL_ORACLE_RECOVER_RATIO = 0.5
+TAIL_ORACLE_VOL_MULT = 3.0
+TAIL_ORACLE_PRICE_BPS_FLOOR = 0.00005
+
 def calc_proximity_threshold(remaining):
     """proximity zone 宽度随时间衰减：越接近到期 buffer 越窄"""
     if remaining > 180:
@@ -160,6 +169,115 @@ def get_direction_flip_required_confirms(diff_atr, remaining):
     if remaining > 60:
         return 3
     return 2
+
+
+def calc_signed_direction_gap(direction, crypto_price, ptb_price):
+    """返回带方向的 gap: >0 表示在正确侧，<0 表示在错误侧。"""
+    if crypto_price is None or ptb_price is None:
+        return None
+    if direction == "UP":
+        return crypto_price - ptb_price
+    if direction == "DOWN":
+        return ptb_price - crypto_price
+    return None
+
+
+def get_tail_oracle_confirmations(remaining):
+    """尾盘越接近结算，要求更多 oracle 连续确认。"""
+    if remaining <= 30:
+        return 3
+    if remaining <= 60:
+        return 2
+    return 1
+
+
+def classify_tail_oracle_state(direction, ptb_price, atr_val, recent_prices, remaining, wrong_streak=0):
+    """
+    尾盘 oracle-only 状态机:
+    - 最近价格用 median 去单点 spike
+    - 用 MAD + ATR floor 做 hysteresis
+    - 只有 confirmed wrong 才允许把方向视为错误
+    """
+    inactive = {
+        "active": False,
+        "state": "inactive",
+        "wrong_signal": False,
+        "effective_direction_correct": None,
+        "raw_direction_correct": None,
+        "wrong_streak": 0,
+        "required_confirms": get_tail_oracle_confirmations(remaining),
+        "median_gap": None,
+        "enter_margin": None,
+        "recover_margin": None,
+        "mad_gap": None,
+    }
+    if remaining > 60 or direction not in ("UP", "DOWN") or ptb_price is None:
+        return inactive
+
+    gaps = []
+    for price in recent_prices or []:
+        gap = calc_signed_direction_gap(direction, price, ptb_price)
+        if gap is not None:
+            gaps.append(gap)
+    if not gaps:
+        return inactive
+
+    required_confirms = get_tail_oracle_confirmations(remaining)
+    latest_gap = gaps[-1]
+    if len(gaps) < TAIL_ORACLE_MIN_SAMPLES:
+        return {
+            "active": True,
+            "state": "warming",
+            "wrong_signal": False,
+            "effective_direction_correct": True,
+            "raw_direction_correct": True,
+            "wrong_streak": 0,
+            "required_confirms": required_confirms,
+            "median_gap": latest_gap,
+            "enter_margin": None,
+            "recover_margin": None,
+            "mad_gap": None,
+        }
+
+    median_gap = median(gaps)
+    deviations = [abs(gap - median_gap) for gap in gaps]
+    mad_gap = median(deviations) if deviations else 0.0
+    atr_floor = atr_val * TAIL_ORACLE_ENTER_ATR_FLOOR if atr_val and atr_val > 0 else 0.0
+    price_floor = abs(ptb_price) * TAIL_ORACLE_PRICE_BPS_FLOOR
+    enter_margin = max(mad_gap * TAIL_ORACLE_VOL_MULT, atr_floor, price_floor)
+    recover_margin = max(enter_margin * TAIL_ORACLE_RECOVER_RATIO, price_floor * TAIL_ORACLE_RECOVER_RATIO)
+
+    wrong_signal = median_gap <= -enter_margin
+    correct_signal = median_gap >= recover_margin
+    if wrong_signal:
+        next_streak = wrong_streak + 1
+    elif correct_signal:
+        next_streak = 0
+    else:
+        next_streak = max(0, wrong_streak - 1)
+
+    if wrong_signal and next_streak >= required_confirms:
+        state = "wrong_confirmed"
+    elif wrong_signal:
+        state = "wrong_pending"
+    elif correct_signal:
+        state = "correct"
+    else:
+        state = "noise"
+
+    return {
+        "active": True,
+        "state": state,
+        "wrong_signal": wrong_signal,
+        "effective_direction_correct": state != "wrong_confirmed",
+        "raw_direction_correct": not wrong_signal,
+        "wrong_streak": next_streak,
+        "required_confirms": required_confirms,
+        "median_gap": median_gap,
+        "enter_margin": enter_margin,
+        "recover_margin": recover_margin,
+        "mad_gap": mad_gap,
+    }
 
 # 链上余额预缓存（止损时避免临时查链增加延迟）
 # {token_id: (balance, timestamp)}
@@ -2105,8 +2223,8 @@ def monitor():
     _poly_ws.start()
     _ws_subscribed = set()  # 已订阅的 token_ids
     _src_label = "Chainlink优先" if PRICE_SOURCE == 1 else "Pyth优先"
-    print(f"🔍 持仓监控 v9.8 启动（ATR三层决策 + {_src_label}止损优化 + Proximity衰减streak）...")
-    print("   Exit Protocol: P0双曲止盈 | ATR衰减止损 | ATR加速下降 | -25%硬止损 | 方向翻转 | ATR≥2抄底 | ATR<1止损")
+    print(f"🔍 持仓监控 v9.8 启动（ATR三层决策 + {_src_label}止损优化 + Proximity衰减streak + 尾盘Oracle确认）...")
+    print("   Exit Protocol: P0双曲止盈 | ATR衰减止损 | ATR加速下降 | -25%硬止损 | 方向翻转 | ATR≥2抄底 | ATR<1止损 | 尾盘Oracle状态机")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
     print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%(时间衰减) | streak衰减+8轮滑动窗口")
 
@@ -2122,6 +2240,8 @@ def monitor():
     entry_atr = {}  # (slug, entry_time) -> 入场时的ATR值
     atr_decay_confirm_streak = {}  # (slug, entry_time) -> ATR衰减止损连续确认次数
     close_intents = {}  # (slug, entry_time) -> {"reason": str}
+    tail_oracle_prices = {}  # (slug, entry_time) -> deque(maxlen=7) 最近oracle价格
+    tail_oracle_wrong_streak = {}  # (slug, entry_time) -> 尾盘oracle错误确认计数
     
     while True:
         try:
@@ -2145,6 +2265,8 @@ def monitor():
             entry_atr = {k: v for k, v in entry_atr.items() if k in open_keys}
             atr_decay_confirm_streak = {k: v for k, v in atr_decay_confirm_streak.items() if k in open_keys}
             close_intents = {k: v for k, v in close_intents.items() if k in open_keys}
+            tail_oracle_prices = {k: v for k, v in tail_oracle_prices.items() if k in open_keys}
+            tail_oracle_wrong_streak = {k: v for k, v in tail_oracle_wrong_streak.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -2255,20 +2377,49 @@ def monitor():
                     continue
                 
                 profit_rate = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+                atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
 
-                # PTB 在下注时已记录，直接从持仓数据读取
-                is_losing = is_losing_direction(direction, crypto_price, ptb_price, remaining) if ptb_price and crypto_price else False
-                # 只有在 remaining <= 60 且方向正确时才算"必赢"，避免 is_losing_direction 在 >60s 时返回 False 导致误判
-                if ptb_price and crypto_price and remaining <= 60:
-                    is_winning = (direction == "UP" and crypto_price > ptb_price) or (direction == "DOWN" and crypto_price < ptb_price)
-                else:
-                    is_winning = False
-                
                 # 用加密货币价格判断实际方向（不依赖可能失真的 token 价格）
                 if ptb_price and crypto_price:
-                    direction_correct = (direction == "UP" and crypto_price > ptb_price) or (direction == "DOWN" and crypto_price < ptb_price)
+                    single_tick_direction_correct = (
+                        (direction == "UP" and crypto_price > ptb_price) or
+                        (direction == "DOWN" and crypto_price < ptb_price)
+                    )
                 else:
-                    direction_correct = None
+                    single_tick_direction_correct = None
+
+                tail_info = None
+                direction_signal_correct = single_tick_direction_correct
+                direction_correct = single_tick_direction_correct
+                if ptb_price and crypto_price and remaining <= 60:
+                    history = tail_oracle_prices.setdefault(attempt_key, deque(maxlen=TAIL_ORACLE_WINDOW))
+                    history.append(crypto_price)
+                    tail_info = classify_tail_oracle_state(
+                        direction,
+                        ptb_price,
+                        atr_val,
+                        list(history),
+                        remaining,
+                        tail_oracle_wrong_streak.get(attempt_key, 0),
+                    )
+                    if tail_info["active"]:
+                        tail_oracle_wrong_streak[attempt_key] = tail_info["wrong_streak"]
+                        direction_signal_correct = tail_info["raw_direction_correct"]
+                        direction_correct = tail_info["effective_direction_correct"]
+                    else:
+                        tail_oracle_wrong_streak.pop(attempt_key, None)
+                else:
+                    tail_oracle_wrong_streak.pop(attempt_key, None)
+
+                # PTB 在下注时已记录，直接从持仓数据读取
+                is_losing = bool(tail_info and tail_info["active"] and tail_info["state"] == "wrong_confirmed")
+                is_winning = bool(tail_info and tail_info["active"] and direction_correct is True)
+                if not (tail_info and tail_info["active"]):
+                    is_losing = is_losing_direction(direction, crypto_price, ptb_price, remaining) if ptb_price and crypto_price else False
+                    if ptb_price and crypto_price and remaining <= 60:
+                        is_winning = (direction == "UP" and crypto_price > ptb_price) or (direction == "DOWN" and crypto_price < ptb_price)
+                    else:
+                        is_winning = False
 
                 status = "🟢赢" if is_winning else "🔴输" if is_losing else "⚪"
                 # 补充显示：用加密货币方向替代可能失真的 token 利润率
@@ -2287,6 +2438,24 @@ def monitor():
                     print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status} | 方向{dir_icon}{crypto_label}")
                 else:
                     print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status}{crypto_label}")
+                if tail_info and tail_info["active"]:
+                    median_gap = tail_info["median_gap"]
+                    enter_margin = tail_info["enter_margin"]
+                    median_gap_atr = (median_gap / atr_val) if median_gap is not None and atr_val else None
+                    enter_margin_atr = (enter_margin / atr_val) if enter_margin is not None and atr_val else None
+                    if tail_info["state"] == "wrong_pending":
+                        gap_label = f"{median_gap_atr:+.2f}ATR" if median_gap_atr is not None else f"${median_gap:+.2f}"
+                        margin_label = f"{enter_margin_atr:.2f}ATR" if enter_margin_atr is not None else f"${enter_margin:.2f}"
+                        print(
+                            f"  ⏸️ 尾盘Oracle待确认: {tail_info['wrong_streak']}/{tail_info['required_confirms']}轮 | "
+                            f"median={gap_label} <= -{margin_label}"
+                        )
+                    elif tail_info["state"] == "wrong_confirmed":
+                        gap_label = f"{median_gap_atr:+.2f}ATR" if median_gap_atr is not None else f"${median_gap:+.2f}"
+                        print(f"  🚨 尾盘Oracle确认翻面: median={gap_label} | 连续{tail_info['wrong_streak']}轮")
+                    elif single_tick_direction_correct is False and direction_correct is True:
+                        gap_label = f"{median_gap_atr:+.2f}ATR" if median_gap_atr is not None else f"${median_gap:+.2f}"
+                        print(f"  🔶 尾盘Oracle过滤单tick反向: median={gap_label} | state={tail_info['state']}")
 
                 sold = False
                 sold_price = 0
@@ -2460,7 +2629,6 @@ def monitor():
                                 print(f"  [P0] Triggered but no executable price | remaining {remaining:.0f}s")
                 # ═══ ATR 三层决策矩阵（替代旧Token暴跌熔断+亏损熔断+方向持有）═══
                 # 获取 ATR 偏离（crypto 离 PTB 多远，以 ATR 倍数计）
-                atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
                 _, _, diff_atr = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val, entry_price)
                 atr_str = f"{diff_atr:.1f}ATR" if diff_atr else "N/A"
 
@@ -2502,9 +2670,9 @@ def monitor():
 
                 # --- PTB Proximity Buffer: crypto在PTB附近时冻结方向信号 ---
                 # 保存 proximity override 前的原始方向，用于 streak 计数
-                raw_direction_correct = direction_correct
+                raw_direction_correct = direction_signal_correct if tail_info and tail_info["active"] else direction_correct
                 in_proximity = False
-                if diff_atr is not None and crypto_price and ptb_price:
+                if diff_atr is not None and crypto_price and ptb_price and not (tail_info and tail_info["active"]):
                     prox_threshold = calc_proximity_threshold(remaining)
                     in_proximity = diff_atr < prox_threshold
 
