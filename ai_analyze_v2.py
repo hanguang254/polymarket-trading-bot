@@ -394,7 +394,8 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     filter_label = f" [{details.get('trend_15m_filter', '')}]" if details.get("trend_15m_filter") else ""
     details["bet_reason"] = (
         f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
-        f"ev={ev:+.4f}({'✅' if ev>ev_threshold else '❌'}>{ev_threshold:.3f}[adapt],扣spread{spread_cost:.3f}) "
+        f"ev={ev:+.4f}({'✅' if ev>ev_threshold else '❌'}>{ev_threshold:.3f}[adapt],"
+        f"gross={ev_gross:+.3f},spread={spread_cost:.3f},fee_in={entry_fee_cost:.3f},fee_out={exit_fee_cost:.3f}) "
         f"p_win={p_win:.3f} rw={rw_p_win:.3f} base={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "

@@ -1084,6 +1084,14 @@ class MarketTracker:
         show_price_label = "CLOB" if 'exec_discount' in details else "Gamma"
         exec_price_str = f" | 执行价=${details.get('exec_price',0):.3f}" if 'exec_price' in details else f" | Gamma={details.get('leading_odds',0):.3f}"
         logger.info(f"  💵 折价({show_price_label}): ${show_discount:.3f} | 估值: ${details.get('estimated_value',0):.2f} | ATR偏离: {details.get('diff_in_atr',0):.2f}{exec_price_str}")
+        if 'ev_gross' in details:
+            logger.info(
+                f"  📐 EV拆解: gross={details.get('ev_gross',0):+.3f}"
+                f" - spread={details.get('spread_cost',0):.3f}"
+                f" - 入场费={details.get('entry_fee_cost',0):.3f}"
+                f" - 预期出场费={details.get('expected_exit_fee_cost',0):.3f}"
+                f" = {details.get('expected_value',0):+.3f}"
+            )
         if details.get("clob_empty_book"):
             logger.info(f"  📡 空簿校准: 执行价=${details.get('exec_price',0):.3f} (原ask=${details.get('clob_raw_ask',0):.3f})")
         
