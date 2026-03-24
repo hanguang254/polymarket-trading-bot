@@ -199,28 +199,44 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     # 贝叶斯后验融合
     bayesian_info = extra_info.get("bayesian") if extra_info else None
     if bayesian_info:
-        b_p_hat = bayesian_info.get("p_hat", 0.5)
-        bayesian_conf = bayesian_info.get("confidence", 0)
-        bayesian_dir = bayesian_info.get("direction", direction)
+        gate_p_hat = bayesian_info.get("p_hat", 0.5)
+        gate_conf = bayesian_info.get("confidence", 0)
+        gate_dir = bayesian_info.get("direction", direction)
+        incremental_p_hat = bayesian_info.get("incremental_p_hat", gate_p_hat)
+        incremental_conf = bayesian_info.get("incremental_confidence", gate_conf)
+        incremental_dir = bayesian_info.get("incremental_direction", gate_dir)
+        state_conf = bayesian_info.get("state_confidence", 0)
 
         # 早期窗口融合门槛与入场门槛对齐(0.15)，避免死区
         is_early_window = extra_info.get("early_window", False) if extra_info else False
         fusion_threshold = 0.15 if is_early_window else 0.3
-        if bayesian_dir == direction and bayesian_conf > fusion_threshold:
-            # 贝叶斯融合：只能提升 p_win，不能降低（random walk 已是合理下界）
-            fused_p = p_win * 0.4 + b_p_hat * 0.6
+
+        if gate_dir == direction and incremental_dir == direction and incremental_conf > fusion_threshold:
+            # 仅用“增量后验”参与 p_win 融合，避免把 state probability 双重计入 EV。
+            fused_p = p_win * 0.4 + incremental_p_hat * 0.6
             p_win = max(p_win, fused_p)
-            confidence = confidence * 0.4 + bayesian_conf * 0.6
+            confidence = confidence * 0.4 + gate_conf * 0.6
             details["confidence_source"] = "bayesian_fused"
-        elif bayesian_dir != direction:
+        elif gate_dir == direction and gate_conf > fusion_threshold:
+            # gate 方向与主模型一致，但增量证据偏弱时，只温和提升整体置信度。
+            confidence = confidence * 0.5 + gate_conf * 0.5
+            details["confidence_source"] = "bayesian_gate_support"
+        elif incremental_dir != direction and incremental_conf > fusion_threshold:
             confidence = confidence * 0.5
-            details["confidence_source"] = "bayesian_conflict"
+            details["confidence_source"] = "bayesian_incremental_conflict"
+        elif gate_dir != direction and gate_conf > fusion_threshold:
+            confidence *= 0.75
+            details["confidence_source"] = "bayesian_gate_conflict"
         else:
             details["confidence_source"] = "discount_only"
 
-        details["bayesian_p_hat"] = round(b_p_hat, 4)
-        details["bayesian_confidence"] = round(bayesian_conf, 4)
-        details["bayesian_direction"] = bayesian_dir
+        details["bayesian_p_hat"] = round(gate_p_hat, 4)
+        details["bayesian_confidence"] = round(gate_conf, 4)
+        details["bayesian_direction"] = gate_dir
+        details["bayesian_incremental_p_hat"] = round(incremental_p_hat, 4)
+        details["bayesian_incremental_confidence"] = round(incremental_conf, 4)
+        details["bayesian_incremental_direction"] = incremental_dir
+        details["bayesian_state_confidence"] = round(state_conf, 4) if state_conf is not None else None
 
     P_WIN_CAP = float(os.environ.get("P_WIN_CAP", "0.92"))
     p_win = min(p_win, P_WIN_CAP)  # P1: 防止贝叶斯累积推高 p_win (env可配置)

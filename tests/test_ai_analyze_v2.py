@@ -230,5 +230,105 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
         self.assertGreater(record["buy_fee_shares"], 0.06)
 
 
+class TestBayesianFusionModes(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.prev_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        os.makedirs("logs", exist_ok=True)
+
+    def tearDown(self):
+        os.chdir(self.prev_cwd)
+        self.tmpdir.cleanup()
+
+    def _base_details(self):
+        return {
+            "target_odds": 0.40,
+            "price_diff": 60.0,
+            "atr": 55.0,
+            "diff_in_atr": 2.2,
+            "estimated_value": 0.80,
+            "trend_15m_alignment": "neutral",
+        }
+
+    def test_gate_support_boosts_confidence_without_repricing_p_win(self):
+        base_details = self._base_details()
+        rw_p_win = ai_analyze_v2._random_walk_p_win(60.0, 55.0, 260)
+
+        with patch.dict(os.environ, {
+            "MIN_CONFIDENCE": "0.40",
+            "MIN_EV": "0.01",
+            "MIN_ATR_DEVIATION": "1.5",
+            "MAX_BUY_PRICE": "0.92",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "analyze_market", return_value=("UP", 0.40, base_details.copy())):
+                with patch.object(ai_analyze_v2, "get_base_rate", return_value=0.55):
+                    with patch.object(ai_analyze_v2.clob_client, "get_fee_rate_bps", return_value=0):
+                        should_bet, direction, confidence, details = ai_analyze_v2.analyze_and_decide(
+                            "BTC",
+                            70787.02,
+                            0.40,
+                            0.60,
+                            "btc-updown-5m-test",
+                            extra_info={
+                                "remaining_seconds": 260,
+                                "bayesian": {
+                                    "direction": "UP",
+                                    "p_hat": 0.74,
+                                    "confidence": 0.48,
+                                    "incremental_direction": "DOWN",
+                                    "incremental_p_hat": 0.53,
+                                    "incremental_confidence": 0.06,
+                                    "state_confidence": 0.52,
+                                },
+                            },
+                        )
+
+        self.assertTrue(should_bet)
+        self.assertEqual(direction, "UP")
+        self.assertEqual(details["confidence_source"], "bayesian_gate_support")
+        self.assertAlmostEqual(details["p_win_final"], rw_p_win, places=4)
+        self.assertGreater(confidence, 0.40)
+
+    def test_incremental_alignment_can_improve_p_win(self):
+        base_details = self._base_details()
+        rw_p_win = ai_analyze_v2._random_walk_p_win(60.0, 55.0, 260)
+
+        with patch.dict(os.environ, {
+            "MIN_CONFIDENCE": "0.40",
+            "MIN_EV": "0.01",
+            "MIN_ATR_DEVIATION": "1.5",
+            "MAX_BUY_PRICE": "0.92",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "analyze_market", return_value=("UP", 0.40, base_details.copy())):
+                with patch.object(ai_analyze_v2, "get_base_rate", return_value=0.55):
+                    with patch.object(ai_analyze_v2.clob_client, "get_fee_rate_bps", return_value=0):
+                        should_bet, direction, confidence, details = ai_analyze_v2.analyze_and_decide(
+                            "BTC",
+                            70787.02,
+                            0.40,
+                            0.60,
+                            "btc-updown-5m-test",
+                            extra_info={
+                                "remaining_seconds": 260,
+                                "bayesian": {
+                                    "direction": "UP",
+                                    "p_hat": 0.76,
+                                    "confidence": 0.50,
+                                    "incremental_direction": "UP",
+                                    "incremental_p_hat": 0.82,
+                                    "incremental_confidence": 0.45,
+                                    "state_confidence": 0.52,
+                                },
+                            },
+                        )
+
+        self.assertTrue(should_bet)
+        self.assertEqual(direction, "UP")
+        self.assertEqual(details["confidence_source"], "bayesian_fused")
+        self.assertGreater(details["p_win_final"], rw_p_win)
+        self.assertGreater(confidence, 0.40)
+
+
 if __name__ == "__main__":
     unittest.main()

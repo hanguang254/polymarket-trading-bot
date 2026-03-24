@@ -240,6 +240,46 @@ def get_strategy_config():
     }
 
 
+def _get_bayesian_summary(updater, remaining_seconds=None):
+    """兼容新旧 updater：优先读取富摘要，旧 mock 则回退原始摘要。"""
+    if not updater:
+        return None
+
+    getter = getattr(updater, "get_summary", None)
+    if not getter:
+        return None
+
+    try:
+        summary = getter(remaining_seconds=remaining_seconds)
+    except TypeError:
+        summary = getter()
+
+    if not isinstance(summary, dict):
+        return None
+
+    return summary
+
+
+def _get_bayesian_signal(updater, remaining_seconds=None):
+    summary = _get_bayesian_summary(updater, remaining_seconds=remaining_seconds)
+    if summary:
+        return summary
+
+    if not updater:
+        return None
+
+    try:
+        direction, p_hat, confidence = updater.get_direction_and_confidence()
+    except Exception:
+        return None
+
+    return {
+        "direction": direction,
+        "p_hat": p_hat,
+        "confidence": confidence,
+    }
+
+
 def _fetch_ptb_api(slug, timeout=None, retry_attempts=None, retry_interval=None):
     """单个 PTB HTTP 获取，主路径走 crypto-price 接口，首轮无值时重复轮询。"""
     timeout = PTB_API_REQUEST_TIMEOUT if timeout is None else timeout
@@ -674,8 +714,25 @@ class MarketTracker:
                             updater = self.bayesian_updaters.get(slug)
                             if updater:
                                 updater.update(price, ptb_now)
-                                direction, p_hat, conf = updater.get_direction_and_confidence()
-                                logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap} | 贝叶斯: {direction} p̂={p_hat:.4f} conf={conf:.3f}")
+                                signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
+                                if signal:
+                                    direction = signal["direction"]
+                                    p_hat = signal["p_hat"]
+                                    conf = signal["confidence"]
+                                    source = signal.get("source")
+                                    incremental_conf = signal.get("incremental_confidence")
+                                    state_conf = signal.get("state_confidence")
+                                    extra = ""
+                                    if source:
+                                        extra = f" src={source}"
+                                    if incremental_conf is not None and state_conf is not None:
+                                        extra += f" inc={incremental_conf:.3f} state={state_conf:.3f}"
+                                    logger.info(
+                                        f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap} "
+                                        f"| 贝叶斯: {direction} p̂={p_hat:.4f} conf={conf:.3f}{extra}"
+                                    )
+                                else:
+                                    logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                             else:
                                 logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                         elif price and not ptb_now:
@@ -728,7 +785,12 @@ class MarketTracker:
 
                 # 早期门槛: 至少拿到 EARLY_MIN_SAMPLES 个样本
                 if updater and updater.n_updates >= early_min_samples and len(samples) >= early_min_samples:
-                    b_dir, b_phat, b_conf = updater.get_direction_and_confidence()
+                    bayesian_summary = _get_bayesian_signal(updater, remaining_seconds=remaining)
+                    if not bayesian_summary:
+                        continue
+                    b_dir = bayesian_summary["direction"]
+                    b_phat = bayesian_summary["p_hat"]
+                    b_conf = bayesian_summary["confidence"]
 
                     if b_conf >= 0.25:
                         gap_trend, gap_info = self._calc_gap_trend(samples)
@@ -750,7 +812,7 @@ class MarketTracker:
                             if is_reanalyze:
                                 extra_info["reanalyze"] = True
                                 extra_info["volatility_move_atr"] = skip_info.get("move_atr", 0)
-                            extra_info["bayesian"] = updater.get_summary()
+                            extra_info["bayesian"] = bayesian_summary
                             reanalyze_tag = " [重分析]" if is_reanalyze else ""
                             logger.info(
                                 f"\n⚡ 早期下注窗口{reanalyze_tag}: {market['coin']} "
@@ -791,7 +853,10 @@ class MarketTracker:
                 # 贝叶斯后验结果
                 updater = self.bayesian_updaters.get(slug)
                 if updater and updater.n_updates >= strategy_cfg["late_min_updates"]:
-                    bayesian_summary = updater.get_summary()
+                    bayesian_summary = _get_bayesian_signal(updater, remaining_seconds=remaining)
+                    if not bayesian_summary:
+                        logger.info(f"\n📊 无贝叶斯数据，使用gap趋势: {gap_trend}")
+                        continue
                     extra_info["bayesian"] = bayesian_summary
                     b_dir = bayesian_summary["direction"]
                     b_phat = bayesian_summary["p_hat"]
@@ -821,7 +886,8 @@ class MarketTracker:
                 if gap_trend == "穿越":
                     # 但如果贝叶斯置信度很高（>60%），仍允许交易
                     if updater and updater.n_updates >= strategy_cfg["late_min_updates"]:
-                        b_conf = updater.get_direction_and_confidence()[2]
+                        signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
+                        b_conf = signal["confidence"] if signal else 0
                         if b_conf >= strategy_cfg["late_gap_cross_allow_conf"]:
                             logger.info(f"  ✅ gap穿越但贝叶斯置信度高({b_conf:.3f})，允许交易")
                         else:

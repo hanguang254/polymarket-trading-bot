@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.5.6
+# Polymarket Trading Bot v10.6
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -52,7 +52,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Strict Binary EV**: `EV = p_win - price` (replaces discount/odds ratio). Minimum edge required (configurable via `MIN_EV`).
 - **Early Bet Window (90-95s)**: Enters before CLOB fully prices in, with lower thresholds (`EARLY_MIN_EV`, `EARLY_MIN_CONFIDENCE`). Captures mispricing before market makers adjust.
 - **5-min K-line Trend Filter**: Checks Binance 5-min candle trend (same timeframe as market) to avoid counter-trend trades. Replaces 15-min filter which was too slow for 5-minute markets.
-- **Bayesian Fusion**: Base rate (40%) + Bayesian posterior (60%) when direction-aligned with confidence > 30%.
+- **Bayesian Fusion (v2.1 Gate)**: 贝叶斯引擎升级为增量信号(Δprice) + 状态信号(gap/ATR/剩余时间) 双通道。`_gate_signal()` 融合两路信号（方向一致时 state 权重 65%，冲突时 85%），输出统一的 direction/confidence 供预筛和 EV 计算。p_win 融合仅使用增量后验（避免 state probability 双重计入 EV），gate confidence 用于整体置信度。持续方向翻面时执行软重置（`_maybe_soft_reset`，gap ≥ 0.6 ATR + 连续3轮反向 → 重置后验到 0.58 种子），减少早期错误方向的锚定。
 - **Cross-Validation**: Flags overestimation when `estimated_value > p_win + 0.15` (reduces confidence 15%).
 - **LMSR Inefficiency Signal**: When realtime `best_ask` diverges >10% from `p_win`, lowers discount threshold by 2% (min 6%) for easier entry on mispriced markets.
 - **LMSR Liquidity Assessment**: Orderbook spread/depth/slippage scoring → dynamic discount threshold (8%-20%).
@@ -149,7 +149,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | `ai_trader/ai_model_v2.py` | Scoring model: ATR deviation → token value estimation → discount |
 | `ai_trader/base_rate.py` | Base Rate calibration: conservative priors + empirical learning |
 | `scripts/validate_base_rate.py` | Base Rate calibration validator: ATR-band win rates vs priors |
-| `ai_trader/bayesian_engine.py` | Bayesian sequential updater: sigmoid likelihood, log-space, anti-saturation |
+| `ai_trader/bayesian_engine.py` | Bayesian sequential updater v2.1: incremental + state gate, sigmoid likelihood, soft reset |
 | `ai_trader/lmsr_liquidity.py` | Orderbook liquidity: spread + depth + slippage → dynamic threshold |
 | `ai_trader/fees.py` | Taker fee helpers: effective_fee_rate, estimate_buy_fill, estimate_sell_fill |
 | `position_monitor.py` | EV-driven exit + 4-stage closing + pending order reconciliation + outcome recording |
