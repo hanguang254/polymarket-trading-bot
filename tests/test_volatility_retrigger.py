@@ -510,6 +510,37 @@ class TestAnalyzeAndTradeSkipRecording(unittest.TestCase):
         self.assertNotIn(slug, self.tracker.skipped_markets)
 
 
+class TestPtbFetchStrategy(unittest.TestCase):
+    def setUp(self):
+        bot._ptb_failures.clear()
+
+    @patch("auto_bot_v3.subprocess.run")
+    @patch("auto_bot_v3.get_price_to_beat_api", return_value=70182.430585)
+    def test_get_ptb_multi_strategy_prefers_crypto_price_api(self, mock_api, mock_run):
+        ptb = bot.get_ptb_multi_strategy("btc-updown-5m-1774328700")
+
+        self.assertEqual(ptb, 70182.430585)
+        mock_api.assert_called_once_with("btc-updown-5m-1774328700", timeout=3)
+        mock_run.assert_not_called()
+        self.assertEqual(bot._ptb_failures.get("BTC", 0), 0)
+
+    @patch("auto_bot_v3.get_price_to_beat_api", return_value=None)
+    @patch("auto_bot_v3.subprocess.run")
+    def test_get_ptb_multi_strategy_falls_back_to_playwright(self, mock_run, mock_api):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="测试 slug: btc-updown-5m-1774328700\nPTB=70182.43, 耗时=1.0s\n",
+            stderr="",
+        )
+
+        ptb = bot.get_ptb_multi_strategy("btc-updown-5m-1774328700")
+
+        self.assertEqual(ptb, 70182.43)
+        mock_api.assert_called_once_with("btc-updown-5m-1774328700", timeout=3)
+        mock_run.assert_called_once()
+        self.assertEqual(bot._ptb_failures.get("BTC", 0), 0)
+
+
 # ═══════════════════════════════════════════════════════════
 # 4. Cleanup 测试
 # ═══════════════════════════════════════════════════════════

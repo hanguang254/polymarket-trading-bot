@@ -12,7 +12,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 import requests
-from ai_trader.polymarket_api import normalize_orderbook
+from ai_trader.polymarket_api import normalize_orderbook, get_price_to_beat_api
 from ai_trader import clob_client
 from ai_trader.fees import effective_fee_rate, estimate_buy_fill, estimate_sell_fill
 from ai_trader.binance_api import price_stream as _price_stream
@@ -1198,8 +1198,12 @@ def get_current_crypto_price(coin):
     return None
 
 def get_ptb_from_slug(slug):
-    """从slug获取PTB价格"""
+    """从 slug 获取 PTB，优先 crypto-price API，失败时回退 Playwright。"""
     try:
+        ptb = get_price_to_beat_api(slug, timeout=3)
+        if ptb is not None:
+            return ptb
+
         ptb_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_trader", "playwright_ptb.py")
         result = subprocess.run(
             ["python3", ptb_script, slug],
@@ -1208,7 +1212,10 @@ def get_ptb_from_slug(slug):
             timeout=15
         )
         if result.returncode == 0:
-            return float(result.stdout.strip())
+            import re
+            match = re.search(r'PTB=([\d.]+)', result.stdout or "")
+            if match:
+                return float(match.group(1))
     except Exception:
         pass
     return None

@@ -1,17 +1,16 @@
-"""
-Polymarket 数据采集模块 - 使用浏览器方案
-"""
-import json
-import requests
-from datetime import datetime, timezone
-
-"""
-Polymarket 数据采集模块
-"""
 import json
 import re
-import requests
 from datetime import datetime, timezone
+
+import requests
+
+
+CRYPTO_PRICE_API = "https://polymarket.com/api/crypto/crypto-price"
+EVENT_API = "https://gamma-api.polymarket.com/events"
+MARKET_WINDOW_SECONDS = 300
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+}
 
 def normalize_orderbook(bids, asks):
     """规范化订单簿排序：bids降序(最优买价在前)，asks升序(最优卖价在前)
@@ -25,22 +24,85 @@ def normalize_orderbook(bids, asks):
     return sorted_bids, sorted_asks
 
 
-def get_price_to_beat_browser(slug):
+def _slug_start_timestamp(slug):
+    """从 5m market slug 提取开始时间戳。"""
+    try:
+        return int(str(slug).rsplit("-", 1)[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _timestamp_to_iso_utc(ts):
+    dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(microsecond=0)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def get_price_to_beat_params(slug, variant="fiveminute", market_seconds=MARKET_WINDOW_SECONDS):
+    """构造 Polymarket crypto-price 接口参数。"""
+    from ai_trader.coins import coin_from_slug
+
+    start_ts = _slug_start_timestamp(slug)
+    if start_ts is None:
+        return None
+
+    return {
+        "symbol": coin_from_slug(slug).upper(),
+        "eventStartTime": _timestamp_to_iso_utc(start_ts),
+        "variant": variant,
+        "endDate": _timestamp_to_iso_utc(start_ts + market_seconds),
+    }
+
+
+def get_price_to_beat_api(slug, timeout=3, variant="fiveminute"):
+    """用 crypto-price 接口获取当前 market 的 PTB(openPrice)。"""
+    params = get_price_to_beat_params(slug, variant=variant)
+    if not params:
+        return None
+
+    try:
+        resp = requests.get(
+            CRYPTO_PRICE_API,
+            params=params,
+            timeout=timeout,
+            headers=DEFAULT_HEADERS,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        open_price = data.get("openPrice")
+        if open_price is None:
+            return None
+        price = float(open_price)
+        if 100 < price < 10_000_000:
+            return price
+    except Exception:
+        pass
+    return None
+
+
+def get_price_to_beat_browser(slug, timeout=10):
     """从 HTML 提取 Price to Beat"""
     url = f"https://polymarket.com/event/{slug}"
     try:
-        resp = requests.get(url, timeout=10, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-        })
+        resp = requests.get(url, timeout=timeout, headers=DEFAULT_HEADERS)
         if resp.status_code == 200:
             match = re.search(r'"priceToBeat":([\d.]+)', resp.text)
             if match:
                 price = float(match.group(1))
-                if 100 < price < 1000000:
+                if 100 < price < 10_000_000:
                     return price
-    except:
+    except Exception:
         pass
     return None
+
+
+def get_price_to_beat(slug, timeout=3):
+    """统一 PTB 获取入口：仅使用 crypto-price API。"""
+    price = get_price_to_beat_api(slug, timeout=timeout)
+    if price is not None:
+        return price, "crypto-price"
+    return None, None
+
 
 def get_current_markets():
     """获取当前进行中的 5分钟市场"""
@@ -48,7 +110,7 @@ def get_current_markets():
     base_5m = (now_ts // 300) * 300
     
     markets = []
-    from ai_trader.coins import get_coins_config, coin_from_slug
+    from ai_trader.coins import get_coins_config
     coins_cfg = get_coins_config()
     for coin, cfg in coins_cfg.items():
         prefix = cfg["slug_prefix"]
@@ -56,7 +118,8 @@ def get_current_markets():
         
         try:
             resp = requests.get(
-                f"https://gamma-api.polymarket.com/events?slug={slug}",
+                EVENT_API,
+                params={"slug": slug},
                 timeout=3
             )
             if resp.status_code == 200:
@@ -65,8 +128,7 @@ def get_current_markets():
                     event = events[0]
                     market = event['markets'][0]
                     
-                    # 获取 Price to Beat
-                    ptb = get_price_to_beat_browser(slug)
+                    ptb = get_price_to_beat_api(slug, timeout=3)
                     
                     prices = json.loads(market['outcomePrices'])
                     

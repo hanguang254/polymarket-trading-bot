@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.5.1
+# Polymarket Trading Bot v10.5.2
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -12,7 +12,7 @@ The bot uses Bayesian sequential updating to detect directional signals, enters 
 
 ```
 0s    Market starts
-2s    PTB acquisition (Playwright only, no fallback — skip if unavailable)
+2s    PTB acquisition (crypto-price API, Playwright fallback)
 20s   Bayesian warmup (5s intervals, 3s after 80s)
 40s   PTB deadline
 90s   Early bet window opens (lower thresholds, CLOB mispricing)
@@ -127,7 +127,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior. Price sourced from Chainlink RTDS (same oracle as PTB/settlement) with Binance fallback. Sample log shows source tag `(CL)`/`(BN)` for traceability.
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
-- **Playwright PTB (No Fallback)**: PTB only from Playwright subprocess. HTML/Gamma API fallbacks removed (returned wrong market's PTB). Skip browser PTB after 3 consecutive failures.
+- **PTB 获取 (crypto-price API + Playwright 回退)**: 主路径使用 Polymarket `crypto-price` REST API（`get_price_to_beat_api()`，从 slug 时间戳构造请求参数，~50ms），无需浏览器进程。API 失败时回退 Playwright subprocess。3 次连续失败后跳过该币种。`get_current_markets()` 和 `position_monitor.get_ptb_from_slug()` 同步切换。
 - **Volatility Re-Trigger**: Skipped markets monitored for large price moves — piggybacks on existing sampling loop (no extra API calls), re-enters analysis when volatility exceeds threshold
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
@@ -269,7 +269,7 @@ All components now use SDK/REST API directly — no Polymarket CLI dependency.
 - **服务器最低配置**: 2核 2GB（2个币种串行PTB）/ 4核 4GB（3个币种并行PTB）
 - [py-clob-client](https://github.com/Polymarket/py-clob-client) (`pip install py-clob-client`)
 - [websocket-client](https://pypi.org/project/websocket-client/) (`pip install websocket-client`) — Binance WebSocket price stream
-- Chromium browser + 系统依赖 (for Playwright PTB extraction)
+- Chromium browser + 系统依赖 (optional, Playwright PTB fallback only — primary PTB uses crypto-price API)
 
 ### Installation
 

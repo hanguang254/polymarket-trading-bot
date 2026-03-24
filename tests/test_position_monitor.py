@@ -59,6 +59,26 @@ class TestPositionMonitor(unittest.TestCase):
         self.assertEqual(price, 68671.2)
         self.assertEqual(source, "冻结价")
 
+    @patch("position_monitor.subprocess.run")
+    @patch("position_monitor.get_price_to_beat_api", return_value=70351.52373576991)
+    def test_get_ptb_from_slug_prefers_crypto_price_api(self, mock_api, mock_run):
+        price = pm.get_ptb_from_slug("btc-updown-5m-1774328400")
+
+        self.assertEqual(price, 70351.52373576991)
+        mock_api.assert_called_once_with("btc-updown-5m-1774328400", timeout=3)
+        mock_run.assert_not_called()
+
+    @patch("position_monitor.get_price_to_beat_api", return_value=None)
+    @patch("position_monitor.subprocess.run")
+    def test_get_ptb_from_slug_falls_back_to_playwright_subprocess(self, mock_run, mock_api):
+        mock_run.return_value = DummyResult(stdout="测试 slug: btc-updown-5m-1774328400\nPTB=70351.52, 耗时=1.0s\n")
+
+        price = pm.get_ptb_from_slug("btc-updown-5m-1774328400")
+
+        self.assertEqual(price, 70351.52)
+        mock_api.assert_called_once_with("btc-updown-5m-1774328400", timeout=3)
+        mock_run.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
