@@ -239,12 +239,18 @@ def build_report(log_dir="logs"):
         entry_price = safe_float(outcome.get("entry_price"), 0.0)
         exit_price = safe_float(outcome.get("exit_price"), 0.0)
         size = safe_float(outcome.get("size"), 0.0)
-        entry_cost = round(entry_price * size, 4) if entry_price > 0 and size > 0 else 0.0
-        roi_pct = round((pnl / entry_cost) * 100, 4) if entry_cost > 0 else None
 
         decision = latest_decisions.get(key, {})
         attempts = attempts_by_key.get(key, [])
         chosen_attempt = choose_entry_attempt(attempts) or {}
+        entry_cost = safe_float(outcome.get("entry_cost"))
+        if entry_cost is None or entry_cost <= 0:
+            entry_cost = safe_float(chosen_attempt.get("amount"))
+        if entry_cost is None or entry_cost <= 0:
+            entry_cost = round(entry_price * size, 4) if entry_price > 0 and size > 0 else 0.0
+        else:
+            entry_cost = round(entry_cost, 4)
+        roi_pct = round((pnl / entry_cost) * 100, 4) if entry_cost > 0 else None
         attempt_mode = "unknown"
         if chosen_attempt.get("success"):
             attempt_mode = "immediate_fill"

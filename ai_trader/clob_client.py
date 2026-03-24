@@ -34,8 +34,9 @@ def init_client():
     global _client
     private_key = os.environ.get("PRIVATE_KEY", "")
     sig_type = int(os.environ.get("CLOB_SIGNATURE_TYPE", "0"))
-    # sig_type=0: EOA直签，funder=EOA；sig_type=1: Proxy模式，funder=PROXY
-    funder = os.environ.get("PROXY_WALLET", "") if sig_type == 1 else os.environ.get("EOA_WALLET", "")
+    # 官方文档：0=EOA；1=POLY_PROXY（Magic/email）；2=GNOSIS_SAFE（浏览器钱包/嵌入式钱包）。
+    # 对官网账户来说，1 和 2 都应使用官网显示的 proxy wallet 作为 funder。
+    funder = os.environ.get("PROXY_WALLET", "") if sig_type in (1, 2) else os.environ.get("EOA_WALLET", "")
 
     _client = ClobClient(
         "https://clob.polymarket.com",
@@ -135,6 +136,26 @@ def precache_tokens(token_ids):
     elapsed = (time.time() - t0) * 1000
     logger.info(f"📦 并行预缓存{len(token_ids)}个token完成 | {elapsed:.0f}ms")
     return results
+
+
+def get_token_metadata(token_id, refresh=False):
+    """读取 token 元数据；默认优先返回缓存。"""
+    token_id = str(token_id)
+    if not refresh and token_id in _token_cache:
+        return dict(_token_cache[token_id])
+    meta = precache_token(token_id)
+    return dict(meta) if meta else None
+
+
+def get_fee_rate_bps(token_id, refresh=False):
+    """返回 token 当前 feeRateBps；fee-free 市场返回 0。"""
+    meta = get_token_metadata(token_id, refresh=refresh)
+    if not meta:
+        return 0
+    try:
+        return int(meta.get("fee_rate_bps") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _warmup():
@@ -340,7 +361,6 @@ def get_balance():
                 BalanceAllowanceParams(
                     asset_type=AssetType.COLLATERAL,
                     token_id="",
-                    signature_type=0,
                 )
             )
         # API 返回原子单位（USDC 6位小数），需除以 1e6 转美元
@@ -360,7 +380,6 @@ def get_token_balance(token_id):
                 BalanceAllowanceParams(
                     asset_type=AssetType.CONDITIONAL,
                     token_id=str(token_id),
-                    signature_type=0,
                 )
             )
         # API 返回原子单位（6位小数），需除以 1e6 转份数
@@ -380,7 +399,6 @@ def update_token_allowance(token_id):
                 BalanceAllowanceParams(
                     asset_type=AssetType.CONDITIONAL,
                     token_id=str(token_id),
-                    signature_type=0,
                 )
             )
         logger.info(f"🔓 更新token allowance: {resp}")

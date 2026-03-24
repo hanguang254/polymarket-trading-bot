@@ -329,7 +329,7 @@ def _fetch_positions_api(addr: str, label: str) -> list:
         return []
 
 
-def _fetch_closed_positions_api(addr: str) -> list:
+def _fetch_closed_positions_api(addr: str, label: str) -> list:
     """通过 data-api 获取已关闭持仓"""
     try:
         resp = requests.get(
@@ -341,10 +341,10 @@ def _fetch_closed_positions_api(addr: str) -> list:
         data = resp.json()
         positions = data if isinstance(data, list) else []
         if positions:
-            log.info(f"  已关闭持仓: {len(positions)} 个")
+            log.info(f"  {label} 已关闭持仓: {len(positions)} 个")
         return positions
     except Exception as e:
-        log.warning(f"  已关闭持仓查询失败: {str(e)[:100]}")
+        log.warning(f"  {label} 已关闭持仓查询失败: {str(e)[:100]}")
         return []
 
 
@@ -355,11 +355,15 @@ def fetch_positions() -> list:
     for addr, label in [(PROXY_WALLET, "proxy"), (EOA_WALLET, "eoa")]:
         if not addr:
             continue
-        all_positions.extend(_fetch_positions_api(addr, label))
+        active_positions = _fetch_positions_api(addr, label)
+        closed_positions = _fetch_closed_positions_api(addr, label)
+        if not active_positions and not closed_positions:
+            log.info(f"  {label} 地址: data-api 未返回任何持仓")
+        all_positions.extend(active_positions)
+        all_positions.extend(closed_positions)
 
-    # 也查 closed-positions
-    if PROXY_WALLET:
-        all_positions.extend(_fetch_closed_positions_api(PROXY_WALLET))
+    if not all_positions:
+        log.info("  data-api 未返回任何 active/closed 持仓")
 
     return all_positions
 
@@ -381,6 +385,16 @@ def check_resolved_onchain(w3: Web3, cond_id: str) -> bool:
     return denominator > 0
 
 
+def _is_likely_resolved(position: dict) -> bool:
+    return (
+        position.get("resolved") is True
+        or position.get("redeemable") is True
+        or position.get("game_status") == "resolved"
+        or position.get("status") == "resolved"
+        or position.get("outcome") not in (None, "", "pending")
+    )
+
+
 def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
     """data-api 获取持仓 -> 字段预筛 -> 链上验证已结算 + 余额 > 0"""
     eoa_cs = Web3.to_checksum_address(wallet.address)
@@ -396,30 +410,16 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
 
     # 2. 字段预筛已结算的（减少链上调用）
     redeemable = []
-    seen_conditions = set()
-
+    positions_by_condition: dict[str, list[dict]] = {}
     for p in positions:
         cond_id = p.get("conditionId") or p.get("condition_id", "")
-        token_id = p.get("asset") or p.get("token_id", "")
-        market_slug = p.get("slug", p.get("market_slug", ""))
-        title = p.get("title", market_slug or cond_id[:16])
-        neg_risk = p.get("negativeRisk", p.get("neg_risk", p.get("negRisk", False)))
-        cur_value = float(p.get("currentValue", p.get("current_value", p.get("value", 0))) or 0)
-        size = float(p.get("size", 0) or 0)
+        if cond_id:
+            positions_by_condition.setdefault(cond_id, []).append(p)
 
-        if not cond_id or cond_id in seen_conditions:
-            continue
-        seen_conditions.add(cond_id)
-
-        # API 字段预筛：只对可能已结算的做链上验证
-        is_likely_resolved = (
-            p.get("resolved") is True
-            or p.get("redeemable") is True
-            or p.get("game_status") == "resolved"
-            or p.get("status") == "resolved"
-            or p.get("outcome") not in (None, "", "pending")
-        )
-        if not is_likely_resolved:
+    for cond_id, condition_positions in positions_by_condition.items():
+        # API 字段预筛：同一 condition 里任意一条像已结算，就继续链上验证
+        resolved_candidates = [p for p in condition_positions if _is_likely_resolved(p)]
+        if not resolved_candidates:
             continue
 
         # 3. 链上确认已结算
@@ -433,24 +433,55 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
         # 4. 链上检查 token 余额（先查 EOA，再查 proxy）
         bal = 0
         holder = eoa_cs
-        if token_id:
-            for addr in check_addrs:
+        selected_position = None
+        token_id = ""
+
+        for addr in check_addrs:
+            found_for_addr = None
+            for p in resolved_candidates:
+                current_token_id = p.get("asset") or p.get("token_id", "")
+                if not current_token_id:
+                    continue
                 try:
-                    b = ctf_contract.functions.balanceOf(addr, int(token_id)).call()
-                    if b > 0:
-                        bal = b
-                        holder = addr
-                        break
+                    b = ctf_contract.functions.balanceOf(addr, int(current_token_id)).call()
                 except Exception:
                     continue
-            if bal == 0:
-                continue
-        else:
-            bal = int(size * 1e6) if size > 0 else 0
+                if b > 0:
+                    found_for_addr = (p, current_token_id, b)
+                    break
+
+            if found_for_addr:
+                selected_position, token_id, bal = found_for_addr
+                holder = addr
+                break
+
+        if selected_position is None:
+            for p in resolved_candidates:
+                size = float(p.get("size", 0) or 0)
+                if size <= 0:
+                    continue
+                selected_position = p
+                bal = int(size * 1e6)
+                break
 
         # 余额为0的跳过（无意义调用）
         if bal <= 0:
             continue
+
+        selected_position = selected_position or resolved_candidates[0]
+        market_slug = selected_position.get("slug", selected_position.get("market_slug", ""))
+        title = selected_position.get("title", market_slug or cond_id[:16])
+        neg_risk = selected_position.get(
+            "negativeRisk",
+            selected_position.get("neg_risk", selected_position.get("negRisk", False)),
+        )
+        cur_value = float(
+            selected_position.get(
+                "currentValue",
+                selected_position.get("current_value", selected_position.get("value", 0)),
+            ) or 0
+        )
+        size = float(selected_position.get("size", 0) or 0)
 
         redeemable.append({
             "condition_id": cond_id,
@@ -769,15 +800,51 @@ def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
 # 核心逻辑
 # ==============================================================================
 
-def get_usdc_balance(wallet, usdc_contract) -> float:
-    """查询 EOA 钱包 USDC 余额"""
+def _get_usdc_balance_for_address(usdc_contract, address: str) -> float | None:
     try:
         bal = usdc_contract.functions.balanceOf(
-            Web3.to_checksum_address(wallet.address)
+            Web3.to_checksum_address(address)
         ).call()
         return bal / 1e6
     except Exception:
-        return -1
+        return None
+
+
+def get_usdc_balances(wallet, usdc_contract) -> dict[str, float | None]:
+    """查询 EOA / Proxy / 合计 USDC 余额"""
+    eoa_balance = _get_usdc_balance_for_address(usdc_contract, wallet.address)
+    proxy_balance = None
+
+    if PROXY_WALLET and PROXY_WALLET.lower() != wallet.address.lower():
+        proxy_balance = _get_usdc_balance_for_address(usdc_contract, PROXY_WALLET)
+
+    if eoa_balance is None:
+        total_balance = None
+    elif proxy_balance is None:
+        total_balance = eoa_balance
+    else:
+        total_balance = eoa_balance + proxy_balance
+
+    return {
+        "eoa": eoa_balance,
+        "proxy": proxy_balance,
+        "total": total_balance,
+    }
+
+
+def _format_usdc_balance_line(label: str, balances: dict[str, float | None]) -> str | None:
+    total = balances.get("total")
+    eoa_balance = balances.get("eoa")
+    proxy_balance = balances.get("proxy")
+
+    if total is None:
+        return None
+    if proxy_balance is None or eoa_balance is None:
+        return f"{label}: ${total:.2f} USDC"
+    return (
+        f"{label}: EOA ${eoa_balance:.2f} | "
+        f"Proxy ${proxy_balance:.2f} | 合计 ${total:.2f} USDC"
+    )
 
 
 def cleanup_false_redeemed(w3: Web3, wallet, ctf_contract) -> int:
@@ -838,9 +905,11 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     """执行一轮领取，返回实际 USDC 到账金额"""
 
     # 0. 当前余额
-    usdc_now = get_usdc_balance(wallet, usdc_contract)
-    if usdc_now >= 0:
-        log.info(f"💰 当前余额: ${usdc_now:.2f} USDC")
+    balances_now = get_usdc_balances(wallet, usdc_contract)
+    usdc_now = balances_now.get("total")
+    balance_line = _format_usdc_balance_line("💰 当前余额", balances_now)
+    if balance_line:
+        log.info(balance_line)
 
     # 1. 获取可 redeem 的持仓
     redeemable = find_redeemable(w3, wallet, ctf_contract)
@@ -870,9 +939,11 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
     log.info(f"🎯 准备领取 {len(pending)} 个头寸，约 ${total_value:.2f} USDC: {preview}")
 
     # 3. USDC 余额（领取前）
-    usdc_before = get_usdc_balance(wallet, usdc_contract)
-    if usdc_before >= 0:
-        log.info(f"💰 领取前余额: ${usdc_before:.2f} USDC")
+    balances_before = get_usdc_balances(wallet, usdc_contract)
+    usdc_before = balances_before.get("total")
+    balance_line = _format_usdc_balance_line("💰 领取前余额", balances_before)
+    if balance_line:
+        log.info(balance_line)
 
     # 4. 并行 redeem（预分配 nonce + 批量发送 + 统一收回执）
     eoa_cs = Web3.to_checksum_address(wallet.address)
@@ -921,11 +992,12 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
         mark_redeemed(redeemed, cid, slug, r.get("value", 0), r.get("size", 0), br.get("tx_hash", ""))
 
     # 6. USDC 余额（领取后）+ 统计到账/净收益
-    usdc_after = get_usdc_balance(wallet, usdc_contract)
+    balances_after = get_usdc_balances(wallet, usdc_contract)
+    usdc_after = balances_after.get("total")
     settled_amount = 0.0
-    if usdc_after >= 0 and usdc_before >= 0:
+    if usdc_after is not None and usdc_before is not None:
         settled_amount = usdc_after - usdc_before
-    elif usdc_after >= 0 and usdc_now >= 0:
+    elif usdc_after is not None and usdc_now is not None:
         settled_amount = usdc_after - usdc_now
 
     net_profit, matched_profit_count = estimate_redeem_profit(successful_positions, settled_amount)
@@ -937,8 +1009,11 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
         f"{'✅' if success_count > 0 else '⚠️'} 领取完成: "
         f"{success_count} 成功 / {fail_count} 失败 / {len(pending)} 总计"
     )
-    if usdc_after >= 0:
-        log.info(f"💸 USDC 到账: +${settled_amount:.2f}  |  余额: ${usdc_after:.2f}")
+    if usdc_after is not None:
+        log.info(f"💸 USDC 到账: +${settled_amount:.2f}")
+        balance_line = _format_usdc_balance_line("💰 领取后余额", balances_after)
+        if balance_line:
+            log.info(balance_line)
     if net_profit is not None:
         match_label = f"{matched_profit_count}/{success_count}" if success_count > 0 else "0/0"
         log.info(f"📈 估算净收益: {net_profit:+.2f} USDC | 已匹配本地持仓 {match_label}")
@@ -947,7 +1022,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
 
     # 6. Telegram 通知
     if success_count > 0 and settled_amount > 0:
-        balance_line = f"💰 余额: ${usdc_after:.2f} USDC\n" if usdc_after >= 0 else ""
+        balance_line = f"💰 余额: ${usdc_after:.2f} USDC\n" if usdc_after is not None else ""
         payout_line = f"💸 到账: +${settled_amount:.2f} USDC\n"
         profit_line = ""
         if net_profit is not None:

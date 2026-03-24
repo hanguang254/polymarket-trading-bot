@@ -4,6 +4,7 @@ position_monitor.py 全面测试
 覆盖: 纯逻辑函数 + 带mock的交易函数 + 文件IO函数
 """
 import json
+import importlib.util
 import math
 import os
 import sys
@@ -11,10 +12,20 @@ import tempfile
 import unittest
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 # 在 import position_monitor 之前 mock 掉需要外部依赖的模块
 # 这样 position_monitor 在 import 时不会真正连接外部服务
+ROOT = Path(__file__).resolve().parents[1]
+_fees_spec = importlib.util.spec_from_file_location(
+    "test_position_monitor_full_fees",
+    ROOT / "ai_trader" / "fees.py",
+)
+_fees_module = importlib.util.module_from_spec(_fees_spec)
+assert _fees_spec.loader is not None
+_fees_spec.loader.exec_module(_fees_module)
+
 sys.modules.setdefault("ai_trader", MagicMock())
 sys.modules.setdefault("ai_trader.polymarket_api", MagicMock())
 sys.modules.setdefault("ai_trader.clob_client", MagicMock())
@@ -26,6 +37,7 @@ sys.modules.setdefault("ai_trader.polymarket_ws.poly_ws", MagicMock())
 sys.modules.setdefault("ai_trader.polymarket_rtds", MagicMock())
 sys.modules.setdefault("ai_trader.coins", MagicMock())
 sys.modules.setdefault("ai_trader.base_rate", MagicMock())
+sys.modules.setdefault("ai_trader.fees", _fees_module)
 sys.modules.setdefault("py_clob_client", MagicMock())
 sys.modules.setdefault("py_clob_client.order_builder", MagicMock())
 sys.modules.setdefault("py_clob_client.order_builder.constants", MagicMock(BUY="BUY", SELL="SELL"))
@@ -682,6 +694,22 @@ class TestSellPosition(unittest.TestCase):
         self.assertTrue(success)
         self.assertAlmostEqual(actual, 0.50, places=4)
 
+    @patch.object(pm, "_check_and_adjust_size", return_value=10.0)
+    @patch.object(pm, "clob_client")
+    def test_success_first_try_deducts_sell_fee_when_fee_enabled(self, mock_clob, _):
+        mock_clob.get_fee_rate_bps.return_value = 2500
+        mock_clob.place_fok_order.return_value = {
+            "matched": True,
+            "status": "MATCHED",
+            "taking": 5.0,
+            "making": 0,
+            "raw": "ok",
+            "elapsed_ms": 100,
+        }
+        success, output, actual = pm.sell_position("token1", 10, 0.50)
+        self.assertTrue(success)
+        self.assertAlmostEqual(actual, 0.4922, places=4)
+
     @patch.object(pm, "_check_and_adjust_size", return_value=0)
     @patch.object(pm, "clob_client")
     def test_zero_balance(self, mock_clob, _):
@@ -900,17 +928,21 @@ class TestExecuteDipBuy(unittest.TestCase):
     @patch.object(pm, "get_best_ask", return_value=0.40)
     @patch.object(pm, "clob_client")
     def test_success(self, mock_clob, _, __):
+        mock_clob.get_fee_rate_bps.return_value = 0
+        mock_clob.get_balance.return_value = 100.0
+        mock_clob.get_token_balance.return_value = 5.0
         mock_clob.place_fok_order.return_value = {
             "matched": True,
             "status": "MATCHED",
             "making": 2.0,
-            "taking": 0,
+            "taking": 5.0,
             "raw": "ok",
             "elapsed_ms": 80,
         }
         success, size, price = pm.execute_dip_buy("token1", 10, "BTC", "slug", {})
         self.assertTrue(success)
-        self.assertEqual(size, max(1, int(10 * pm.DIP_BUY_SIZE_RATIO)))
+        self.assertEqual(size, 5.0)
+        self.assertEqual(price, 0.4)
         mock_clob.update_token_allowance.assert_called_once_with("token1")
 
     @patch("trading_state.check_daily_loss_limit", return_value=(True, -10, 50))
@@ -918,6 +950,32 @@ class TestExecuteDipBuy(unittest.TestCase):
     def test_ask_too_high(self, _, __):
         success, size, price = pm.execute_dip_buy("token1", 10, "BTC", "slug", {})
         self.assertFalse(success)
+
+    @patch("trading_state.check_daily_loss_limit", return_value=(True, -10, 50))
+    @patch.object(pm, "get_best_ask", return_value=0.40)
+    @patch.object(pm, "clob_client")
+    def test_fee_aware_dip_buy_forces_minimum_net_size(self, mock_clob, _, __):
+        mock_clob.get_fee_rate_bps.return_value = 2500
+        mock_clob.get_balance.return_value = 100.0
+        mock_clob.get_token_balance.return_value = 9.02656
+        mock_clob.place_fok_order.return_value = {
+            "matched": True,
+            "status": "MATCHED",
+            "making": 2.04,
+            "taking": 5.1,
+            "raw": "ok",
+            "elapsed_ms": 70,
+        }
+        pos = {"size": 4.0, "token_balance": 4.0}
+
+        success, size, price = pm.execute_dip_buy("token1", 4, "BTC", "slug", pos)
+
+        self.assertTrue(success)
+        self.assertAlmostEqual(size, 5.02656, places=5)
+        self.assertAlmostEqual(price, 2.04 / 5.02656, places=5)
+        self.assertEqual(mock_clob.place_fok_order.call_args.args[3], 5.1)
+        self.assertAlmostEqual(pos["token_balance"], 9.02656, places=5)
+        self.assertGreater(pos["dip_buy_fee_shares"], 0.07)
 
 
 class TestMonitorExpiryCleanup(unittest.TestCase):

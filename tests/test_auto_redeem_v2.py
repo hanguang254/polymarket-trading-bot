@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +92,108 @@ class TestAutoRedeemProfitEstimate(unittest.TestCase):
 
         self.assertEqual(matched, 1)
         self.assertAlmostEqual(profit, 0.4902, places=4)
+
+
+class TestAutoRedeemBalancesAndDiscovery(unittest.TestCase):
+    def test_get_usdc_balances_includes_proxy_and_total(self):
+        wallet = type("Wallet", (), {"address": redeem.EOA_WALLET})()
+        eoa_cs = redeem.Web3.to_checksum_address(redeem.EOA_WALLET)
+        proxy_cs = redeem.Web3.to_checksum_address(redeem.PROXY_WALLET)
+        raw_balances = {
+            eoa_cs: 0,
+            proxy_cs: 9_000_000,
+        }
+
+        def balance_of(addr):
+            return MagicMock(call=MagicMock(return_value=raw_balances[addr]))
+
+        usdc_contract = MagicMock()
+        usdc_contract.functions.balanceOf.side_effect = balance_of
+
+        balances = redeem.get_usdc_balances(wallet, usdc_contract)
+
+        self.assertEqual(balances["eoa"], 0.0)
+        self.assertEqual(balances["proxy"], 9.0)
+        self.assertEqual(balances["total"], 9.0)
+
+    def test_fetch_positions_queries_active_and_closed_for_both_wallets(self):
+        active_side_effect = [
+            [{"source": "proxy-active"}],
+            [{"source": "eoa-active"}],
+        ]
+        closed_side_effect = [
+            [{"source": "proxy-closed"}],
+            [{"source": "eoa-closed"}],
+        ]
+
+        with patch.object(redeem, "_fetch_positions_api", side_effect=active_side_effect) as mock_active:
+            with patch.object(redeem, "_fetch_closed_positions_api", side_effect=closed_side_effect) as mock_closed:
+                positions = redeem.fetch_positions()
+
+        self.assertEqual(
+            positions,
+            [
+                {"source": "proxy-active"},
+                {"source": "proxy-closed"},
+                {"source": "eoa-active"},
+                {"source": "eoa-closed"},
+            ],
+        )
+        self.assertEqual(
+            mock_active.call_args_list,
+            [
+                unittest.mock.call(redeem.PROXY_WALLET, "proxy"),
+                unittest.mock.call(redeem.EOA_WALLET, "eoa"),
+            ],
+        )
+        self.assertEqual(
+            mock_closed.call_args_list,
+            [
+                unittest.mock.call(redeem.PROXY_WALLET, "proxy"),
+                unittest.mock.call(redeem.EOA_WALLET, "eoa"),
+            ],
+        )
+
+    def test_find_redeemable_checks_all_tokens_within_same_condition(self):
+        wallet = type("Wallet", (), {"address": redeem.EOA_WALLET})()
+        eoa_cs = redeem.Web3.to_checksum_address(redeem.EOA_WALLET)
+
+        positions = [
+            {
+                "conditionId": "0x" + "11" * 32,
+                "asset": "101",
+                "title": "First token",
+                "slug": "first-token",
+                "resolved": True,
+                "size": 0,
+                "currentValue": 0,
+            },
+            {
+                "conditionId": "0x" + "11" * 32,
+                "asset": "202",
+                "title": "Winning token",
+                "slug": "winning-token",
+                "resolved": True,
+                "size": 7,
+                "currentValue": 7,
+            },
+        ]
+
+        def balance_of(addr, token_id):
+            raw = 7_000_000 if (addr, token_id) == (eoa_cs, 202) else 0
+            return MagicMock(call=MagicMock(return_value=raw))
+
+        ctf_contract = MagicMock()
+        ctf_contract.functions.balanceOf.side_effect = balance_of
+
+        with patch.object(redeem, "fetch_positions", return_value=positions):
+            with patch.object(redeem, "check_resolved_onchain", return_value=True):
+                redeemable = redeem.find_redeemable(MagicMock(), wallet, ctf_contract)
+
+        self.assertEqual(len(redeemable), 1)
+        self.assertEqual(redeemable[0]["token_id"], "202")
+        self.assertEqual(redeemable[0]["balance"], 7_000_000)
+        self.assertEqual(redeemable[0]["slug"], "Winning token")
 
 
 if __name__ == "__main__":

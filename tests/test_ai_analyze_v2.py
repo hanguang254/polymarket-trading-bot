@@ -53,7 +53,7 @@ class TestAdaptiveEntryHelpers(unittest.TestCase):
 
         self.assertIsNotNone(plan)
         self.assertEqual(plan["mode"], "reduced")
-        self.assertEqual(plan["size"], 5)
+        self.assertEqual(plan["size"], 5.9)
         self.assertEqual(plan["limit_price"], 0.88)
 
 
@@ -112,11 +112,22 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
             "MIN_BALANCE": "5",
             "MIN_BET_SIZE": "5",
             "MAX_BUY_PRICE": "0.99",
+            "MAX_BUY_PRICE_UP": "0.99",
+            "MAX_BUY_PRICE_DOWN": "0.99",
             "ENTRY_WS_MAX_AGE_MS": "400",
         }, clear=False):
             with patch.object(ai_analyze_v2, "_bet_executor", _ImmediateExecutor()):
                 with patch.object(ai_analyze_v2, "_get_execution_quote", side_effect=[initial_quote, retry_quote]):
-                    with patch.object(ai_analyze_v2, "calculate_kelly_size", return_value=7):
+                    with patch.object(ai_analyze_v2, "calculate_kelly_size", return_value={
+                        "gross_order_size": 7.0,
+                        "min_gross_size": 5.0,
+                        "raw_net_size": 7.0,
+                        "target_net_size": 7.0,
+                        "expected_net_size": 7.0,
+                        "forced_to_min": False,
+                        "entry_fee_rate": 0.0,
+                        "skip_reason": None,
+                    }):
                         with patch.object(ai_analyze_v2, "_detect_ghost_fill", return_value=None) as ghost_mock:
                             with patch.object(ai_analyze_v2.clob_client, "get_orderbook", return_value=None):
                                 with patch.object(ai_analyze_v2.clob_client, "place_fok_order", side_effect=[explicit_fok_error, matched_retry]) as place_mock:
@@ -147,7 +158,76 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
         self.assertEqual(record["quoted_price"], 0.85)
         self.assertEqual(record["limit_price"], 0.92)
         self.assertEqual(record["requested_size"], 7)
+        self.assertEqual(record["requested_net_size"], 7)
         self.assertTrue(record["success"])
+
+    def test_execute_bet_uses_net_balance_for_fee_aware_entry_price(self):
+        quote = {
+            "best_bid": 0.70,
+            "best_ask": 0.71,
+            "bids": [{"price": "0.70", "size": "100"}],
+            "asks": [{"price": "0.71", "size": "20"}],
+            "bid_depth": 100.0,
+            "source": "rest_book",
+            "age_ms": 0.0,
+        }
+        matched = {
+            "matched": True,
+            "status": "matched",
+            "elapsed_ms": 120,
+            "error": "",
+            "raw": "{'status': 'matched'}",
+            "making": 5.039998,
+            "taking": 7.098589,
+            "order_id": "oid-2",
+        }
+
+        with patch.dict(os.environ, {
+            "MIN_BALANCE": "5",
+            "MIN_BET_SIZE": "5",
+            "MAX_BUY_PRICE": "0.99",
+            "MAX_BUY_PRICE_UP": "0.99",
+            "MAX_BUY_PRICE_DOWN": "0.99",
+            "ENTRY_WS_MAX_AGE_MS": "400",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "_bet_executor", _ImmediateExecutor()):
+                with patch.object(ai_analyze_v2, "_get_execution_quote", return_value=quote):
+                    with patch.object(ai_analyze_v2, "calculate_kelly_size", return_value={
+                        "gross_order_size": 7.0,
+                        "min_gross_size": 5.1,
+                        "raw_net_size": 6.8,
+                        "target_net_size": 7.0,
+                        "expected_net_size": 6.935,
+                        "forced_to_min": False,
+                        "entry_fee_rate": 0.0092,
+                        "skip_reason": None,
+                    }):
+                        with patch.object(ai_analyze_v2.clob_client, "place_fok_order", return_value=matched):
+                            with patch.object(ai_analyze_v2.clob_client, "get_token_balance", return_value=7.033124):
+                                with patch.object(ai_analyze_v2.clob_client, "get_fee_rate_bps", return_value=2500):
+                                    with patch.object(ai_analyze_v2.clob_client, "update_token_allowance", return_value=True):
+                                        success, actual_price, actual_size, _ = ai_analyze_v2.execute_bet(
+                                            slug="btc-updown-5m-fee-aware",
+                                            direction="UP",
+                                            token_id="token-2",
+                                            confidence=0.71,
+                                            ev=0.10,
+                                            p_hat=0.80,
+                                            entry_details={"p_win_final": 0.92},
+                                            pre_balance=100.0,
+                                        )
+
+        self.assertTrue(success)
+        self.assertAlmostEqual(actual_size, 7.033124, places=6)
+        self.assertAlmostEqual(actual_price, 5.039998 / 7.033124, places=6)
+
+        with open("logs/bets.jsonl") as f:
+            record = json.loads(f.readline())
+
+        self.assertAlmostEqual(record["size"], 7.033124, places=6)
+        self.assertAlmostEqual(record["gross_size"], 7.0986, places=4)
+        self.assertEqual(record["requested_net_size"], 7.0)
+        self.assertGreater(record["buy_fee_shares"], 0.06)
 
 
 if __name__ == "__main__":

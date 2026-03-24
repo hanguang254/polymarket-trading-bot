@@ -90,13 +90,13 @@ class TestTradingStateRollover(unittest.TestCase):
 
 
 class TestKellySizing(unittest.TestCase):
-    def test_size_below_minimum_skips_instead_of_forcing_min_bet(self):
+    def test_size_below_minimum_forces_minimum_net_size(self):
         with patch.dict(os.environ, {
             "MIN_BET_SIZE": "5",
             "MAX_BET_SIZE": "10",
             "P_WIN_CAP": "0.92",
         }):
-            size = ai_analyze_v2.calculate_kelly_size(
+            size_plan = ai_analyze_v2.calculate_kelly_size(
                 confidence=0.75,
                 ev=0.04,
                 balance=20,
@@ -104,9 +104,54 @@ class TestKellySizing(unittest.TestCase):
                 p_win=0.86,
                 kelly_reduction=1.0,
                 exit_bid_depth=100,
+                return_details=True,
             )
 
-        self.assertEqual(size, 0)
+        self.assertTrue(size_plan["forced_to_min"])
+        self.assertEqual(size_plan["target_net_size"], 5.0)
+        self.assertGreaterEqual(size_plan["expected_net_size"], 5.0)
+        self.assertGreaterEqual(size_plan["gross_order_size"], 5.0)
+
+    def test_hard_cap_below_minimum_net_size_still_skips(self):
+        with patch.dict(os.environ, {
+            "MIN_BET_SIZE": "5",
+            "MAX_BET_SIZE": "10",
+            "P_WIN_CAP": "0.92",
+        }):
+            size_plan = ai_analyze_v2.calculate_kelly_size(
+                confidence=0.75,
+                ev=0.04,
+                balance=19,
+                target_price=0.8,
+                p_win=0.86,
+                kelly_reduction=1.0,
+                exit_bid_depth=100,
+                return_details=True,
+            )
+
+        self.assertEqual(size_plan["gross_order_size"], 0.0)
+        self.assertEqual(size_plan["skip_reason"], "HARD_CAP_BELOW_MIN")
+
+    def test_max_entry_balance_pct_can_raise_balance_cap(self):
+        with patch.dict(os.environ, {
+            "MIN_BET_SIZE": "4",
+            "MAX_BET_SIZE": "20",
+            "P_WIN_CAP": "0.90",
+            "MAX_ENTRY_BALANCE_PCT": "0.40",
+        }):
+            size_plan = ai_analyze_v2.calculate_kelly_size(
+                confidence=0.63,
+                ev=0.06,
+                balance=8.9,
+                target_price=0.78,
+                p_win=0.90,
+                kelly_reduction=1.0,
+                exit_bid_depth=5000,
+                return_details=True,
+            )
+
+        self.assertIsNone(size_plan["skip_reason"])
+        self.assertGreaterEqual(size_plan["expected_net_size"], 4.0)
 
 
 if __name__ == "__main__":

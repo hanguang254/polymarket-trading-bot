@@ -29,6 +29,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from ai_trader.polymarket_api import normalize_orderbook
+from ai_trader.fees import estimate_sell_fill
 
 # --- 新增日志配置 ---
 LOG_FILE = "logs/polymarket-bot.log"
@@ -380,7 +381,14 @@ def close_position(token_id, size=5, time_remaining=None):
 
         info = clob_client.place_fok_order(token_id, SELL, sell_price, size)
         if info["matched"]:
-            actual = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
+            gross_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
+            fill_summary = estimate_sell_fill(
+                price=gross_price,
+                size=size,
+                fee_rate_bps=clob_client.get_fee_rate_bps(token_id),
+                gross_proceeds=info.get("taking", 0),
+            )
+            actual = round(fill_summary["net_price"], 4)
             print(f"  ✅ FOK成交！${actual:.3f} | {info.get('elapsed_ms', 0):.0f}ms")
             return True, actual, info["raw"]
 
@@ -388,7 +396,14 @@ def close_position(token_id, size=5, time_remaining=None):
         if sell_price > 0.02:
             info2 = clob_client.place_fok_order(token_id, SELL, 0.01, size)
             if info2["matched"]:
-                actual = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
+                gross_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else 0.01
+                fill_summary = estimate_sell_fill(
+                    price=gross_price,
+                    size=size,
+                    fee_rate_bps=clob_client.get_fee_rate_bps(token_id),
+                    gross_proceeds=info2.get("taking", 0),
+                )
+                actual = round(fill_summary["net_price"], 4)
                 print(f"  ✅ 地板价成交！${actual:.3f} | {info2.get('elapsed_ms', 0):.0f}ms")
                 return True, actual, info2["raw"]
 

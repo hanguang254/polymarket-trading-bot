@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 from ai_trader.ai_model_v2 import analyze_market
 from ai_trader.base_rate import get_base_rate
 from ai_trader import clob_client
+from ai_trader.fees import effective_fee_rate, estimate_buy_fill
 from py_clob_client.order_builder.constants import BUY
 
 _bet_executor = ThreadPoolExecutor(max_workers=3)
@@ -31,6 +32,35 @@ def _directional_env_float(base_key, direction, default):
         if value not in (None, ""):
             return float(value)
     return float(os.environ.get(base_key, str(default)))
+
+
+def _size_step():
+    try:
+        step = float(os.environ.get("SIZE_STEP", "0.1"))
+    except (TypeError, ValueError):
+        step = 0.1
+    return step if step > 0 else 0.1
+
+
+def _round_size(value, mode="nearest", step=None):
+    value = max(float(value or 0), 0.0)
+    step = step or _size_step()
+    if step <= 0:
+        return round(value, 6)
+
+    units = value / step
+    if mode == "ceil":
+        rounded_units = math.ceil(units - 1e-9)
+    elif mode == "floor":
+        rounded_units = math.floor(units + 1e-9)
+    else:
+        rounded_units = round(units)
+    return round(rounded_units * step, 6)
+
+
+def _buy_fill_ratio(price, fee_rate_bps):
+    fee_rate = effective_fee_rate(price, fee_rate_bps)
+    return max(1.0 - fee_rate, 1e-9), fee_rate
 
 
 def _random_walk_p_win(gap, atr_val, remaining_seconds):
@@ -134,6 +164,8 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     # ── LMSR 流动性评估 ──
     liquidity_info = None
     token_id = extra_info.get("token_id") if extra_info else None
+    fee_rate_bps = clob_client.get_fee_rate_bps(token_id) if token_id else 0
+    details["fee_rate_bps"] = fee_rate_bps
     if token_id:
         try:
             from ai_trader.lmsr_liquidity import estimate_lmsr_b, get_dynamic_discount_threshold
@@ -262,11 +294,29 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     EARLY_EXIT_RATIO = float(os.environ.get("EARLY_EXIT_RATIO", "0.3"))  # 提前平仓概率
     raw_spread = liquidity_info["spread"] if liquidity_info and liquidity_info.get("spread") else 0.02
     spread_cost = raw_spread * EARLY_EXIT_RATIO
+    entry_fee_rate = effective_fee_rate(target_odds, fee_rate_bps)
+    net_entry_denominator = max(1.0 - entry_fee_rate, 1e-9)
+    effective_entry_price = target_odds / net_entry_denominator if fee_rate_bps > 0 else target_odds
+    entry_fee_cost = max(0.0, effective_entry_price - target_odds)
+    exit_fee_basis = None
+    if liquidity_info and liquidity_info.get("best_bid"):
+        exit_fee_basis = liquidity_info["best_bid"]
+    elif 0.01 < target_odds < 0.99:
+        exit_fee_basis = max(round(target_odds - raw_spread, 4), 0.01)
+    exit_fee_rate = effective_fee_rate(exit_fee_basis, fee_rate_bps) if exit_fee_basis else 0.0
+    exit_fee_cost = (exit_fee_basis * exit_fee_rate * EARLY_EXIT_RATIO) if exit_fee_basis else 0.0
     ev_gross = p_win - target_odds
-    ev = ev_gross - spread_cost  # 按提前退出概率折算后的净EV
+    ev = ev_gross - spread_cost - entry_fee_cost - exit_fee_cost
     details["expected_value"] = round(ev, 4)
     details["ev_gross"] = round(ev_gross, 4)
     details["spread_cost"] = round(spread_cost, 4)
+    details["entry_fee_cost"] = round(entry_fee_cost, 4)
+    details["entry_fee_rate"] = round(entry_fee_rate, 6)
+    details["effective_entry_price"] = round(effective_entry_price, 4)
+    details["expected_exit_fee_cost"] = round(exit_fee_cost, 4)
+    details["expected_exit_fee_rate"] = round(exit_fee_rate, 6)
+    if exit_fee_basis:
+        details["expected_exit_fee_basis"] = round(exit_fee_basis, 4)
     details["p_win_final"] = round(p_win, 4)
     details["ev_positive"] = ev > 0
 
@@ -369,7 +419,8 @@ def check_bid_depth(token_id):
 
 
 def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
-                          p_win=None, kelly_reduction=1.0, exit_bid_depth=None):
+                          p_win=None, kelly_reduction=1.0, exit_bid_depth=None,
+                          fee_rate_bps=0, return_details=False):
     """
     修正的 1/4 Kelly 仓位计算（5分钟市场专用）
 
@@ -390,13 +441,31 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
         p_win: 严格概率估计（来自 base_rate + 贝叶斯融合，优先级最高）
         kelly_reduction: 缩减因子（base_rate < 0.55 → 0.5, 相关性 → 0.5）
     """
-    MIN_BET = int(os.environ.get("MIN_BET_SIZE", "5"))
-    MAX_BET = int(os.environ.get("MAX_BET_SIZE", "10"))
+    MIN_BET = float(os.environ.get("MIN_BET_SIZE", "5"))
+    MAX_BET = float(os.environ.get("MAX_BET_SIZE", "10"))
     P_CAP = float(os.environ.get("P_WIN_CAP", "0.92"))
+    size_step = _size_step()
+
+    def _result(skip_reason=None, **kwargs):
+        result = {
+            "gross_order_size": 0.0,
+            "min_gross_size": 0.0,
+            "raw_net_size": 0.0,
+            "target_net_size": 0.0,
+            "expected_net_size": 0.0,
+            "max_net_by_balance": 0.0,
+            "max_net_by_liquidity": None,
+            "effective_entry_price": 0.0,
+            "entry_fee_rate": 0.0,
+            "forced_to_min": False,
+            "skip_reason": skip_reason,
+        }
+        result.update(kwargs)
+        return result if return_details else result["gross_order_size"]
 
     if ev <= 0:
         logger.info(f"  📊 Kelly仓位: EV={ev:.3f}≤0 → 跳过")
-        return 0
+        return _result(skip_reason="EV_NON_POSITIVE")
 
     # 胜率估计优先级: p_win > p_hat > confidence映射
     if p_win and p_win > 0.5:
@@ -415,41 +484,105 @@ def calculate_kelly_size(confidence, ev, balance, target_price=None, p_hat=None,
 
     if kelly_full <= 0:
         logger.info(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f}≤0 → 跳过")
-        return 0
+        return _result(skip_reason="KELLY_NON_POSITIVE")
 
     # 1/4 Kelly + 缩减因子
     kelly_quarter = kelly_full * 0.25 * kelly_reduction
     kelly_quarter = max(0, min(0.25, kelly_quarter))
 
-    # Kelly 比例换算为份数：dollar_amount / price
+    # Kelly 比例先换算为净份额：资金预算 / 含fee的净入场成本
+    fill_ratio, entry_fee_rate = _buy_fill_ratio(price, fee_rate_bps)
+    effective_entry_price = price / fill_ratio if price > 0 else 0.0
     dollar_amount = balance * kelly_quarter
-    size = int(dollar_amount / price) if price > 0 else 0
+    raw_net_size = (dollar_amount / effective_entry_price) if effective_entry_price > 0 else 0.0
+    if raw_net_size <= 0:
+        logger.info(
+            f"  📊 Kelly仓位: 预算${dollar_amount:.2f} 经fee换算后净仓位{raw_net_size:.4f}份 ≤ 0 → 跳过"
+        )
+        return _result(
+            skip_reason="NET_SIZE_NON_POSITIVE",
+            raw_net_size=round(raw_net_size, 6),
+            effective_entry_price=round(effective_entry_price, 6),
+            entry_fee_rate=round(entry_fee_rate, 6),
+        )
 
-    # 余额约束：单笔不超过余额 20%（安全网）
-    max_by_balance = int(balance * 0.20 / price) if price > 0 else 0
-    size = min(size, max_by_balance)
+    # 余额约束：单笔不超过余额的一定比例（安全网）
+    max_entry_balance_pct = float(os.environ.get("MAX_ENTRY_BALANCE_PCT", "0.20"))
+    max_entry_balance_pct = min(max(max_entry_balance_pct, 0.0), 1.0)
+    max_gross_by_balance = _round_size(balance * max_entry_balance_pct / price, mode="floor", step=size_step) if price > 0 else 0.0
+    max_net_by_balance = max_gross_by_balance * fill_ratio
 
     # P3: 流动性上限 — 不超过退出流动性的50%
+    max_net_by_liquidity = None
     if exit_bid_depth and exit_bid_depth > 0:
-        max_by_liquidity = int(exit_bid_depth * 0.5)
-        if size > max_by_liquidity:
-            logger.info(f"  📊 P3流动性上限: bid_depth={exit_bid_depth:.1f} → max={max_by_liquidity}份")
-            size = min(size, max_by_liquidity)
+        max_net_by_liquidity = exit_bid_depth * 0.5
 
-    if size < MIN_BET:
+    hard_net_cap = min(MAX_BET, max_net_by_balance)
+    if max_net_by_liquidity is not None:
+        hard_net_cap = min(hard_net_cap, max_net_by_liquidity)
+
+    if hard_net_cap < MIN_BET:
         logger.info(
-            f"  📊 Kelly仓位: 计算仓位{size}份 < 最小可执行仓位{MIN_BET}份，跳过"
+            f"  📊 Kelly仓位: 可执行净仓位上限{hard_net_cap:.4f}份 < 最小净仓位{MIN_BET:.1f}份，跳过"
         )
-        return 0
+        return _result(
+            skip_reason="HARD_CAP_BELOW_MIN",
+            raw_net_size=round(raw_net_size, 6),
+            max_net_by_balance=round(max_net_by_balance, 6),
+            max_net_by_liquidity=round(max_net_by_liquidity, 6) if max_net_by_liquidity is not None else None,
+            effective_entry_price=round(effective_entry_price, 6),
+            entry_fee_rate=round(entry_fee_rate, 6),
+        )
 
-    # ENV 上限
-    size = min(MAX_BET, size)
+    forced_to_min = 0 < raw_net_size < MIN_BET
+    target_net_size = MIN_BET if forced_to_min else raw_net_size
+    target_net_size = min(target_net_size, hard_net_cap)
+
+    gross_order_size = _round_size(target_net_size / fill_ratio, mode="ceil", step=size_step)
+    min_gross_size = _round_size(MIN_BET / fill_ratio, mode="ceil", step=size_step)
+    if gross_order_size > max_gross_by_balance + 1e-9:
+        gross_order_size = max_gross_by_balance
+
+    expected_net_size = gross_order_size * fill_ratio
+    if expected_net_size < MIN_BET:
+        logger.info(
+            f"  📊 Kelly仓位: 预计净仓位{expected_net_size:.4f}份 < 最小净仓位{MIN_BET:.1f}份，跳过"
+        )
+        return _result(
+            skip_reason="EXPECTED_NET_BELOW_MIN",
+            gross_order_size=round(gross_order_size, 6),
+            min_gross_size=round(min_gross_size, 6),
+            raw_net_size=round(raw_net_size, 6),
+            target_net_size=round(target_net_size, 6),
+            expected_net_size=round(expected_net_size, 6),
+            max_net_by_balance=round(max_net_by_balance, 6),
+            max_net_by_liquidity=round(max_net_by_liquidity, 6) if max_net_by_liquidity is not None else None,
+            effective_entry_price=round(effective_entry_price, 6),
+            entry_fee_rate=round(entry_fee_rate, 6),
+            forced_to_min=forced_to_min,
+        )
 
     red_label = f" red={kelly_reduction}" if kelly_reduction < 1.0 else ""
     liq_label = f" liq_cap={exit_bid_depth:.0f}" if exit_bid_depth else ""
-    logger.info(f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} f*={kelly_full:.3f} f/4={kelly_quarter:.3f} ${dollar_amount:.1f}{red_label}{liq_label} → {size}份")
+    min_label = f" raw_net={raw_net_size:.2f}→min{MIN_BET:.1f}" if forced_to_min else ""
+    logger.info(
+        f"  📊 Kelly仓位: p={p:.3f} price={price:.3f} eff={effective_entry_price:.4f} "
+        f"f*={kelly_full:.3f} f/4={kelly_quarter:.3f} ${dollar_amount:.1f}{red_label}{liq_label}{min_label} "
+        f"→ net={expected_net_size:.2f}份 gross={gross_order_size:.2f}份"
+    )
 
-    return max(0, size)
+    return _result(
+        gross_order_size=round(gross_order_size, 6),
+        min_gross_size=round(min_gross_size, 6),
+        raw_net_size=round(raw_net_size, 6),
+        target_net_size=round(target_net_size, 6),
+        expected_net_size=round(expected_net_size, 6),
+        max_net_by_balance=round(max_net_by_balance, 6),
+        max_net_by_liquidity=round(max_net_by_liquidity, 6) if max_net_by_liquidity is not None else None,
+        effective_entry_price=round(effective_entry_price, 6),
+        entry_fee_rate=round(entry_fee_rate, 6),
+        forced_to_min=forced_to_min,
+    )
 
 
 def _is_valid_clob_price(price):
@@ -609,6 +742,7 @@ def _plan_fok_entry(asks, desired_size, best_ask, price_cap, ev, min_size):
     if desired_size <= 0:
         return None
 
+    size_step = _size_step()
     best_ask = round(best_ask, 2)
     price_cap = round(price_cap, 2)
     if best_ask > price_cap:
@@ -621,17 +755,17 @@ def _plan_fok_entry(asks, desired_size, best_ask, price_cap, ev, min_size):
 
     if coverage["covered"]:
         return {
-            "size": int(desired_size),
+            "size": _round_size(desired_size, mode="ceil", step=size_step),
             "limit_price": limit_price,
             "coverage": coverage,
             "mode": "full",
             "chase_cap": chase_cap,
         }
 
-    available_size = int(coverage["cover_size"])
+    available_size = _round_size(coverage["cover_size"], mode="floor", step=size_step)
     if available_size >= min_size:
         return {
-            "size": min(available_size, int(desired_size)),
+            "size": min(available_size, _round_size(desired_size, mode="floor", step=size_step)),
             "limit_price": limit_price,
             "coverage": coverage,
             "mode": "reduced",
@@ -701,7 +835,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
 
     SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))
     MAX_PRICE = _directional_env_float("MAX_BUY_PRICE", direction, 0.92)
-    MIN_BET = int(os.environ.get("MIN_BET_SIZE", "5"))
+    MIN_BET = float(os.environ.get("MIN_BET_SIZE", "5"))
     p_win_final = entry_details.get("p_win_final") if entry_details else None
     price_cap = _derive_entry_price_cap(MAX_PRICE, entry_details)
 
@@ -756,16 +890,40 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             print(f"  ⚠️ 退出流动性极低({bid_depth:.1f}<5)，跳过下注")
             return False, 0, 0, "SKIP_NO_EXIT_LIQUIDITY"
 
-    # Kelly动态仓位（修正公式 + base_rate/相关性缩减 + P3流动性上限）
-    size = calculate_kelly_size(
+    fee_rate_bps = clob_client.get_fee_rate_bps(token_id)
+
+    # Kelly动态仓位：先算目标净仓位，再反推 gross 下单量
+    size_plan = calculate_kelly_size(
         confidence, ev, balance, target_price=price, p_hat=p_hat,
         p_win=p_win_final, kelly_reduction=kelly_reduction,
-        exit_bid_depth=bid_depth
+        exit_bid_depth=bid_depth, fee_rate_bps=fee_rate_bps, return_details=True,
     )
+    if not isinstance(size_plan, dict):
+        size_plan = {
+            "gross_order_size": float(size_plan or 0),
+            "min_gross_size": float(MIN_BET),
+            "raw_net_size": float(size_plan or 0),
+            "target_net_size": float(size_plan or 0),
+            "expected_net_size": float(size_plan or 0),
+            "forced_to_min": False,
+            "entry_fee_rate": 0.0,
+            "skip_reason": None,
+        }
 
-    if size < 1:
-        print("  ⚠️ 风险预算不足，计算仓位小于最小可执行值，跳过下注")
+    size = float(size_plan.get("gross_order_size") or 0)
+    min_gross_size = float(size_plan.get("min_gross_size") or MIN_BET)
+    requested_net_size = float(size_plan.get("target_net_size") or 0)
+    expected_net_size = float(size_plan.get("expected_net_size") or 0)
+
+    if size <= 0:
+        reason = size_plan.get("skip_reason") or "SIZE_TOO_SMALL"
+        print(f"  ⚠️ 风险预算不足，净仓位计划不可执行({reason})，跳过下注")
         return False, 0, 0, "SKIP_SIZE_TOO_SMALL"
+    if size_plan.get("forced_to_min"):
+        print(
+            f"  📏 最小净仓位补齐: raw_net={size_plan['raw_net_size']:.2f}份 "
+            f"→ target_net={requested_net_size:.2f}份 | gross={size:.2f}份"
+        )
 
     quoted_price = price
     requested_size = size
@@ -778,9 +936,11 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             f"  📊 入场流动性: ask_top3={entry_depth['top3_size']:.1f}份 "
             f"| cap内可买={entry_depth['cover_size']:.1f}份 | 限价上限=${price_cap:.2f}"
         )
-        plan = _plan_fok_entry(sorted_asks_full, size, price, price_cap, ev, MIN_BET)
+        plan = _plan_fok_entry(sorted_asks_full, size, price, price_cap, ev, min_gross_size)
         if not plan or plan["mode"] == "skip":
-            print(f"  ⚠️ cap内 ask 深度不足({entry_depth['cover_size']:.1f}<{MIN_BET})，跳过下注")
+            print(
+                f"  ⚠️ cap内 ask 深度不足({entry_depth['cover_size']:.1f}<{min_gross_size:.1f} gross)，跳过下注"
+            )
             return False, 0, 0, "SKIP_NO_ASK_DEPTH"
         size = plan["size"]
         fok_price = plan["limit_price"]
@@ -788,11 +948,11 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         if plan["mode"] == "reduced":
             print(
                 f"  ⚠️ ask深度不足: cap内仅{plan['coverage']['cover_size']:.1f}份，"
-                f"缩减为{size}份 @ ${fok_price:.2f}"
+                f"缩减为gross {size:.2f}份 (预计net {size * (1 - size_plan.get('entry_fee_rate', 0.0)):.2f}份) @ ${fok_price:.2f}"
             )
         elif fok_price > price:
             print(
-                f"  📡 FOK执行计划: 覆盖{size}份需到${cover_price:.2f}，"
+                f"  📡 FOK执行计划: 覆盖gross {size:.2f}份需到${cover_price:.2f}，"
                 f"限价${price:.2f}→${fok_price:.2f} (追价上限=${plan['chase_cap']:.2f})"
             )
         else:
@@ -844,12 +1004,12 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                     break
 
                 if retry_asks:
-                    retry_plan = _plan_fok_entry(retry_asks, retry_size, retry_price, price_cap, ev, MIN_BET)
+                    retry_plan = _plan_fok_entry(retry_asks, retry_size, retry_price, price_cap, ev, min_gross_size)
                     if not retry_plan or retry_plan["mode"] == "skip":
                         available = _measure_ask_depth(retry_asks, retry_size, max_price=price_cap)
                         print(
                             f"  ⚠️ 重试{retry_idx}: cap内仅剩{available['cover_size']:.1f}份，"
-                            f"不足最小{MIN_BET}份，停止重试"
+                            f"不足最小{min_gross_size:.1f} gross 份，停止重试"
                         )
                         break
                     next_size = retry_plan["size"]
@@ -922,20 +1082,59 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     else:
         actual_price = executed_limit_price
 
-    # 记录下注结果（使用实际成交价）
+    gross_entry_price = actual_price
+    gross_size = actual_size
+    entry_cost = round(float(info.get("making", 0) or (gross_entry_price * gross_size)), 6)
+    effective_entry_price = gross_entry_price
+    effective_size = gross_size
+    buy_fee_shares = 0.0
+    buy_fee_usdc = 0.0
+    token_balance = None
+    if success and gross_size > 0:
+        try:
+            token_balance = clob_client.get_token_balance(token_id)
+        except Exception:
+            token_balance = None
+
+        fill_summary = estimate_buy_fill(
+            price=gross_entry_price,
+            gross_size=gross_size,
+            fee_rate_bps=fee_rate_bps,
+            gross_cost=entry_cost,
+            net_size=token_balance,
+        )
+        effective_entry_price = fill_summary["effective_entry_price"]
+        effective_size = fill_summary["net_size"] or gross_size
+        buy_fee_shares = fill_summary["fee_shares"]
+        buy_fee_usdc = fill_summary["fee_usdc"]
+        if effective_size > 0 and effective_size != gross_size:
+            print(
+                f"  💳 买入手续费: gross={gross_size:.4f}份 → net={effective_size:.4f}份 "
+                f"| fee={buy_fee_shares:.4f}份 (${buy_fee_usdc:.4f})"
+            )
+
+    # 记录下注结果（使用含 fee 的净入场价 / 净份数）
     log_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "slug": slug,
         "direction": direction,
         "token_id": token_id,
-        "price": actual_price,
+        "price": effective_entry_price,
         "quoted_price": quoted_price,
         "limit_price": executed_limit_price,
         "price_source": price_source,
         "snapshot_age_ms": snapshot_age_ms,
-        "size": actual_size,
+        "size": effective_size,
+        "gross_price": gross_entry_price,
+        "gross_size": gross_size,
         "requested_size": requested_size,
-        "amount": actual_price * actual_size,
+        "requested_net_size": requested_net_size,
+        "planned_net_size": expected_net_size,
+        "amount": round(effective_entry_price * effective_size, 6),
+        "gross_amount": entry_cost,
+        "fee_rate_bps": fee_rate_bps,
+        "buy_fee_shares": buy_fee_shares,
+        "buy_fee_usdc": buy_fee_usdc,
         "success": success,
         "pending": False,
         "order_id": info.get("order_id"),
@@ -952,8 +1151,16 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             "token_id": token_id,
             "slug": slug,
             "direction": direction,
-            "entry_price": actual_price,
-            "size": actual_size,
+            "entry_price": effective_entry_price,
+            "size": effective_size,
+            "gross_entry_price": gross_entry_price,
+            "gross_size": gross_size,
+            "requested_net_size": requested_net_size,
+            "planned_net_size": expected_net_size,
+            "entry_cost": entry_cost,
+            "fee_rate_bps": fee_rate_bps,
+            "buy_fee_shares": buy_fee_shares,
+            "buy_fee_usdc": buy_fee_usdc,
             "confidence": confidence,
             "ev": ev,
             "entry_time": datetime.now(timezone.utc).isoformat(),
@@ -974,12 +1181,8 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             if "opposite_token_id" in entry_details:
                 position["opposite_token_id"] = entry_details["opposite_token_id"]
         # 买入后查链上真实余额（同步，写入position供monitor用）
-        try:
-            real_balance = clob_client.get_token_balance(token_id)
-            if real_balance and real_balance > 0:
-                position["token_balance"] = real_balance
-        except Exception:
-            pass
+        if token_balance and token_balance > 0:
+            position["token_balance"] = token_balance
         # allowance刷新异步执行（不阻塞主流程，省~270ms）
         _bet_executor.submit(clob_client.update_token_allowance, token_id)
 
@@ -988,9 +1191,9 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
 
     if pending:
         pending_msg = f"PENDING_LIVE:{info.get('order_id')}" if info.get("order_id") else "PENDING_LIVE"
-        return False, actual_price, actual_size, pending_msg
+        return False, effective_entry_price, effective_size, pending_msg
 
-    return success, actual_price, actual_size, output
+    return success, effective_entry_price, effective_size, output
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.4
+# Polymarket Trading Bot v10.5
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -58,7 +58,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **LMSR Liquidity Assessment**: Orderbook spread/depth/slippage scoring → dynamic discount threshold (8%-20%).
 - **Exit Liquidity Gate (P2)**: Before entering, checks bid-side depth of the chosen token. `bid_depth < 5` → skip entry entirely. Prevents entering positions that can't be exited.
 - **Correlated Exposure Control**: BTC/ETH correlation ~0.85. Same-direction position halves Kelly sizing.
-- **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds. EV≤0 或 Kelly≤0 返回 0（跳过），不再兜底 MIN_BET 强制下注。
+- **1/4 Kelly Sizing**: Binary formula `f* = (p - price) / (1 - price)`, quarter Kelly, 5-10 shares hard bounds. 先按 fee-aware 有效入场价计算目标净仓位；`EV≤0`、`Kelly≤0`、或硬上限不足最小净仓位时跳过。若 `0 < raw_net_size < MIN_BET_SIZE`，则补到最小净仓位后再反推 gross 下单量。
 - **Liquidity-Capped Sizing (P3)**: Kelly size capped at 50% of exit bid depth. Works with P2 — P2 gates entry, P3 adjusts size.
 - **Balance Auto-Retry**: When balance insufficient, automatically retries with reduced size (98%/95%/90%) instead of skipping entirely.
 - **Post-Buy Allowance Refresh**: After successful buy (both direct and pending fill), queries actual on-chain `token_balance` and calls `update_balance_allowance` to ensure sell authorization is pre-set. Prevents "not enough balance / allowance" errors at exit time.
@@ -70,6 +70,9 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **方向化参数配置**: `MAX_BUY_PRICE`/`MIN_EV`/`MIN_CONFIDENCE` 支持 `_UP`/`_DOWN` 后缀按方向覆盖（如 `MIN_EV_UP=0.04`, `MIN_EV_DOWN=0.08`），早期窗口同理。未配置时使用统一阈值。
 - **FOK 入场重构**: 执行前基于 `_get_execution_quote()` 刷新盘口快照，`_plan_fok_entry()` 按 `price_cap`（p_win 限价上限）规划限价和份数。重试时再次刷新盘口，按价格漂移/深度不足分流处理，替代旧的固定 +2tick 提价策略。`_is_explicit_fok_kill()` 区分明确 FOK 拒绝 vs 网络超时，前者跳过链上余额回查。
 - **CLOB 价格校验增强**: `_is_valid_clob_price()` 统一校验价格有效性（0.01 < price < 0.99），替代分散的 `if price is None` 检查。
+- **Fee-Aware EV**: EV 计算扣除 entry_fee_cost + exit_fee_cost（按 `EARLY_EXIT_RATIO` 折算），不再仅扣 spread_cost。`effective_entry_price = price / (1 - fee_rate)` 反映买入手续费对实际入场成本的影响。
+- **Fee-Aware Kelly Sizing**: `calculate_kelly_size()` 先按含 fee 的有效入场价计算目标净仓位，再反推 gross 下单量（`gross = net / fill_ratio`）。支持 `SIZE_STEP`（默认0.1）非整数份额精度。返回详细 dict（`return_details=True`）含 gross_order_size/expected_net_size/skip_reason 等字段。
+- **手续费模块 (`ai_trader/fees.py`)**: `effective_fee_rate(price, fee_rate_bps)` 计算实际 taker fee 比率，支持 fee curve exponent 按市场类别自动推断（crypto 2500bps→exponent=2, 720bps→exponent=1）。`estimate_buy_fill()` / `estimate_sell_fill()` 分别处理买入（shares-based fee）和卖出（USDC-based fee）的 gross→net 换算。
 
 ### Exit (P0-P1 + P4)
 - **PTB Proximity Buffer**: When `abs(crypto_price - ptb_price) / ATR < dynamic_threshold`, crypto is in the "noise zone" near PTB — direction signal is unreliable. Freezes `direction_correct = True` (trusts original bet), suppressing all direction-based stop-losses. Threshold decays with time: 0.7 ATR (first 2min) → 0.3 ATR (mid) → 0.15 ATR (last 1min). Extreme safety valve: token drop ≥50% (`PTB_PROXIMITY_EXTREME_STOP`) forces exit regardless. Configurable via `PTB_PROXIMITY_ATR`.
@@ -100,6 +103,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **平仓锁定机制 (Close Intent)**: 止损决策触发时，`_arm_close_intent()` 将平仓意图持久化到持仓记录（reason + timestamp）。若当轮卖出失败（网络/深度问题），下一轮循环检测到 `close_intent_active` 后直接进入卖出流程，跳过所有条件判断。确保止损决策不因轮询间歇而丢失。所有止损路径（ATR衰减/ATR加速/硬止损/方向翻转/ATR矩阵/方向错误）均已接入。
 - **止损卖出重试**: `market_sell_immediate()` 新增 `max_retries` 参数（默认3），每次重试调用 `_get_fresh_exit_quote()` 刷新盘口定价，替代旧的单次固定降价策略。
 - **抄底后 Allowance 刷新**: Dip-buy（50% 加仓）成交后立即调用 `update_token_allowance()`，避免后续卖出时因 allowance 不足报错。
+- **Fee-Aware 卖出**: 所有卖出路径（`market_sell_immediate`/`sell_position`/`sell_and_confirm`）通过 `estimate_sell_fill()` 计算扣 fee 后的净到手价，日志显示 gross/net/fee 三段明细。
+- **Fee-Aware 抄底**: `_plan_dip_buy_size()` 按 fee-aware 逻辑规划抄底 gross 下单量，`_finalize_dip_fill()` 用链上 `token_balance` 校准实际净到手份数，持仓记录含 `dip_buy_fee_shares`/`dip_buy_fee_usdc`/`dip_buy_cost`。
 - **ATR衰减止损连续确认**: ATR 衰减止损（ATR < 0.5 且衰减 >70%）进入待确认状态后，需 `ATR_DECAY_CONFIRMATIONS`（默认 3）轮连续确认 + `true_direction_correct=False` 才触发平仓，防止单点插针误杀赢单。近邻冻结区内同样受此保护。
 - **方向降级开关**: `ENABLE_DIRECTION_DOWNGRADE=0`（默认关闭）— 不再把底层方向实际正确的单子强行降级为方向错误。仅当显式开启时，ATR < `ATR_DOWNGRADE_THRESHOLD` 才降级 direction_correct。
 - **收盘价冻结**: 收盘前 5s 冻结底层 crypto 价格到 `close_crypto_price`。当 API 无 outcome 需回退判断时，优先使用冻结价（而非实时价，实时价可能已漂移到下一个市场）。
@@ -127,7 +132,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
 - **隔夜仓位 PnL 隔离**: `pending_costs` 存储 `{cost, session_date}`，跨天结算的仓位成本不回补到新交易日的 daily_pnl，防止隔夜仓位污染当日风控额度。旧格式自动兼容迁移。
-- **Auto Redeem + PnL 匹配**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`)，结算后匹配 `positions.jsonl` 计算真实成本基准和净收益，shows USDC balance + PnL stats after each round
+- **Auto Redeem + PnL 匹配**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`)，结算后匹配 `positions.jsonl` 计算真实成本基准和净收益，shows USDC balance + PnL stats after each round. 多钱包余额展示（EOA + Proxy + 合计）。`find_redeemable()` 按 condition_id 分组遍历所有 token 查链上余额，修复同一 condition 多 token 场景遗漏。
 - **Watchdog**: `watchdog_v3.sh` monitors all 3 services and auto-restarts on failure
 - **systemd Management**: Auto-restart on crash, boot-start
 
@@ -136,13 +141,14 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | File | Role |
 |------|------|
 | `auto_bot_v3.py` | Main engine: market discovery, warmup, early/late betting, correlation control |
-| `ai_trader/clob_client.py` | CLOB SDK wrapper: global singleton, GTC/FOK orders, balance, orderbook, warmup |
+| `ai_trader/clob_client.py` | CLOB SDK wrapper: global singleton, GTC/FOK orders, balance, orderbook, warmup, fee_rate_bps |
 | `ai_analyze_v2.py` | Decision engine: strict EV, Kelly sizing, Bayesian fusion, bet execution, pending order tracking |
 | `ai_trader/ai_model_v2.py` | Scoring model: ATR deviation → token value estimation → discount |
 | `ai_trader/base_rate.py` | Base Rate calibration: conservative priors + empirical learning |
 | `scripts/validate_base_rate.py` | Base Rate calibration validator: ATR-band win rates vs priors |
 | `ai_trader/bayesian_engine.py` | Bayesian sequential updater: sigmoid likelihood, log-space, anti-saturation |
 | `ai_trader/lmsr_liquidity.py` | Orderbook liquidity: spread + depth + slippage → dynamic threshold |
+| `ai_trader/fees.py` | Taker fee helpers: effective_fee_rate, estimate_buy_fill, estimate_sell_fill |
 | `position_monitor.py` | EV-driven exit + 4-stage closing + pending order reconciliation + outcome recording |
 | `auto_redeem_v2.py` | Auto claim settled positions (REST API + on-chain redeem) |
 | `ai_trader/pyth_api.py` | Pyth Network on-chain price stream: SSE real-time + REST fallback (primary for position monitor) |
@@ -239,6 +245,10 @@ clob_client.get_balance()                  # USDC collateral
 clob_client.get_token_balance(token_id)    # Conditional token balance
 clob_client.update_token_allowance(token_id) # Refresh token sell authorization
 
+# Fees & Metadata
+clob_client.get_fee_rate_bps(token_id)     # Token taker fee (bps), 0 for fee-free
+clob_client.get_token_metadata(token_id)   # Cached token metadata dict
+
 # Warmup & Cache
 clob_client.precache_tokens([t1, t2])      # Parallel neg_risk/fee_rate/tick_size cache
 clob_client.invalidate_book_cache(token_id) # Clear orderbook cache after trades
@@ -289,7 +299,7 @@ See `.env.example` for all configurable parameters:
 |----------|----------|-------------|
 | `EOA_WALLET` | Yes | EOA wallet address for signing |
 | `PROXY_WALLET` | Yes | Polymarket proxy wallet (holds positions, see Settings on polymarket.com) |
-| `CLOB_SIGNATURE_TYPE` | No | `0` = EOA direct (default), `1` = Polymarket Gnosis Safe proxy |
+| `CLOB_SIGNATURE_TYPE` | No | `0` = EOA direct, `1` = POLY_PROXY (Magic/email), `2` = GNOSIS_SAFE (browser wallet / most Polymarket.com proxy wallets) |
 | `PRIVATE_KEY` | Yes | Private key for SDK signing + on-chain settlement |
 | `POLYGON_RPC_URL` | No | Polygon RPC endpoint (default: public) |
 | `TELEGRAM_BOT_TOKEN` | No | Telegram bot token for notifications |
@@ -299,6 +309,8 @@ See `.env.example` for all configurable parameters:
 | `MAX_OPEN_POSITIONS` | No | Max concurrent positions (default: 2) |
 | `MIN_BET_SIZE` | No | Min shares per bet (default: 5) |
 | `MAX_BET_SIZE` | No | Max shares per bet — raise to scale with balance (default: 10) |
+| `MAX_ENTRY_BALANCE_PCT` | No | Max fraction of wallet balance allowed for a single entry before fee/min-size checks (default: 0.20) |
+| `SIZE_STEP` | No | Entry order size rounding step for gross shares (default: 0.1) |
 | `MIN_BALANCE` | No | Min balance to place bets (default: 5) |
 | `MAX_BUY_PRICE` | No | Max buy price for entry (default: 0.90) |
 | `MIN_EV` | No | Min EV for late window (default: 0.10) |

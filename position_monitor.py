@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import requests
 from ai_trader.polymarket_api import normalize_orderbook
 from ai_trader import clob_client
+from ai_trader.fees import effective_fee_rate, estimate_buy_fill, estimate_sell_fill
 from ai_trader.binance_api import price_stream as _price_stream
 from ai_trader.pyth_api import pyth_stream as _pyth_stream, get_pyth_price
 from ai_trader.polymarket_ws import poly_ws as _poly_ws
@@ -176,6 +177,139 @@ def _safe_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _size_step():
+    step = _safe_float(os.environ.get("SIZE_STEP")) or 0.1
+    return step if step > 0 else 0.1
+
+
+def _round_size(value, mode="nearest", step=None):
+    value = max(_safe_float(value) or 0.0, 0.0)
+    step = step or _size_step()
+    if step <= 0:
+        return round(value, 6)
+
+    units = value / step
+    if mode == "ceil":
+        rounded_units = math.ceil(units - 1e-9)
+    elif mode == "floor":
+        rounded_units = math.floor(units + 1e-9)
+    else:
+        rounded_units = round(units)
+    return round(rounded_units * step, 6)
+
+
+def _buy_fill_ratio(price, fee_rate_bps):
+    fee_rate = effective_fee_rate(price, fee_rate_bps)
+    return max(1.0 - fee_rate, 1e-9), fee_rate
+
+
+def _plan_dip_buy_size(token_id, original_size, buy_price):
+    original_net_size = max(_safe_float(original_size) or 0.0, 0.0)
+    if original_net_size <= 0 or buy_price <= 0:
+        return {
+            "gross_order_size": 0.0,
+            "target_net_size": 0.0,
+            "expected_net_size": 0.0,
+            "min_gross_size": 0.0,
+            "fee_rate_bps": 0,
+            "entry_fee_rate": 0.0,
+            "forced_to_min": False,
+            "skip_reason": "NON_POSITIVE_TARGET",
+        }
+
+    min_net = float(os.environ.get("MIN_BET_SIZE", "5"))
+    max_net = float(os.environ.get("MAX_BET_SIZE", "10"))
+    size_step = _size_step()
+    fee_rate_bps = clob_client.get_fee_rate_bps(token_id)
+    fill_ratio, entry_fee_rate = _buy_fill_ratio(buy_price, fee_rate_bps)
+    raw_net_size = original_net_size * DIP_BUY_SIZE_RATIO
+    forced_to_min = 0 < raw_net_size < min_net
+
+    max_net_by_balance = None
+    try:
+        balance = _safe_float(clob_client.get_balance())
+    except Exception:
+        balance = None
+    if balance is not None and buy_price > 0:
+        max_gross_by_balance = _round_size(balance / buy_price, mode="floor", step=size_step)
+        max_net_by_balance = max_gross_by_balance * fill_ratio
+    else:
+        max_gross_by_balance = None
+
+    hard_net_cap = max_net
+    if max_net_by_balance is not None:
+        hard_net_cap = min(hard_net_cap, max_net_by_balance)
+    if hard_net_cap < min_net:
+        return {
+            "gross_order_size": 0.0,
+            "target_net_size": 0.0,
+            "expected_net_size": 0.0,
+            "min_gross_size": _round_size(min_net / fill_ratio, mode="ceil", step=size_step),
+            "fee_rate_bps": fee_rate_bps,
+            "entry_fee_rate": round(entry_fee_rate, 6),
+            "forced_to_min": forced_to_min,
+            "skip_reason": "HARD_CAP_BELOW_MIN",
+        }
+
+    target_net_size = min(max_net, max(raw_net_size, min_net))
+    if not forced_to_min:
+        target_net_size = min(max_net, raw_net_size)
+    target_net_size = min(target_net_size, hard_net_cap)
+
+    gross_order_size = _round_size(target_net_size / fill_ratio, mode="ceil", step=size_step)
+    min_gross_size = _round_size(min_net / fill_ratio, mode="ceil", step=size_step)
+    if max_gross_by_balance is not None and gross_order_size > max_gross_by_balance + 1e-9:
+        gross_order_size = max_gross_by_balance
+    expected_net_size = gross_order_size * fill_ratio
+    if expected_net_size < min_net:
+        return {
+            "gross_order_size": 0.0,
+            "target_net_size": round(target_net_size, 6),
+            "expected_net_size": round(expected_net_size, 6),
+            "min_gross_size": min_gross_size,
+            "fee_rate_bps": fee_rate_bps,
+            "entry_fee_rate": round(entry_fee_rate, 6),
+            "forced_to_min": forced_to_min,
+            "skip_reason": "EXPECTED_NET_BELOW_MIN",
+        }
+
+    return {
+        "gross_order_size": gross_order_size,
+        "target_net_size": round(target_net_size, 6),
+        "expected_net_size": round(expected_net_size, 6),
+        "min_gross_size": min_gross_size,
+        "fee_rate_bps": fee_rate_bps,
+        "entry_fee_rate": round(entry_fee_rate, 6),
+        "forced_to_min": forced_to_min,
+        "skip_reason": None,
+    }
+
+
+def _position_size(position):
+    token_balance = _safe_float(position.get("token_balance")) if isinstance(position, dict) else None
+    if token_balance and token_balance > 0:
+        return token_balance
+    size = _safe_float(position.get("size")) if isinstance(position, dict) else None
+    return size or 0.0
+
+
+def _realized_trade_size(position):
+    total = _position_size(position)
+    for partial in position.get("partial_exits", []) or []:
+        total += _safe_float(partial.get("size")) or 0.0
+    return round(total, 6)
+
+
+def _sell_fill_summary(token_id, size, gross_proceeds, gross_price):
+    fee_rate_bps = clob_client.get_fee_rate_bps(token_id)
+    return estimate_sell_fill(
+        price=gross_price,
+        size=size,
+        fee_rate_bps=fee_rate_bps,
+        gross_proceeds=gross_proceeds,
+    )
 
 
 def send_telegram(text):
@@ -585,7 +719,7 @@ def _bucket_exit_error(error_text):
 def _calculate_total_realized_pnl(position, final_exit_price):
     """聚合部分成交和最终平仓，得到整笔交易的真实 realized PnL。"""
     entry = _safe_float(position.get("entry_price")) or 0.0
-    final_size = _safe_float(position.get("size")) or 0.0
+    final_size = _position_size(position)
     final_exit_price = _safe_float(final_exit_price) or 0.0
 
     total_pnl = (final_exit_price - entry) * final_size if entry > 0 and final_size > 0 else 0.0
@@ -657,8 +791,13 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
             }
 
         if info["matched"]:
-            actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
-            print(f"    ⚡ 市价成交: Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
+            gross_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
+            fill_summary = _sell_fill_summary(token_id, size, info.get("taking", 0), gross_price)
+            actual_price = round(fill_summary["net_price"], 4)
+            print(
+                f"    ⚡ 市价成交: gross=${gross_price:.4f} | net=${actual_price:.4f} "
+                f"| fee=${fill_summary['fee_usdc']:.4f} | {info.get('elapsed_ms', 0):.0f}ms"
+            )
             return True, actual_price
 
         err = info.get("error", "") or info.get("raw", "")
@@ -724,8 +863,14 @@ def sell_position(token_id, size, price, max_retries=3):
     for attempt in range(max_retries):
         info = clob_client.place_fok_order(token_id, SELL, price, size)
         if info["matched"]:
-            actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
-            print(f"    📊 成交确认: Status={info['status']} | Taking=${info['taking']:.4f} | 实际价=${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
+            gross_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
+            fill_summary = _sell_fill_summary(token_id, size, info.get("taking", 0), gross_price)
+            actual_price = round(fill_summary["net_price"], 4)
+            print(
+                f"    📊 成交确认: Status={info['status']} | gross=${gross_price:.4f} "
+                f"| net=${actual_price:.4f} | fee=${fill_summary['fee_usdc']:.4f} "
+                f"| {info.get('elapsed_ms', 0):.0f}ms"
+            )
             return True, info["raw"], actual_price
         # 余额/授权不足 → 立即停止，不降价重试
         err = info.get("error", "") or info.get("raw", "")
@@ -788,7 +933,8 @@ def close_position(position, exit_price):
             extra={
                 "entry_price": entry,
                 "exit_price": exit_price,
-                "size": position.get("size", 0),
+                "size": _realized_trade_size(position),
+                "entry_cost": round((_safe_float(entry) or 0.0) * _realized_trade_size(position), 6),
                 "realized_pnl": total_pnl,
                 "realized_won": realized_won,
                 "directional_won": directional_won,
@@ -802,13 +948,12 @@ def close_position(position, exit_price):
     try:
         from trading_state import record_bet_result, settle_bet_cost
         entry = position.get("entry_price", 0)
-        size = position.get("size", 0)
-        pnl = (exit_price - entry) * size if entry > 0 else 0.0
+        size = _position_size(position)
         total_pnl = _calculate_total_realized_pnl(position, exit_price)
         won = total_pnl > 0
         slug = position.get("slug", "unknown")
         # 用实际盈亏替换预扣成本
-        settle_bet_cost(slug, pnl)
+        settle_bet_cost(slug, total_pnl)
         record_bet_result(won, slug, pnl=0.0)  # pnl已在settle中处理，这里只更新胜负统计
     except Exception:
         pass
@@ -827,6 +972,7 @@ def update_position(position, new_size=None, partial_exit=None):
                             if pos.get("token_id") == position["token_id"] and pos.get("entry_time") == position["entry_time"]:
                                 if new_size is not None:
                                     pos["size"] = new_size
+                                    pos["token_balance"] = new_size
                                 if partial_exit:
                                     history = pos.get("partial_exits", [])
                                     history.append(partial_exit)
@@ -834,7 +980,9 @@ def update_position(position, new_size=None, partial_exit=None):
                                     pos["last_partial_exit"] = partial_exit
                                 # 同步调用方修改的字段（如抄底后的entry_price/original_size等）
                                 for sync_key in ("entry_price", "original_entry_price", "original_size",
-                                                 "dip_buy_price", "dip_buy_size",
+                                                 "dip_buy_price", "dip_buy_size", "dip_buy_gross_size",
+                                                 "dip_buy_fee_shares", "dip_buy_fee_usdc", "dip_buy_cost",
+                                                 "entry_cost",
                                                  "close_crypto_price", "close_crypto_time",
                                                  "close_intent_active", "close_intent_reason", "close_intent_at"):
                                     if sync_key in position:
@@ -1142,54 +1290,96 @@ def execute_dip_buy(token_id, original_size, coin, slug, pos):
             return False, 0, None
     except Exception:
         pass
-    dip_size = max(1, int(original_size * DIP_BUY_SIZE_RATIO))
     best_ask = get_best_ask(token_id)
     if not best_ask or best_ask >= 0.95:
         print(f"    ❌ 抄底失败: best_ask={best_ask}, 无法买入")
         return False, 0, None
 
     buy_price = round(best_ask, 2)
-    print(f"    🟢 抄底下单: {dip_size}份 × ${buy_price:.2f} (FOK)")
+    dip_plan = _plan_dip_buy_size(token_id, original_size, buy_price)
+    dip_size = float(dip_plan.get("gross_order_size") or 0.0)
+    if dip_size <= 0:
+        print(f"    ⚠️ 抄底跳过: {dip_plan.get('skip_reason') or 'SIZE_TOO_SMALL'}")
+        return False, 0, None
+
+    current_net_size = _position_size(pos)
+    if dip_plan.get("forced_to_min"):
+        print(
+            f"    📏 抄底最小净仓位补齐: raw_net={(original_size or 0) * DIP_BUY_SIZE_RATIO:.2f}份 "
+            f"→ target_net={dip_plan['target_net_size']:.2f}份 | gross={dip_size:.2f}份"
+        )
+    print(
+        f"    🟢 抄底下单: gross {dip_size:.2f}份 "
+        f"(目标net {dip_plan['target_net_size']:.2f} / 预计net {dip_plan['expected_net_size']:.2f}) × ${buy_price:.2f} (FOK)"
+    )
+
+    def _finalize_dip_fill(info, fallback_price, planned_gross_size):
+        actual_gross_size = planned_gross_size
+        if info.get("taking", 0):
+            actual_gross_size = round(float(info.get("taking", 0) or planned_gross_size), 6)
+        actual_gross_price = round(
+            info["making"] / actual_gross_size, 4
+        ) if actual_gross_size > 0 and info.get("making", 0) > 0 else fallback_price
+        entry_cost = round(float(info.get("making", 0) or (actual_gross_price * actual_gross_size)), 6)
+
+        total_balance = None
+        net_added_size = None
+        try:
+            total_balance = _safe_float(clob_client.get_token_balance(token_id))
+        except Exception:
+            total_balance = None
+        if total_balance is not None and total_balance > 0:
+            net_added_size = max(round(total_balance - current_net_size, 6), 0.0)
+
+        fill_summary = estimate_buy_fill(
+            price=actual_gross_price,
+            gross_size=actual_gross_size,
+            fee_rate_bps=dip_plan["fee_rate_bps"],
+            gross_cost=entry_cost,
+            net_size=net_added_size,
+        )
+        bought_net_size = fill_summary["net_size"] or actual_gross_size
+        effective_buy_price = fill_summary["effective_entry_price"]
+        if bought_net_size <= 0:
+            return False, 0.0, None
+
+        if total_balance is not None and total_balance > 0:
+            pos["token_balance"] = total_balance
+        else:
+            pos["token_balance"] = round(current_net_size + bought_net_size, 6)
+        pos["dip_buy_gross_size"] = actual_gross_size
+        pos["dip_buy_fee_shares"] = fill_summary["fee_shares"]
+        pos["dip_buy_fee_usdc"] = fill_summary["fee_usdc"]
+        pos["dip_buy_cost"] = entry_cost
+
+        print(
+            f"    ✅ 抄底成交: gross {actual_gross_size:.4f}份 → net {bought_net_size:.4f}份 "
+            f"× ${effective_buy_price:.4f} | fee=${fill_summary['fee_usdc']:.4f} | {info.get('elapsed_ms', 0):.0f}ms"
+        )
+        try:
+            clob_client.update_token_allowance(token_id)
+            print("    🔓 抄底后刷新卖出allowance")
+        except Exception:
+            pass
+        try:
+            from trading_state import record_bet_cost
+            record_bet_cost(slug, round(entry_cost, 4))
+            print(f"    📉 抄底预扣成本 ${entry_cost:.2f}")
+        except Exception:
+            pass
+        return True, bought_net_size, effective_buy_price
+
     try:
         info = clob_client.place_fok_order(token_id, BUY, buy_price, dip_size)
         if info["matched"]:
-            actual_price = round(info["making"] / dip_size, 4) if dip_size > 0 and info["making"] > 0 else buy_price
-            print(f"    ✅ 抄底成交: {dip_size}份 × ${actual_price:.4f} | {info.get('elapsed_ms', 0):.0f}ms")
-            try:
-                clob_client.update_token_allowance(token_id)
-                print("    🔓 抄底后刷新卖出allowance")
-            except Exception:
-                pass
-            # 预扣抄底成本到daily_pnl（record_bet_cost会累加到已有pending_costs）
-            try:
-                from trading_state import record_bet_cost
-                dip_cost = round(actual_price * dip_size, 4)
-                record_bet_cost(slug, dip_cost)
-                print(f"    📉 抄底预扣成本 ${dip_cost:.2f}")
-            except Exception:
-                pass
-            return True, dip_size, actual_price
+            return _finalize_dip_fill(info, buy_price, dip_size)
         print(f"    ❌ 抄底FOK未成交: Status={info.get('status')} | {info.get('elapsed_ms', 0):.0f}ms")
 
         # 提高出价重试一次
         buy_price2 = round(min(buy_price + 0.01, 0.95), 2)
         info2 = clob_client.place_fok_order(token_id, BUY, buy_price2, dip_size)
         if info2["matched"]:
-            actual_price2 = round(info2["making"] / dip_size, 4) if dip_size > 0 and info2["making"] > 0 else buy_price2
-            print(f"    ✅ 抄底重试成交: {dip_size}份 × ${actual_price2:.4f} | {info2.get('elapsed_ms', 0):.0f}ms")
-            try:
-                clob_client.update_token_allowance(token_id)
-                print("    🔓 抄底后刷新卖出allowance")
-            except Exception:
-                pass
-            try:
-                from trading_state import record_bet_cost
-                dip_cost2 = round(actual_price2 * dip_size, 4)
-                record_bet_cost(slug, dip_cost2)
-                print(f"    📉 抄底预扣成本 ${dip_cost2:.2f}")
-            except Exception:
-                pass
-            return True, dip_size, actual_price2
+            return _finalize_dip_fill(info2, buy_price2, dip_size)
         return False, 0, None
     except Exception as e:
         print(f"    ❌ 抄底异常: {str(e)[:80]}")
@@ -1574,11 +1764,15 @@ def reconcile_pending_orders():
             if not entry_price:
                 entry_price = order.get("limit_price", 0.50)
 
-            size = filled_size if filled_size else order.get("requested_size") or order.get("size") or 0
+            gross_size = filled_size if filled_size else order.get("requested_size") or order.get("size") or 0
+            size = gross_size
 
             coin = _coin_from_slug(slug)
             confidence = order.get("confidence") or 0
             ev = order.get("ev") or 0
+            fee_rate_bps = clob_client.get_fee_rate_bps(token_id)
+            entry_cost = round((_safe_float(entry_price) or 0.0) * gross_size, 6)
+            real_balance = None
 
             position = {
                 "token_id": token_id,
@@ -1592,6 +1786,10 @@ def reconcile_pending_orders():
                 "closed": False,
                 "pending_order_id": order.get("order_id") or order.get("pending_id"),
                 "entry_price_source": price_source,
+                "gross_entry_price": entry_price,
+                "gross_size": gross_size,
+                "entry_cost": entry_cost,
+                "fee_rate_bps": fee_rate_bps,
             }
 
             entry_details = order.get("entry_details") or {}
@@ -1610,7 +1808,20 @@ def reconcile_pending_orders():
             try:
                 real_balance = get_token_balance(token_id)
                 if real_balance and real_balance > 0:
+                    fill_summary = estimate_buy_fill(
+                        price=entry_price,
+                        gross_size=gross_size,
+                        fee_rate_bps=fee_rate_bps,
+                        gross_cost=entry_cost,
+                        net_size=real_balance,
+                    )
+                    size = fill_summary["net_size"] or gross_size
+                    entry_price = fill_summary["effective_entry_price"]
+                    position["entry_price"] = entry_price
+                    position["size"] = size
                     position["token_balance"] = real_balance
+                    position["buy_fee_shares"] = fill_summary["fee_shares"]
+                    position["buy_fee_usdc"] = fill_summary["fee_usdc"]
                 clob_client.update_token_allowance(token_id)
             except Exception:
                 pass
@@ -1763,7 +1974,9 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5, position=None):
             f"making={info['making']:.4f} taking={info['taking']:.4f} | {info.get('elapsed_ms', 0):.0f}ms"
         )
         if info["matched"]:
-            actual_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
+            gross_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else price
+            fill_summary = _sell_fill_summary(token_id, size, info.get("taking", 0), gross_price)
+            actual_price = round(fill_summary["net_price"], 4)
             return True, actual_price
 
         err = info.get("error", "") or info.get("raw", "")
@@ -1775,7 +1988,9 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5, position=None):
                 clob_client.update_token_allowance(token_id)
                 info2 = clob_client.place_fok_order(token_id, SELL, price, size)
                 if info2["matched"]:
-                    actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else price
+                    gross_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else price
+                    fill_summary = _sell_fill_summary(token_id, size, info2.get("taking", 0), gross_price)
+                    actual_price = round(fill_summary["net_price"], 4)
                     return True, actual_price
                 err2 = info2.get("error", "") or info2.get("raw", "")
                 if "not enough balance" in err2.lower():
@@ -1789,8 +2004,13 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5, position=None):
             print(f"    🔄 原价无买方，降至$0.01地板价重试")
             info3 = clob_client.place_fok_order(token_id, SELL, 0.01, size)
             if info3["matched"]:
-                actual_price = round(info3["taking"] / size, 4) if size > 0 and info3["taking"] > 0 else 0.01
-                print(f"    ⚡ 地板价成交: Taking=${info3['taking']:.4f} | 实际价=${actual_price:.4f} | {info3.get('elapsed_ms', 0):.0f}ms")
+                gross_price = round(info3["taking"] / size, 4) if size > 0 and info3["taking"] > 0 else 0.01
+                fill_summary = _sell_fill_summary(token_id, size, info3.get("taking", 0), gross_price)
+                actual_price = round(fill_summary["net_price"], 4)
+                print(
+                    f"    ⚡ 地板价成交: gross=${gross_price:.4f} | net=${actual_price:.4f} "
+                    f"| fee=${fill_summary['fee_usdc']:.4f} | {info3.get('elapsed_ms', 0):.0f}ms"
+                )
                 return True, actual_price
             err3 = info3.get("error", "") or info3.get("raw", "")
             if "not enough balance" in err3.lower():
@@ -1807,7 +2027,9 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5, position=None):
                 try:
                     info2 = clob_client.place_fok_order(token_id, SELL, price, size)
                     if info2["matched"]:
-                        actual_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else price
+                        gross_price = round(info2["taking"] / size, 4) if size > 0 and info2["taking"] > 0 else price
+                        fill_summary = _sell_fill_summary(token_id, size, info2.get("taking", 0), gross_price)
+                        actual_price = round(fill_summary["net_price"], 4)
                         return True, actual_price
                 except Exception:
                     pass
@@ -2511,13 +2733,14 @@ def monitor():
                         if dip_ok:
                             dip_bought[attempt_key] = True
                             # 更新仓位: size增加, 记录原始size, 均价调整
-                            new_size = size + bought_size
-                            total_cost = entry_price * size + buy_price * bought_size
-                            new_avg_price = total_cost / new_size
+                            new_size = _safe_float(pos.get("token_balance")) or round(size + bought_size, 6)
+                            total_cost = round(entry_price * size + buy_price * bought_size, 6)
+                            new_avg_price = total_cost / new_size if new_size > 0 else entry_price
                             pos["original_size"] = pos.get("original_size") or size
                             pos["original_entry_price"] = pos.get("original_entry_price") or entry_price
                             pos["dip_buy_price"] = buy_price
                             pos["dip_buy_size"] = bought_size
+                            pos["entry_cost"] = total_cost
                             pos["entry_price"] = new_avg_price
                             update_position(pos, new_size=new_size)
                             pos["size"] = new_size
