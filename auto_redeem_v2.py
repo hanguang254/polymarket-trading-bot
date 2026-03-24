@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Polymarket 自动领取已结算收益脚本 v3.6
-- data-api REST 查持仓 + web3 EOA 直接链上结算（不走 Gnosis Safe）
+Polymarket 自动领取已结算收益脚本 v3.7
+- data-api REST 查持仓 + web3 链上结算（支持 EOA / 1-of-1 Gnosis Safe）
 - EOA 直接调用 CTF.redeemPositions / NegRiskAdapter.redeemPositions
+- 官网 proxy wallet (1/1 Safe) 由 owner EOA 通过 execTransaction 代 Safe 执行 redeem
 - 并行 redeem: 预分配 nonce + 批量发送 + 统一收回执（117笔 ~20s）
 - revert 自动切换 normal↔neg-risk 重试
 - 链上验证余额变化，防止假标记
@@ -31,6 +32,7 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 EOA_WALLET = os.environ.get("EOA_WALLET", "").strip()
 PROXY_WALLET = os.environ.get("PROXY_WALLET", "").strip()
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "").strip()
+CLOB_SIGNATURE_TYPE = int(os.environ.get("CLOB_SIGNATURE_TYPE", "0"))
 if not PROXY_WALLET or not PRIVATE_KEY:
     raise RuntimeError("PROXY_WALLET and PRIVATE_KEY must be set in .env")
 RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com").strip()
@@ -52,6 +54,7 @@ CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"       # Conditional T
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # NegRiskAdapter
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"      # USDC (PoS) on Polygon
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" # Multicall3 (Polygon)
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # ==============================================================================
 # 最小 ABI
@@ -79,6 +82,25 @@ USDC_ABI = [
         "type": "function",
     }
 ]
+
+SAFE_ABI = [
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "getOwners",
+        "outputs": [{"name": "", "type": "address[]"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "getThreshold",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+]
+
+_SAFE_CONTEXT_CACHE: dict[str, dict] = {}
 
 # ==============================================================================
 # 日志：终端 + 按天日志文件
@@ -165,6 +187,30 @@ def mark_redeemed(redeemed: dict, condition_id: str, slug: str, value: float,
         "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     save_redeemed(redeemed)
+
+
+def clear_stale_redeemed_marks(redeemed: dict, redeemable: list[dict]) -> int:
+    """
+    每轮动态清理误标记：
+    如果某个 condition 已在 redeemed_conditions.json 中，
+    但本轮扫描时链上余额仍 > 0，说明它并未真正领干净，移除标记立即重试。
+    """
+    stale_ids = {
+        r.get("condition_id")
+        for r in redeemable
+        if r.get("condition_id") in redeemed and (r.get("balance", 0) or 0) > 0
+    }
+    stale_ids.discard(None)
+
+    if not stale_ids:
+        return 0
+
+    for cid in stale_ids:
+        del redeemed[cid]
+
+    save_redeemed(redeemed)
+    log.info(f"🔄 发现 {len(stale_ids)} 个已标记但链上仍有余额的头寸，已移除标记并重新领取")
+    return len(stale_ids)
 
 
 def _safe_float(value) -> float | None:
@@ -499,26 +545,100 @@ def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
     return redeemable
 
 # ==============================================================================
-# EOA 直接链上 Redeem
+# 链上 Redeem（EOA / Proxy Safe）
 # ==============================================================================
 
-def _send_tx(w3: Web3, wallet, target: str, call_data: bytes) -> str | None:
+def _get_safe_context(w3: Web3, safe_address: str) -> dict:
+    safe_cs = Web3.to_checksum_address(safe_address)
+    cached = _SAFE_CONTEXT_CACHE.get(safe_cs)
+    if cached:
+        return cached
+
+    safe_contract = w3.eth.contract(address=safe_cs, abi=SAFE_ABI)
+    threshold = safe_contract.functions.getThreshold().call()
+    owners = [Web3.to_checksum_address(addr) for addr in safe_contract.functions.getOwners().call()]
+
+    context = {
+        "address": safe_cs,
+        "contract": safe_contract,
+        "threshold": threshold,
+        "owners": owners,
+    }
+    _SAFE_CONTEXT_CACHE[safe_cs] = context
+    return context
+
+
+def _build_safe_prevalidated_signature(owner_address: str) -> bytes:
+    owner_hex = owner_address.lower().replace("0x", "").rjust(64, "0")
+    return bytes.fromhex(owner_hex) + (b"\x00" * 32) + b"\x01"
+
+
+def _build_safe_exec_calldata(w3: Web3, wallet, safe_address: str, target: str, call_data: bytes) -> bytes:
+    safe_ctx = _get_safe_context(w3, safe_address)
+    wallet_cs = Web3.to_checksum_address(wallet.address)
+
+    if safe_ctx["threshold"] != 1:
+        raise RuntimeError(f"proxy safe threshold={safe_ctx['threshold']}，当前脚本只支持 1/1 Safe")
+    if wallet_cs not in safe_ctx["owners"]:
+        raise RuntimeError(f"EOA {wallet.address} 不是 proxy safe owner，无法代 safe 执行 redeem")
+
+    selector = w3.keccak(
+        text="execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)"
+    )[:4]
+    return selector + abi_encode(
+        ["address", "uint256", "bytes", "uint8", "uint256", "uint256", "uint256", "address", "address", "bytes"],
+        [
+            Web3.to_checksum_address(target),
+            0,
+            call_data,
+            0,
+            0,
+            0,
+            0,
+            Web3.to_checksum_address(ZERO_ADDRESS),
+            Web3.to_checksum_address(ZERO_ADDRESS),
+            _build_safe_prevalidated_signature(wallet.address),
+        ],
+    )
+
+
+def _prepare_execution_tx(w3: Web3, wallet, holder: str | None, target: str, call_data: bytes) -> tuple[str, bytes, int, str]:
+    holder_cs = Web3.to_checksum_address(holder or wallet.address)
+    wallet_cs = Web3.to_checksum_address(wallet.address)
+
+    if holder_cs == wallet_cs:
+        return Web3.to_checksum_address(target), call_data, REDEEM_FIXED_GAS, "eoa"
+
+    proxy_cs = Web3.to_checksum_address(PROXY_WALLET)
+    if holder_cs != proxy_cs:
+        raise RuntimeError(f"发现持仓在未知 holder={holder_cs}，当前脚本只支持 EOA 或配置的 PROXY_WALLET")
+    if CLOB_SIGNATURE_TYPE != 2:
+        raise RuntimeError(
+            f"proxy 持仓当前只支持 CLOB_SIGNATURE_TYPE=2 (GNOSIS_SAFE)，当前为 {CLOB_SIGNATURE_TYPE}"
+        )
+
+    safe_exec_data = _build_safe_exec_calldata(w3, wallet, proxy_cs, target, call_data)
+    return proxy_cs, safe_exec_data, SAFE_REDEEM_FIXED_GAS, "gnosis-safe"
+
+
+def _send_tx(w3: Web3, wallet, target: str, call_data: bytes, holder: str | None = None) -> str | None:
     """
-    EOA 直接发送交易到目标合约
+    发送链上交易到目标合约。
+    holder=EOA 时直发；holder=Proxy Safe 时包装成 execTransaction 由 owner EOA 触发。
     gasPrice 加 1.3x 倍率应对 Polygon 拥堵；超时后回查 receipt 兜底。
 
     Returns: tx_hash hex string on success, None on failure
     """
-    target_cs = Web3.to_checksum_address(target)
+    target_cs, tx_data, _, route = _prepare_execution_tx(w3, wallet, holder, target, call_data)
 
     gas_estimate = w3.eth.estimate_gas(
-        {"from": wallet.address, "to": target_cs, "data": call_data}
+        {"from": wallet.address, "to": target_cs, "data": tx_data}
     )
 
     tx = w3.eth.account.sign_transaction(
         {
             "to": target_cs,
-            "data": call_data,
+            "data": tx_data,
             "gas": gas_estimate + 50_000,
             "gasPrice": int(w3.eth.gas_price * 1.3),
             "nonce": w3.eth.get_transaction_count(wallet.address, "pending"),
@@ -543,14 +663,16 @@ def _send_tx(w3: Web3, wallet, target: str, call_data: bytes) -> str | None:
         raise TimeoutError(f"tx_pending:{tx_hash.hex()}")
 
     if receipt.status == 1:
+        if route == "gnosis-safe":
+            log.info(f"  🔐 proxy safe 已执行 redeem: {target_cs[:10]}...")
         return tx_hash.hex()
     return None
 
 
-def redeem_normal(w3: Web3, wallet, cond_id: str) -> str | None:
+def redeem_normal(w3: Web3, wallet, cond_id: str, holder: str | None = None) -> str | None:
     """
     普通市场 redeem: CTF.redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
-    EOA 直接调用 CTF 合约
+    EOA 直调或经 1/1 Safe 转发到 CTF 合约
     """
     usdc_cs = Web3.to_checksum_address(USDC_ADDRESS)
 
@@ -567,13 +689,13 @@ def redeem_normal(w3: Web3, wallet, cond_id: str) -> str | None:
         ],
     )
 
-    return _send_tx(w3, wallet, CTF_ADDRESS, call_data)
+    return _send_tx(w3, wallet, CTF_ADDRESS, call_data, holder=holder)
 
 
-def redeem_neg_risk(w3: Web3, wallet, cond_id: str, amounts: list[int]) -> str | None:
+def redeem_neg_risk(w3: Web3, wallet, cond_id: str, amounts: list[int], holder: str | None = None) -> str | None:
     """
     neg-risk 市场 redeem: NegRiskAdapter.redeemPositions(conditionId, amounts)
-    EOA 直接调用 NegRiskAdapter
+    EOA 直调或经 1/1 Safe 转发到 NegRiskAdapter
     """
     selector = w3.keccak(
         text="redeemPositions(bytes32,uint256[])"
@@ -586,13 +708,13 @@ def redeem_neg_risk(w3: Web3, wallet, cond_id: str, amounts: list[int]) -> str |
         ],
     )
 
-    return _send_tx(w3, wallet, NEG_RISK_ADAPTER, call_data)
+    return _send_tx(w3, wallet, NEG_RISK_ADAPTER, call_data, holder=holder)
 
 
 def redeem_position(w3: Web3, wallet, cond_id: str,
-                    neg_risk: bool = False, balance: int = 0) -> str | None:
+                    neg_risk: bool = False, balance: int = 0, holder: str | None = None) -> str | None:
     """
-    执行单个 condition 的链上 redeem（EOA 直接调用）
+    执行单个 condition 的链上 redeem（EOA 直调 / Proxy Safe 转发）
     策略：先按 neg_risk 标志尝试，失败则切换另一种方式重试
 
     Returns: tx_hash on success, None on failure
@@ -606,9 +728,9 @@ def redeem_position(w3: Web3, wallet, cond_id: str,
     label1 = "neg-risk" if neg_risk else "normal"
     try:
         if neg_risk:
-            tx = redeem_neg_risk(w3, wallet, cond_id, [amt, amt])
+            tx = redeem_neg_risk(w3, wallet, cond_id, [amt, amt], holder=holder)
         else:
-            tx = redeem_normal(w3, wallet, cond_id)
+            tx = redeem_normal(w3, wallet, cond_id, holder=holder)
         if tx:
             log.info(f"  ✅ redeem 成功({label1}): {cond_id[:18]}... | tx: {tx}")
             return tx
@@ -628,9 +750,9 @@ def redeem_position(w3: Web3, wallet, cond_id: str,
     label2 = "normal" if neg_risk else "neg-risk"
     try:
         if neg_risk:
-            tx = redeem_normal(w3, wallet, cond_id)
+            tx = redeem_normal(w3, wallet, cond_id, holder=holder)
         else:
-            tx = redeem_neg_risk(w3, wallet, cond_id, [amt, amt])
+            tx = redeem_neg_risk(w3, wallet, cond_id, [amt, amt], holder=holder)
         if tx:
             log.info(f"  ✅ redeem 成功({label2}): {cond_id[:18]}... | tx: {tx}")
             return tx
@@ -650,6 +772,7 @@ def redeem_position(w3: Web3, wallet, cond_id: str,
 # ==============================================================================
 
 REDEEM_FIXED_GAS = 300_000  # redeem 通常 100-150k，固定 gas 避免逐个 estimate
+SAFE_REDEEM_FIXED_GAS = 600_000  # 通过 1/1 Safe 执行 redeem 的外层 gas
 
 
 def _build_redeem_calldata(w3: Web3, cond_id: str, neg_risk: bool, balance: int) -> tuple[str, bytes]:
@@ -703,16 +826,18 @@ def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
         cid = r["condition_id"]
         neg_risk = r.get("neg_risk", False)
         balance = r.get("balance", 0)
+        holder = r.get("holder", wallet.address)
 
         try:
             target, call_data = _build_redeem_calldata(w3, cid, neg_risk, balance)
-            target_cs = Web3.to_checksum_address(target)
+            tx_target, tx_data, gas_limit, route = _prepare_execution_tx(w3, wallet, holder, target, call_data)
+            target_cs = Web3.to_checksum_address(tx_target)
 
             signed_tx = w3.eth.account.sign_transaction(
                 {
                     "to": target_cs,
-                    "data": call_data,
-                    "gas": REDEEM_FIXED_GAS,
+                    "data": tx_data,
+                    "gas": gas_limit,
                     "gasPrice": gas_price,
                     "nonce": base_nonce + i,
                     "chainId": 137,
@@ -723,6 +848,8 @@ def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             sent.append((r, tx_hash, neg_risk))
             send_ok += 1
+            if route == "gnosis-safe":
+                log.info(f"  🔐 通过 proxy safe 发送: {r.get('slug', '')[:35]}")
 
         except Exception as e:
             err_msg = str(e).lower()
@@ -777,6 +904,7 @@ def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
                 w3, wallet, cid,
                 neg_risk=alt_neg_risk,
                 balance=r.get("balance", 0),
+                holder=r.get("holder", wallet.address),
             )
             # 更新 results 中对应项
             for res in results:
@@ -920,6 +1048,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
 
     # 2. 过滤已 redeem 的
     redeemed = load_redeemed()
+    clear_stale_redeemed_marks(redeemed, redeemable)
     pending = [r for r in redeemable if r["condition_id"] not in redeemed]
     skipped = len(redeemable) - len(pending)
 
@@ -1046,7 +1175,7 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
 
 def main() -> None:
     log.info("=" * 55)
-    log.info("🔄 Polymarket 链上自动结算 v3.6 启动 (并行结算+链上验证+假标记清理)")
+    log.info("🔄 Polymarket 链上自动结算 v3.7 启动 (并行结算+链上验证+假标记清理+proxy safe)")
     log.info(f"   RPC         : {RPC_URL}")
     log.info(f"   轮询间隔    : {REDEEM_INTERVAL}s ({REDEEM_INTERVAL // 60} 分钟)")
     log.info(f"   已领取记录  : {REDEEMED_FILE}")

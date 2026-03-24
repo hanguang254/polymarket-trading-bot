@@ -195,6 +195,70 @@ class TestAutoRedeemBalancesAndDiscovery(unittest.TestCase):
         self.assertEqual(redeemable[0]["balance"], 7_000_000)
         self.assertEqual(redeemable[0]["slug"], "Winning token")
 
+    def test_clear_stale_redeemed_marks_requeues_positions_with_remaining_balance(self):
+        redeemed_marks = {
+            "cond-1": {"slug": "old-entry"},
+            "cond-2": {"slug": "still-redeemed"},
+        }
+        redeemable = [
+            {"condition_id": "cond-1", "balance": 123},
+            {"condition_id": "cond-3", "balance": 456},
+        ]
+
+        with patch.object(redeem, "save_redeemed") as mock_save:
+            cleared = redeem.clear_stale_redeemed_marks(redeemed_marks, redeemable)
+
+        self.assertEqual(cleared, 1)
+        self.assertEqual(redeemed_marks, {"cond-2": {"slug": "still-redeemed"}})
+        mock_save.assert_called_once_with({"cond-2": {"slug": "still-redeemed"}})
+
+    def test_prepare_execution_tx_keeps_direct_eoa_route(self):
+        wallet = type("Wallet", (), {"address": redeem.EOA_WALLET})()
+
+        tx_target, tx_data, gas_limit, route = redeem._prepare_execution_tx(
+            MagicMock(),
+            wallet,
+            redeem.EOA_WALLET,
+            redeem.CTF_ADDRESS,
+            b"\x12\x34",
+        )
+
+        self.assertEqual(tx_target, redeem.Web3.to_checksum_address(redeem.CTF_ADDRESS))
+        self.assertEqual(tx_data, b"\x12\x34")
+        self.assertEqual(gas_limit, redeem.REDEEM_FIXED_GAS)
+        self.assertEqual(route, "eoa")
+
+    def test_prepare_execution_tx_wraps_proxy_holder_in_safe_exec(self):
+        wallet = type("Wallet", (), {"address": redeem.EOA_WALLET})()
+        target_cs = redeem.Web3.to_checksum_address(redeem.CTF_ADDRESS)
+        proxy_cs = redeem.Web3.to_checksum_address(redeem.PROXY_WALLET)
+
+        with patch.object(redeem, "CLOB_SIGNATURE_TYPE", 2):
+            with patch.object(
+                redeem,
+                "_get_safe_context",
+                return_value={
+                    "address": proxy_cs,
+                    "threshold": 1,
+                    "owners": [redeem.Web3.to_checksum_address(redeem.EOA_WALLET)],
+                },
+            ):
+                tx_target, tx_data, gas_limit, route = redeem._prepare_execution_tx(
+                    MagicMock(keccak=redeem.Web3.keccak),
+                    wallet,
+                    redeem.PROXY_WALLET,
+                    redeem.CTF_ADDRESS,
+                    b"\xaa\xbb",
+                )
+
+        self.assertEqual(tx_target, proxy_cs)
+        self.assertEqual(gas_limit, redeem.SAFE_REDEEM_FIXED_GAS)
+        self.assertEqual(route, "gnosis-safe")
+        self.assertTrue(tx_data.startswith(redeem.Web3.keccak(
+            text="execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)"
+        )[:4]))
+        self.assertIn(bytes.fromhex(target_cs[2:].lower()), tx_data)
+
 
 if __name__ == "__main__":
     unittest.main()

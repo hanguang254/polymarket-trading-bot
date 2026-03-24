@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.5
+# Polymarket Trading Bot v10.5.1
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -133,6 +133,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
 - **隔夜仓位 PnL 隔离**: `pending_costs` 存储 `{cost, session_date}`，跨天结算的仓位成本不回补到新交易日的 daily_pnl，防止隔夜仓位污染当日风控额度。旧格式自动兼容迁移。
 - **Auto Redeem + PnL 匹配**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`)，结算后匹配 `positions.jsonl` 计算真实成本基准和净收益，shows USDC balance + PnL stats after each round. 多钱包余额展示（EOA + Proxy + 合计）。`find_redeemable()` 按 condition_id 分组遍历所有 token 查链上余额，修复同一 condition 多 token 场景遗漏。
+- **Proxy Safe Redeem**: 当 `CLOB_SIGNATURE_TYPE=2`（GNOSIS_SAFE）且持仓在 proxy wallet 时，自动通过 1/1 Safe `execTransaction` 代 proxy 执行链上 redeem，无需手动提取到 EOA。链上验证 Safe threshold=1 且 EOA 是 owner。并行 redeem 同样支持 Safe 路由（gas 上限 600k）。
+- **误标记自动清理**: `clear_stale_redeemed_marks()` 每轮扫描时检查已标记 redeemed 但链上余额仍 > 0 的 condition，移除标记并立即重新领取。
 - **Watchdog**: `watchdog_v3.sh` monitors all 3 services and auto-restarts on failure
 - **systemd Management**: Auto-restart on crash, boot-start
 
