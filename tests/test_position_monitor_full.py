@@ -1095,6 +1095,78 @@ class TestMonitorExpiryCleanup(unittest.TestCase):
         mock_price.assert_not_called()
 
 
+class TestPendingOrderReconcile(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.prev_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        os.makedirs("logs", exist_ok=True)
+        self.pending_file = os.path.join(self.tmpdir.name, "logs", "pending_orders.jsonl")
+        self.positions_file = os.path.join(self.tmpdir.name, "logs", "positions.jsonl")
+
+    def tearDown(self):
+        os.chdir(self.prev_cwd)
+        self.tmpdir.cleanup()
+
+    @patch.object(pm, "_append_pending_update")
+    @patch.object(pm, "send_telegram")
+    @patch.object(pm, "cancel_all_orders")
+    @patch.object(pm, "get_token_balance", side_effect=[8.15, 8.15])
+    @patch.object(pm, "get_open_positions", return_value=[])
+    @patch.object(pm, "_coin_from_slug", return_value="BTC")
+    @patch.object(pm, "estimate_buy_fill", return_value={
+        "net_size": 8.15,
+        "effective_entry_price": 0.77,
+        "fee_shares": 0.15,
+        "fee_usdc": 0.11,
+    })
+    @patch.object(pm.clob_client, "update_token_allowance", return_value=True)
+    @patch.object(pm.clob_client, "get_fee_rate_bps", return_value=1000)
+    def test_reconcile_pending_records_cost_and_position(
+        self,
+        _mock_fee_rate,
+        _mock_allowance,
+        _mock_fill,
+        _mock_coin,
+        _mock_open_positions,
+        _mock_balance,
+        _mock_cancel,
+        _mock_tg,
+        mock_pending_update,
+    ):
+        pending_entry = {
+            "pending_id": "pending-1",
+            "created_at": "2026-03-24T09:33:41.000000+00:00",
+            "slug": "btc-updown-5m-1774344600",
+            "direction": "UP",
+            "token_id": "token-1",
+            "status": "PENDING",
+            "limit_price": 0.77,
+            "requested_size": 8.3,
+            "confidence": 0.79,
+            "ev": 0.021,
+            "entry_details": {"p_win_final": 0.90},
+            "cost_recorded": False,
+        }
+        with open(self.pending_file, "a") as f:
+            f.write(json.dumps(pending_entry) + "\n")
+
+        with patch.object(pm, "PENDING_ORDERS_FILE", self.pending_file), \
+             patch.object(pm, "POSITIONS_FILE", self.positions_file), \
+             patch("trading_state.record_bet_cost") as mock_record_cost:
+            pm.reconcile_pending_orders()
+
+        mock_record_cost.assert_called_once_with("btc-updown-5m-1774344600", 6.2755)
+        with open(self.positions_file) as f:
+            position = json.loads(f.readline())
+
+        self.assertEqual(position["slug"], "btc-updown-5m-1774344600")
+        self.assertEqual(position["size"], 8.15)
+        self.assertEqual(position["entry_price"], 0.77)
+        self.assertEqual(position["pending_order_id"], "pending-1")
+        self.assertTrue(mock_pending_update.called)
+
+
 class TestSelfNotify(unittest.TestCase):
     """self_notify: 通知格式化"""
 

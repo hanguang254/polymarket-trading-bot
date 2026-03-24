@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.6.1
+# Polymarket Trading Bot v10.6.2
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -66,7 +66,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **CLOB C1 Calibration**: Replaces Gamma odds with CLOB `best_ask` for discount/EV/price checks — prevents buying at $0.85 while thinking price is $0.50. Empty book detection (ask ≥ 0.95) falls back to `last-trade-price`.
 - **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
 - **Volatility-Triggered Re-Analysis**: Markets skipped due to low confidence are tracked in `skipped_markets`. When crypto price moves ≥1.5 ATR from the skip price (`REANALYZE_ATR_MULT`), the market re-enters the analysis pipeline with updated Bayesian state. The same re-analysis controls apply to both early and late windows; if an early-window retry is retriggered, it carries the same `reanalyze` semantics so failed retries do not reset back into a fresh skip loop. Entry-stage periodic rescans now also share one cooldown env: `ENTRY_REANALYZE_INTERVAL` (falls back to legacy `LATE_REANALYZE_INTERVAL`). Cooldown (`REANALYZE_COOLDOWN`, default 15s) and max retrigger cap (`MAX_REANALYZE`, default 1) prevent loops. Skipped markets are cleaned up on position entry or market cleanup.
-- **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
+- **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain. FOK 请求异常（`Request exception` / `timeout` / `connection reset` 等传输层错误）且链上余额回查未确认时，自动写入 `PENDING_GHOST` 待对账，而非直接判为失败丢弃——解决网络抖动导致实际已成交但 bot 误判为未成交的问题。
+- **幽灵成交多次回查**: `_detect_ghost_fill()` 支持 `GHOST_FILL_RECHECKS`（默认4次）× `GHOST_FILL_RECHECK_INTERVAL`（默认0.25s）多次回查链上余额，容忍 RPC 延迟。`GHOST_FILL_MIN_SIZE` 控制最小确认阈值。
 - **方向化参数配置**: `MAX_BUY_PRICE`/`MIN_EV`/`MIN_CONFIDENCE` 支持 `_UP`/`_DOWN` 后缀按方向覆盖（如 `MIN_EV_UP=0.04`, `MIN_EV_DOWN=0.08`），早期窗口同理。未配置时使用统一阈值。
 - **FOK 入场重构**: 执行前基于 `_get_execution_quote()` 刷新盘口快照，`_plan_fok_entry()` 按 `price_cap`（p_win 限价上限）规划限价和份数。重试时再次刷新盘口，按价格漂移/深度不足分流处理，替代旧的固定 +2tick 提价策略。`_is_explicit_fok_kill()` 区分明确 FOK 拒绝 vs 网络超时，前者跳过链上余额回查。
 - **CLOB 价格校验增强**: `_is_valid_clob_price()` 统一校验价格有效性（0.01 < price < 0.99），替代分散的 `if price is None` 检查。
@@ -112,7 +113,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Realized PnL 聚合**: `_calculate_total_realized_pnl()` 聚合部分成交 + 最终平仓的真实盈亏。胜负判定改为基于 total realized PnL（替代简单 entry vs exit 价格比较），对加仓/减仓场景更准确。
 - **Base Rate 方向校准**: outcome 记录区分 `directional_won`（方向对错，仅市场到期结算时可判）和 `won`（PnL盈亏）。Base rate 校准优先用 `directional_won`，跳过 `calibration_eligible=False` 的早退记录，避免早退盈利单污染方向胜率统计。
 - **API-Based Settlement**: Expiry cleanup uses Polymarket API real outcome (not Binance price guess) to determine $1.00/$0.00.
-- **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s).
+- **Pending Order Reconciliation**: Monitor checks LIVE buy orders every cycle — detects fills via wallet balance, writes position to `positions.jsonl`, sends distinct TG notification (⏰ vs 🎯). Auto-cancels stale orders after `PENDING_ORDER_TTL` (default 120s). Reconcile 时补记 `record_bet_cost`（幽灵成交入场成本），防止 daily_pnl 漏扣。
 - **重启状态恢复**: `_restore_recent_market_state()` 启动时从 `positions.jsonl` 加载近期（2小时内）持仓和已结束的市场记录，恢复 `open_positions`/`recent_markets`/`restored_slugs`，防止重启后重复入场已有持仓的市场。
 
 ### Infrastructure

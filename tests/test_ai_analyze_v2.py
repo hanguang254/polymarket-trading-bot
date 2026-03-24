@@ -229,6 +229,130 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
         self.assertEqual(record["requested_net_size"], 7.0)
         self.assertGreater(record["buy_fee_shares"], 0.06)
 
+    def test_execute_bet_queues_pending_when_request_exception_remains_unconfirmed(self):
+        initial_quote = {
+            "best_bid": 0.75,
+            "best_ask": 0.76,
+            "bids": [{"price": "0.75", "size": "100"}],
+            "asks": [{"price": "0.76", "size": "20"}],
+            "bid_depth": 100.0,
+            "source": "rest_book",
+            "age_ms": 0.0,
+        }
+        retry_quote_1 = {
+            "best_bid": 0.64,
+            "best_ask": 0.65,
+            "bids": [{"price": "0.64", "size": "100"}],
+            "asks": [{"price": "0.65", "size": "20"}],
+            "bid_depth": 100.0,
+            "source": "rest_book",
+            "age_ms": 0.0,
+        }
+        retry_quote_2 = {
+            "best_bid": 0.52,
+            "best_ask": 0.53,
+            "bids": [{"price": "0.52", "size": "100"}],
+            "asks": [{"price": "0.53", "size": "20"}],
+            "bid_depth": 100.0,
+            "source": "rest_book",
+            "age_ms": 0.0,
+        }
+        request_exception = {
+            "matched": False,
+            "status": "ERROR",
+            "elapsed_ms": 2016,
+            "error": "PolyApiException[status_code=None, error_message=Request exception!]",
+            "raw": "PolyApiException[status_code=None, error_message=Request exception!]",
+            "making": 0,
+            "taking": 0,
+            "order_id": None,
+        }
+        explicit_fok_error = {
+            "matched": False,
+            "status": "ERROR",
+            "elapsed_ms": 1896,
+            "error": "PolyApiException[status_code=400, error_message={'error': \"order couldn't be fully filled. FOK orders are fully filled or killed.\"}]",
+            "raw": "PolyApiException[status_code=400, error_message={'error': \"order couldn't be fully filled. FOK orders are fully filled or killed.\"}]",
+            "making": 0,
+            "taking": 0,
+            "order_id": None,
+        }
+
+        with patch.dict(os.environ, {
+            "MIN_BALANCE": "5",
+            "MIN_BET_SIZE": "5",
+            "MAX_BUY_PRICE": "0.99",
+            "MAX_BUY_PRICE_UP": "0.99",
+            "MAX_BUY_PRICE_DOWN": "0.99",
+            "ENTRY_WS_MAX_AGE_MS": "400",
+            "GHOST_FILL_RECHECKS": "1",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "_bet_executor", _ImmediateExecutor()):
+                with patch.object(ai_analyze_v2, "_get_execution_quote", side_effect=[initial_quote, retry_quote_1, retry_quote_2]):
+                    with patch.object(ai_analyze_v2, "calculate_kelly_size", return_value={
+                        "gross_order_size": 8.3,
+                        "min_gross_size": 5.0,
+                        "raw_net_size": 8.1,
+                        "target_net_size": 8.1,
+                        "expected_net_size": 8.15,
+                        "forced_to_min": False,
+                        "entry_fee_rate": 0.0,
+                        "skip_reason": None,
+                    }):
+                        with patch.object(ai_analyze_v2, "PENDING_ORDERS_FILE", os.path.join("logs", "pending_orders.jsonl")):
+                            with patch.object(ai_analyze_v2.clob_client, "get_orderbook", return_value=None):
+                                with patch.object(ai_analyze_v2.clob_client, "place_fok_order", side_effect=[request_exception, explicit_fok_error, explicit_fok_error]):
+                                    with patch.object(ai_analyze_v2.clob_client, "get_token_balance", return_value=None):
+                                        with patch.object(ai_analyze_v2.clob_client, "update_token_allowance", return_value=True):
+                                            with patch.object(ai_analyze_v2, "_detect_ghost_fill", return_value=None):
+                                                success, actual_price, actual_size, output = ai_analyze_v2.execute_bet(
+                                                    slug="btc-updown-5m-ghost",
+                                                    direction="UP",
+                                                    token_id="token-ghost",
+                                                    confidence=0.79,
+                                                    ev=0.021,
+                                                    p_hat=0.88,
+                                                    entry_details={"p_win_final": 0.90},
+                                                    pre_balance=100.0,
+                                                )
+
+        self.assertFalse(success)
+        self.assertEqual(actual_price, 0.54)
+        self.assertEqual(actual_size, 8.3)
+        self.assertTrue(output.startswith("PENDING_GHOST:"))
+
+        with open("logs/bets.jsonl") as f:
+            record = json.loads(f.readline())
+
+        self.assertFalse(record["success"])
+        self.assertTrue(record["pending"])
+        self.assertEqual(record["status"], "PENDING")
+
+        with open("logs/pending_orders.jsonl") as f:
+            pending = json.loads(f.readline())
+
+        self.assertEqual(pending["slug"], "btc-updown-5m-ghost")
+        self.assertEqual(pending["status"], "PENDING")
+        self.assertEqual(pending["limit_price"], 0.54)
+
+
+class TestGhostFillDetection(unittest.TestCase):
+    def test_detect_ghost_fill_retries_until_balance_appears(self):
+        token_balance_side_effect = [0.0, 0.0, 8.12]
+
+        with patch.dict(os.environ, {
+            "GHOST_FILL_RECHECKS": "3",
+            "GHOST_FILL_RECHECK_INTERVAL": "0.01",
+            "GHOST_FILL_MIN_SIZE": "0.5",
+        }, clear=False):
+            with patch("position_monitor.get_token_balance", side_effect=token_balance_side_effect) as balance_mock:
+                with patch.object(ai_analyze_v2.time, "sleep", return_value=None) as sleep_mock:
+                    detected = ai_analyze_v2._detect_ghost_fill("token-ghost", expected_size=8.3)
+
+        self.assertEqual(detected, 8.12)
+        self.assertEqual(balance_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_count, 2)
+
 
 class TestBayesianFusionModes(unittest.TestCase):
     def setUp(self):

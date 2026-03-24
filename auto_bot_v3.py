@@ -1215,6 +1215,8 @@ class MarketTracker:
 
                 # 发送通知
                 send_notification(coin, direction, confidence, details.get('expected_value', 0), entry_price, bet_size)
+            elif isinstance(output, str) and output.startswith("PENDING_GHOST"):
+                logger.warning(f"  ⏳ 下单请求超时，成交状态待确认: {output} | 已写入 pending_orders，交由 monitor 对账")
             elif isinstance(output, str) and output.startswith("PENDING"):
                 logger.warning(f"  ⏳ 挂单待成交: {output} | 已记录待成交，交由 monitor 对账入仓")
             elif isinstance(output, str) and output.startswith("SKIP_"):

@@ -1951,6 +1951,15 @@ def reconcile_pending_orders():
             except Exception:
                 pass
 
+            pending_entry_cost = round((_safe_float(position.get("entry_price")) or 0.0) * (_safe_float(position.get("size")) or 0.0), 4)
+            if pending_entry_cost > 0 and not order.get("cost_recorded"):
+                try:
+                    from trading_state import record_bet_cost
+                    record_bet_cost(slug, pending_entry_cost)
+                    print(f"  📉 reconcile: 补记入场成本 ${pending_entry_cost:.2f}")
+                except Exception as e:
+                    print(f"  ⚠️ reconcile: 补记入场成本失败: {e}")
+
             os.makedirs("logs", exist_ok=True)
             with open("logs/positions.jsonl", "a") as f:
                 f.write(json.dumps(position) + "\n")
@@ -1983,6 +1992,7 @@ def reconcile_pending_orders():
                 "filled_size": size,
                 "entry_price": entry_price,
                 "entry_price_source": price_source,
+                "cost_recorded": pending_entry_cost > 0,
                 "resolved_at": now.isoformat(),
             })
             continue
