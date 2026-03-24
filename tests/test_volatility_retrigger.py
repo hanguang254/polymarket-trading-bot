@@ -15,8 +15,9 @@ from unittest.mock import MagicMock, mock_open, patch
 for mod in [
     "ai_trader", "ai_trader.polymarket_api", "ai_trader.clob_client",
     "ai_trader.binance_api", "ai_trader.binance_api.price_stream",
+    "ai_trader.coins",
     "ai_trader.polymarket_ws", "ai_trader.polymarket_ws.poly_ws",
-    "ai_trader.bayesian_engine", "ai_trader.indicators",
+    "ai_trader.bayesian_engine", "ai_trader.indicators", "ai_trader.fees",
     "ai_analyze_v2", "trading_state",
     "py_clob_client", "py_clob_client.order_builder",
     "py_clob_client.order_builder.constants",
@@ -360,6 +361,39 @@ class TestVolatilityDetection(unittest.TestCase):
             extra = mock_trade.call_args[0][2]
             self.assertTrue(extra.get("reanalyze"))
 
+    def test_early_window_reanalysis_sets_reanalyze_flag(self):
+        """早期窗口被波动重触发后，沿用重分析语义进入 analyze_and_trade"""
+        slug = "btc-updown-5m-1700000000"
+        market = make_market("BTC", slug, elapsed=93)
+        self.tracker.tracked[slug] = market
+        self.tracker.warmup_started.add(slug)
+        self.tracker.early_analyzed.add(slug)
+        self.tracker.skipped_markets[slug] = {
+            "skip_time": time.time() - 20,
+            "price_at_skip": 70730,
+            "reason": "EV too low",
+            "reanalyze_count": 0,
+            "window": "early",
+        }
+        now = time.time()
+        self.tracker.warmup_data[slug] = [
+            {"price": 70730, "gap": 21.7, "ts": now - 6},
+            {"price": 70700, "gap": -8.5, "ts": now - 4},
+            {"price": 70670, "gap": -38.5, "ts": now - 2},
+            {"price": 70650, "gap": -58.5, "ts": now},
+        ]
+        self.tracker.bayesian_updaters[slug] = FakeUpdater(
+            atr_val=45, confidence=0.60, p_hat=0.70, direction="DOWN"
+        )
+
+        with patch.object(self.tracker, "analyze_and_trade") as mock_trade:
+            self.tracker.check_analysis_trigger()
+            self.assertTrue(mock_trade.called)
+            extra = mock_trade.call_args[0][2]
+            self.assertTrue(extra.get("early_window"))
+            self.assertTrue(extra.get("reanalyze"))
+            self.assertEqual(extra.get("volatility_move_atr"), 1.78)
+
 
 # ═══════════════════════════════════════════════════════════
 # 3. 重分析后的完整流程测试
@@ -507,6 +541,47 @@ class TestAnalyzeAndTradeSkipRecording(unittest.TestCase):
         self.tracker.analyze_and_trade(slug, market, extra_info)
 
         # 不应再在 skipped_markets 中
+        self.assertNotIn(slug, self.tracker.skipped_markets)
+
+    @patch("auto_bot_v3.analyze_and_decide")
+    @patch("auto_bot_v3.get_realtime_odds")
+    @patch("auto_bot_v3.get_token_ids", return_value=("up_t", "down_t"))
+    @patch("auto_bot_v3.clob_client")
+    def test_early_reanalyze_no_bet_clears_skip(self, mock_clob, mock_ids, mock_odds, mock_analyze):
+        """早期窗口重分析失败后不应重置为普通 skip"""
+        mock_odds.return_value = {"up_mid": 0.5, "down_mid": 0.5, "up_bid": 0.49, "down_bid": 0.49, "up_ask": 0.51, "down_ask": 0.51}
+        mock_analyze.return_value = (False, "DOWN", 0.45, {
+            "bet_reason": "EV too low",
+            "current_price": 70650,
+        })
+
+        slug = "btc-updown-5m-1700000000"
+        market = make_market("BTC", slug, elapsed=93)
+        self.tracker.tracked[slug] = market
+        self.tracker.ptb_cache[slug] = 70708
+        self.tracker.warmup_started.add(slug)
+        self.tracker.early_analyzed.add(slug)
+        now = time.time()
+        self.tracker.warmup_data[slug] = [
+            {"price": 70730, "gap": 21.7, "ts": now - 6},
+            {"price": 70700, "gap": -8.5, "ts": now - 4},
+            {"price": 70670, "gap": -38.5, "ts": now - 2},
+            {"price": 70650, "gap": -58.5, "ts": now},
+        ]
+        self.tracker.bayesian_updaters[slug] = FakeUpdater(
+            atr_val=45, confidence=0.60, p_hat=0.70, direction="DOWN"
+        )
+        self.tracker.skipped_markets[slug] = {
+            "skip_time": time.time() - 20,
+            "price_at_skip": 70730,
+            "reason": "EV too low",
+            "reanalyze_count": 0,
+            "window": "early",
+        }
+        self.tracker.token_cache[slug] = ("up_t", "down_t")
+
+        self.tracker.check_analysis_trigger()
+
         self.assertNotIn(slug, self.tracker.skipped_markets)
 
 

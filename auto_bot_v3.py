@@ -716,6 +716,8 @@ class MarketTracker:
                         if gap_trend == "穿越":
                             logger.info(f"  ⏳ 早期窗口: gap穿越，等待晚期窗口")
                         else:
+                            skip_info = self.skipped_markets.get(slug, {})
+                            is_reanalyze = skip_info.get("reanalyze_count", 0) > 0
                             self.early_analyzed.add(slug)
                             extra_info = {
                                 "gap_trend": gap_trend,
@@ -724,8 +726,15 @@ class MarketTracker:
                                 "early_window": True,
                                 "remaining_seconds": remaining,
                             }
+                            if is_reanalyze:
+                                extra_info["reanalyze"] = True
+                                extra_info["volatility_move_atr"] = skip_info.get("move_atr", 0)
                             extra_info["bayesian"] = updater.get_summary()
-                            logger.info(f"\n⚡ 早期下注窗口: {market['coin']} elapsed={elapsed:.0f}s | 贝叶斯: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f}")
+                            reanalyze_tag = " [重分析]" if is_reanalyze else ""
+                            logger.info(
+                                f"\n⚡ 早期下注窗口{reanalyze_tag}: {market['coin']} "
+                                f"elapsed={elapsed:.0f}s | 贝叶斯: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f}"
+                            )
                             pending_trades.append((slug, market, extra_info))
 
             # === 晚期下注窗口：由 LATE_BET_START / LATE_BET_END 控制 ===
@@ -778,6 +787,7 @@ class MarketTracker:
                                 "price_at_skip": _skip_price,
                                 "reason": "low_conf",
                                 "reanalyze_count": 0,
+                                "window": "late",
                             }
                             # 成熟样本下的极低置信度不再每轮重扫，交给波动重触发重新放行。
                             if gap_trend == "穿越" or len(samples) >= strategy_cfg["late_mature_sample_count"]:
@@ -1002,6 +1012,7 @@ class MarketTracker:
                         "skip_time": time.time(), "price_at_skip": current_price,
                         "reason": details.get("bet_reason", "no_edge")[:30],
                         "reanalyze_count": 0,
+                        "window": "early" if extra_info.get("early_window") else "late",
                     }
             else:
                 self.skipped_markets.pop(slug, None)

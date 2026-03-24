@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.5.4
+# Polymarket Trading Bot v10.5.5
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -65,7 +65,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Parallel Entry Fetch**: Balance + orderbook queries run concurrently via ThreadPoolExecutor, saving ~0.5s per bet execution.
 - **CLOB C1 Calibration**: Replaces Gamma odds with CLOB `best_ask` for discount/EV/price checks — prevents buying at $0.85 while thinking price is $0.50. Empty book detection (ask ≥ 0.95) falls back to `last-trade-price`.
 - **Empty Book Override**: When C1 calibration makes discount negative (stale last-trade-price > estimated_value), a second-chance check uses Gamma odds: if `gamma_discount ≥ threshold`, `gamma_EV > 0.05`, and `confidence ≥ 75%`, overrides to BET. Execution still uses calibrated price (last-trade-price + SLIPPAGE).
-- **Volatility-Triggered Re-Analysis**: Markets skipped due to low confidence are tracked in `skipped_markets`. When crypto price moves ≥1.5 ATR from the skip price (`REANALYZE_ATR_MULT`), the market re-enters the analysis pipeline with updated Bayesian state. Cooldown (`REANALYZE_COOLDOWN`, default 15s) and max retrigger cap (`MAX_REANALYZE`, default 1) prevent loops. Skipped markets are cleaned up on position entry or market cleanup.
+- **Volatility-Triggered Re-Analysis**: Markets skipped due to low confidence are tracked in `skipped_markets`. When crypto price moves ≥1.5 ATR from the skip price (`REANALYZE_ATR_MULT`), the market re-enters the analysis pipeline with updated Bayesian state. The same re-analysis controls apply to both early and late windows; if an early-window retry is retriggered, it carries the same `reanalyze` semantics so failed retries do not reset back into a fresh skip loop. Cooldown (`REANALYZE_COOLDOWN`, default 15s) and max retrigger cap (`MAX_REANALYZE`, default 1) prevent loops. Skipped markets are cleaned up on position entry or market cleanup.
 - **Pending Order Tracking**: LIVE (unfilled) orders are recorded to `pending_orders.jsonl` and reconciled by position_monitor when filled on-chain.
 - **方向化参数配置**: `MAX_BUY_PRICE`/`MIN_EV`/`MIN_CONFIDENCE` 支持 `_UP`/`_DOWN` 后缀按方向覆盖（如 `MIN_EV_UP=0.04`, `MIN_EV_DOWN=0.08`），早期窗口同理。未配置时使用统一阈值。
 - **FOK 入场重构**: 执行前基于 `_get_execution_quote()` 刷新盘口快照，`_plan_fok_entry()` 按 `price_cap`（p_win 限价上限）规划限价和份数。重试时再次刷新盘口，按价格漂移/深度不足分流处理，替代旧的固定 +2tick 提价策略。`_is_explicit_fok_kill()` 区分明确 FOK 拒绝 vs 网络超时，前者跳过链上余额回查。
