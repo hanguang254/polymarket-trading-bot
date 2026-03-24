@@ -394,6 +394,65 @@ class TestVolatilityDetection(unittest.TestCase):
             self.assertTrue(extra.get("reanalyze"))
             self.assertEqual(extra.get("volatility_move_atr"), 1.78)
 
+    def test_early_window_interval_reanalysis_retries_after_cooldown(self):
+        """早期窗口 should_bet=False 后，冷却到期允许再次分析"""
+        slug = "btc-updown-5m-1700000000"
+        market = make_market("BTC", slug, elapsed=60)
+        self.tracker.tracked[slug] = market
+        self.tracker.warmup_started.add(slug)
+        self.tracker.early_analyzed.add(slug)
+        self.tracker.last_analysis_time[slug] = time.time() - 8
+        now = time.time()
+        self.tracker.warmup_data[slug] = [
+            {"price": 70730, "gap": 21.7, "ts": now - 6},
+            {"price": 70740, "gap": 31.7, "ts": now - 4},
+            {"price": 70750, "gap": 41.7, "ts": now - 2},
+            {"price": 70760, "gap": 51.7, "ts": now},
+        ]
+        self.tracker.bayesian_updaters[slug] = FakeUpdater(
+            atr_val=45, confidence=0.60, p_hat=0.70, direction="UP"
+        )
+
+        with patch.dict(os.environ, {
+            "EARLY_BET_START": "20",
+            "EARLY_BET_END": "99",
+            "ENTRY_REANALYZE_INTERVAL": "5",
+        }, clear=False):
+            with patch.object(self.tracker, "analyze_and_trade") as mock_trade:
+                self.tracker.check_analysis_trigger()
+                self.assertTrue(mock_trade.called)
+                extra = mock_trade.call_args[0][2]
+                self.assertTrue(extra.get("early_window"))
+                self.assertFalse(extra.get("reanalyze", False))
+
+    def test_early_window_interval_reanalysis_waits_for_cooldown(self):
+        """早期窗口定时重扫未到冷却期时不应再次调度"""
+        slug = "btc-updown-5m-1700000000"
+        market = make_market("BTC", slug, elapsed=60)
+        self.tracker.tracked[slug] = market
+        self.tracker.warmup_started.add(slug)
+        self.tracker.early_analyzed.add(slug)
+        self.tracker.last_analysis_time[slug] = time.time() - 3
+        now = time.time()
+        self.tracker.warmup_data[slug] = [
+            {"price": 70730, "gap": 21.7, "ts": now - 6},
+            {"price": 70740, "gap": 31.7, "ts": now - 4},
+            {"price": 70750, "gap": 41.7, "ts": now - 2},
+            {"price": 70760, "gap": 51.7, "ts": now},
+        ]
+        self.tracker.bayesian_updaters[slug] = FakeUpdater(
+            atr_val=45, confidence=0.60, p_hat=0.70, direction="UP"
+        )
+
+        with patch.dict(os.environ, {
+            "EARLY_BET_START": "20",
+            "EARLY_BET_END": "99",
+            "ENTRY_REANALYZE_INTERVAL": "5",
+        }, clear=False):
+            with patch.object(self.tracker, "analyze_and_trade") as mock_trade:
+                self.tracker.check_analysis_trigger()
+                self.assertFalse(mock_trade.called)
+
 
 # ═══════════════════════════════════════════════════════════
 # 3. 重分析后的完整流程测试
@@ -636,6 +695,7 @@ class TestStrategyConfig(unittest.TestCase):
             "LATE_GAP_CROSS_ALLOW_CONF": "0.65",
             "LATE_MATURE_SAMPLE_COUNT": "10",
             "LATE_REANALYZE_INTERVAL": "12",
+            "ENTRY_REANALYZE_INTERVAL": "9",
             "MAX_TRADE_RETRIES": "6",
         }, clear=False):
             cfg = bot.get_strategy_config()
@@ -652,8 +712,18 @@ class TestStrategyConfig(unittest.TestCase):
         self.assertEqual(cfg["late_low_conf_threshold"], 0.18)
         self.assertEqual(cfg["late_gap_cross_allow_conf"], 0.65)
         self.assertEqual(cfg["late_mature_sample_count"], 10)
-        self.assertEqual(cfg["late_reanalyze_interval"], 12)
+        self.assertEqual(cfg["entry_reanalyze_interval"], 9)
+        self.assertEqual(cfg["late_reanalyze_interval"], 9)
         self.assertEqual(cfg["max_trade_retries"], 6)
+
+    def test_get_strategy_config_falls_back_to_legacy_late_reanalyze_interval(self):
+        with patch.dict(os.environ, {
+            "LATE_REANALYZE_INTERVAL": "12",
+        }, clear=True):
+            cfg = bot.get_strategy_config()
+
+        self.assertEqual(cfg["entry_reanalyze_interval"], 12)
+        self.assertEqual(cfg["late_reanalyze_interval"], 12)
 
 
 # ═══════════════════════════════════════════════════════════

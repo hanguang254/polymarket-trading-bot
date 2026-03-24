@@ -200,12 +200,26 @@ def _env_float(name, default, minimum=None):
     return max(minimum, value) if minimum is not None else value
 
 
+def _env_int_alias(primary, fallback, default, minimum=None):
+    raw = os.environ.get(primary)
+    if raw is None:
+        raw = os.environ.get(fallback, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, value) if minimum is not None else value
+
+
 def get_strategy_config():
     """读取下注时序和分析阈值配置。"""
     early_bet_start = _env_int("EARLY_BET_START", 90, minimum=0)
     early_bet_end = _env_int("EARLY_BET_END", 95, minimum=early_bet_start)
     late_bet_start = _env_int("LATE_BET_START", 100, minimum=0)
     late_bet_end = _env_int("LATE_BET_END", 160, minimum=late_bet_start)
+    entry_reanalyze_interval = _env_int_alias(
+        "ENTRY_REANALYZE_INTERVAL", "LATE_REANALYZE_INTERVAL", 20, minimum=1
+    )
 
     return {
         "warmup_start_seconds": _env_int("WARMUP_START_SECONDS", 20, minimum=0),
@@ -220,7 +234,8 @@ def get_strategy_config():
         "late_low_conf_threshold": _env_float("LATE_LOW_CONF_THRESHOLD", 0.15, minimum=0.0),
         "late_gap_cross_allow_conf": _env_float("LATE_GAP_CROSS_ALLOW_CONF", 0.60, minimum=0.0),
         "late_mature_sample_count": _env_int("LATE_MATURE_SAMPLE_COUNT", 8, minimum=1),
-        "late_reanalyze_interval": _env_int("LATE_REANALYZE_INTERVAL", 20, minimum=1),
+        "entry_reanalyze_interval": entry_reanalyze_interval,
+        "late_reanalyze_interval": entry_reanalyze_interval,
         "max_trade_retries": _env_int("MAX_TRADE_RETRIES", 3, minimum=1),
     }
 
@@ -496,7 +511,7 @@ class MarketTracker:
         self.token_cache = {}  # slug -> (up_token, down_token)  预热阶段缓存token_ids
         self.skipped_markets = {}  # slug -> {skip_time, price_at_skip, reason, reanalyze_count}
         self.trade_attempts = {}  # slug -> 晚期窗口交易尝试次数（FOK失败后允许重试）
-        self.last_analysis_time = {}  # slug -> 上次晚期分析时间戳（冷却用）
+        self.last_analysis_time = {}  # slug -> 上次入场分析时间戳（早/晚期窗口冷却用）
         self._ptb_pending = {}  # slug -> coin, 待并行获取PTB的市场
         self.restored_slugs = set()
         self._restore_recent_market_state()
@@ -701,7 +716,12 @@ class MarketTracker:
             # === 早期下注窗口：由 EARLY_BET_START / EARLY_BET_END 控制 ===
             EARLY_BET_START = strategy_cfg["early_bet_start"]
             EARLY_BET_END = strategy_cfg["early_bet_end"]
-            if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed and slug not in self.early_analyzed:
+            ENTRY_REANALYZE_INTERVAL = strategy_cfg["entry_reanalyze_interval"]
+            early_ready = (
+                slug not in self.early_analyzed
+                or time.time() - self.last_analysis_time.get(slug, 0) >= ENTRY_REANALYZE_INTERVAL
+            )
+            if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed and early_ready:
                 updater = self.bayesian_updaters.get(slug)
                 samples = self.warmup_data.get(slug, [])
                 early_min_samples = strategy_cfg["early_min_samples"]
@@ -718,6 +738,7 @@ class MarketTracker:
                         else:
                             skip_info = self.skipped_markets.get(slug, {})
                             is_reanalyze = skip_info.get("reanalyze_count", 0) > 0
+                            self.last_analysis_time[slug] = time.time()
                             self.early_analyzed.add(slug)
                             extra_info = {
                                 "gap_trend": gap_trend,
@@ -747,8 +768,7 @@ class MarketTracker:
                     logger.warning(f"\n⚠️ {market['coin']} 晚期窗口已重试{MAX_TRADE_RETRIES}次，放弃")
                     continue
                 # 冷却期：避免每2秒重复分析，等待市场条件变化
-                LATE_REANALYZE_INTERVAL = strategy_cfg["late_reanalyze_interval"]
-                if time.time() - self.last_analysis_time.get(slug, 0) < LATE_REANALYZE_INTERVAL:
+                if time.time() - self.last_analysis_time.get(slug, 0) < ENTRY_REANALYZE_INTERVAL:
                     continue
                 self.last_analysis_time[slug] = time.time()
                 # 获取跳过时的价格快照（用于波动重触发）
@@ -1224,6 +1244,7 @@ class MarketTracker:
                 self.token_cache.pop(slug, None)
                 self.skipped_markets.pop(slug, None)
                 self.trade_attempts.pop(slug, None)
+                self.last_analysis_time.pop(slug, None)
                 self.analyzed.discard(slug)
                 self.early_analyzed.discard(slug)
                 self.restored_slugs.discard(slug)
