@@ -3,14 +3,11 @@
 Polymarket 全自动交易机器人 v3.3
 核心策略：预热观察 → 趋势确认下注 → 实时盯盘平仓
 
-时间线（5分钟=300秒市场）：
+时间线（5分钟=300秒市场，关键秒数可由 .env 覆盖）：
   0s    市场开始
   2s    PTB获取开始（尽早拿到基准价）
-  20s   预热扫描开始（贝叶斯序贯更新）
-  40s   PTB获取截止 + 早期下注窗口开启（CLOB未充分定价）
-  70s   早期下注窗口关闭
-  100s  晚期下注窗口开启（已有80秒观察数据，早期未触发时兜底）
-  160s  晚期下注窗口关闭
+  预热开始 / 早期窗口 / 晚期窗口 由 WARMUP_START_SECONDS、
+  EARLY_BET_START / EARLY_BET_END、LATE_BET_START / LATE_BET_END 控制
   下注后 立即进入实时监控（止盈/止损/趋势反转）
   120s  时间止盈（盈利中挂单锁利）
   60s   强制平仓开始
@@ -181,6 +178,48 @@ def circuit_breaker_record(success):
             _circuit_open_until = time.time() + CIRCUIT_BREAK_DURATION
             logger.error(f"  ⚡ 触发熔断！连续{_api_failures}次API失败，暂停{CIRCUIT_BREAK_DURATION}s")
             _api_failures = 0
+
+
+def _env_int(name, default, minimum=None):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, value) if minimum is not None else value
+
+
+def _env_float(name, default, minimum=None):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(minimum, value) if minimum is not None else value
+
+
+def get_strategy_config():
+    """读取下注时序和分析阈值配置。"""
+    early_bet_start = _env_int("EARLY_BET_START", 90, minimum=0)
+    early_bet_end = _env_int("EARLY_BET_END", 95, minimum=early_bet_start)
+    late_bet_start = _env_int("LATE_BET_START", 100, minimum=0)
+    late_bet_end = _env_int("LATE_BET_END", 160, minimum=late_bet_start)
+
+    return {
+        "warmup_start_seconds": _env_int("WARMUP_START_SECONDS", 20, minimum=0),
+        "warmup_sample_interval_early": _env_float("WARMUP_SAMPLE_INTERVAL_EARLY", 5, minimum=0.5),
+        "warmup_sample_interval_late": _env_float("WARMUP_SAMPLE_INTERVAL_LATE", 3, minimum=0.5),
+        "early_min_samples": _env_int("EARLY_MIN_SAMPLES", 4, minimum=1),
+        "early_bet_start": early_bet_start,
+        "early_bet_end": early_bet_end,
+        "late_bet_start": late_bet_start,
+        "late_bet_end": late_bet_end,
+        "late_min_updates": _env_int("LATE_MIN_UPDATES", 3, minimum=1),
+        "late_low_conf_threshold": _env_float("LATE_LOW_CONF_THRESHOLD", 0.15, minimum=0.0),
+        "late_gap_cross_allow_conf": _env_float("LATE_GAP_CROSS_ALLOW_CONF", 0.60, minimum=0.0),
+        "late_mature_sample_count": _env_int("LATE_MATURE_SAMPLE_COUNT", 8, minimum=1),
+        "late_reanalyze_interval": _env_int("LATE_REANALYZE_INTERVAL", 20, minimum=1),
+        "max_trade_retries": _env_int("MAX_TRADE_RETRIES", 3, minimum=1),
+    }
+
 
 def _fetch_ptb_api(slug, timeout=3):
     """单个 PTB HTTP 获取，主路径走 crypto-price 接口。"""
@@ -528,6 +567,7 @@ class MarketTracker:
         多个市场同时触发下注时并行执行 analyze_and_trade，避免串行等待。
         """
         now = datetime.now(timezone.utc)
+        strategy_cfg = get_strategy_config()
         pending_trades = []  # [(slug, market, extra_info), ...]
 
         for slug, market in list(self.tracked.items()):
@@ -541,9 +581,9 @@ class MarketTracker:
                 if slug not in self._ptb_pending:
                     self._ptb_pending[slug] = market['coin']
             
-            # === 预热期：20s-160s（PTB获取后立即开始贝叶斯采样，延续到晚期窗口） ===
-            LATE_BET_END = int(os.environ.get("LATE_BET_END", "160"))
-            if 20 <= elapsed <= LATE_BET_END and (slug not in self.analyzed or slug in self.skipped_markets):
+            # === 预热期：由 WARMUP_START_SECONDS 控制（延续到晚期窗口结束） ===
+            LATE_BET_END = strategy_cfg["late_bet_end"]
+            if strategy_cfg["warmup_start_seconds"] <= elapsed <= LATE_BET_END and (slug not in self.analyzed or slug in self.skipped_markets):
                 if slug not in self.warmup_started:
                     self.warmup_started.add(slug)
                     self.warmup_data[slug] = []
@@ -583,11 +623,14 @@ class MarketTracker:
                     except Exception:
                         pass
 
-                # 每5秒采集一次，有PTB时才做贝叶斯更新
+                # 按配置间隔采集，有PTB时才做贝叶斯更新
                 ptb_now = self.ptb_cache.get(slug)
                 samples = self.warmup_data.get(slug, [])
-                # 采样间隔: 前60秒每5秒，临近下注窗口(80s+)每3秒
-                sample_interval = 3 if elapsed >= 80 else 5
+                sample_interval = (
+                    strategy_cfg["warmup_sample_interval_late"]
+                    if elapsed >= strategy_cfg["early_bet_start"]
+                    else strategy_cfg["warmup_sample_interval_early"]
+                )
                 if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
                     try:
                         from ai_trader.price_oracle import get_onchain_price
@@ -641,15 +684,16 @@ class MarketTracker:
                             self.last_analysis_time.pop(slug, None)
                             skip_info["reanalyze_count"] += 1
 
-            # === 早期下注窗口：90-95s（CLOB 在更早阶段可能返回 425 Too Early） ===
-            EARLY_BET_START = int(os.environ.get("EARLY_BET_START", "90"))
-            EARLY_BET_END = int(os.environ.get("EARLY_BET_END", "95"))
+            # === 早期下注窗口：由 EARLY_BET_START / EARLY_BET_END 控制 ===
+            EARLY_BET_START = strategy_cfg["early_bet_start"]
+            EARLY_BET_END = strategy_cfg["early_bet_end"]
             if EARLY_BET_START <= elapsed <= EARLY_BET_END and slug not in self.analyzed and slug not in self.early_analyzed:
                 updater = self.bayesian_updaters.get(slug)
                 samples = self.warmup_data.get(slug, [])
+                early_min_samples = strategy_cfg["early_min_samples"]
 
-                # 早期门槛: n_updates>=4, conf>=0.25, samples>=4
-                if updater and updater.n_updates >= 4 and len(samples) >= 4:
+                # 早期门槛: 至少拿到 EARLY_MIN_SAMPLES 个样本
+                if updater and updater.n_updates >= early_min_samples and len(samples) >= early_min_samples:
                     b_dir, b_phat, b_conf = updater.get_direction_and_confidence()
 
                     if b_conf >= 0.25:
@@ -666,14 +710,13 @@ class MarketTracker:
                                 "early_window": True,
                                 "remaining_seconds": remaining,
                             }
-                            if updater.n_updates >= 3:
-                                extra_info["bayesian"] = updater.get_summary()
+                            extra_info["bayesian"] = updater.get_summary()
                             logger.info(f"\n⚡ 早期下注窗口: {market['coin']} elapsed={elapsed:.0f}s | 贝叶斯: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f}")
                             pending_trades.append((slug, market, extra_info))
 
-            # === 晚期下注窗口：100s-160s（贝叶斯后验 + gap 趋势双重确认） ===
-            LATE_BET_START = int(os.environ.get("LATE_BET_START", "100"))
-            MAX_TRADE_RETRIES = int(os.environ.get("MAX_TRADE_RETRIES", "3"))
+            # === 晚期下注窗口：由 LATE_BET_START / LATE_BET_END 控制 ===
+            LATE_BET_START = strategy_cfg["late_bet_start"]
+            MAX_TRADE_RETRIES = strategy_cfg["max_trade_retries"]
             if LATE_BET_START <= elapsed <= LATE_BET_END and slug not in self.analyzed:
                 # FOK/流动性失败重试上限
                 if self.trade_attempts.get(slug, 0) >= MAX_TRADE_RETRIES:
@@ -681,7 +724,7 @@ class MarketTracker:
                     logger.warning(f"\n⚠️ {market['coin']} 晚期窗口已重试{MAX_TRADE_RETRIES}次，放弃")
                     continue
                 # 冷却期：避免每2秒重复分析，等待市场条件变化
-                LATE_REANALYZE_INTERVAL = int(os.environ.get("LATE_REANALYZE_INTERVAL", "20"))
+                LATE_REANALYZE_INTERVAL = strategy_cfg["late_reanalyze_interval"]
                 if time.time() - self.last_analysis_time.get(slug, 0) < LATE_REANALYZE_INTERVAL:
                     continue
                 self.last_analysis_time[slug] = time.time()
@@ -704,7 +747,7 @@ class MarketTracker:
 
                 # 贝叶斯后验结果
                 updater = self.bayesian_updaters.get(slug)
-                if updater and updater.n_updates >= 3:
+                if updater and updater.n_updates >= strategy_cfg["late_min_updates"]:
                     bayesian_summary = updater.get_summary()
                     extra_info["bayesian"] = bayesian_summary
                     b_dir = bayesian_summary["direction"]
@@ -713,8 +756,8 @@ class MarketTracker:
                     reanalyze_tag = " [重分析]" if is_reanalyze else ""
                     logger.info(f"\n🧠 贝叶斯结果{reanalyze_tag}: {b_dir} p̂={b_phat:.4f} conf={b_conf:.3f} (n={updater.n_updates})")
 
-                    # 贝叶斯置信度太低（<15%），方向不确定，跳过（等冷却后重试）
-                    if b_conf < 0.15:
+                    # 贝叶斯置信度太低，方向不确定，跳过（等冷却后重试）
+                    if b_conf < strategy_cfg["late_low_conf_threshold"]:
                         if not is_reanalyze and _skip_price:
                             self.skipped_markets[slug] = {
                                 "skip_time": time.time(),
@@ -723,7 +766,7 @@ class MarketTracker:
                                 "reanalyze_count": 0,
                             }
                             # 成熟样本下的极低置信度不再每轮重扫，交给波动重触发重新放行。
-                            if gap_trend == "穿越" or len(samples) >= 8:
+                            if gap_trend == "穿越" or len(samples) >= strategy_cfg["late_mature_sample_count"]:
                                 self.analyzed.add(slug)
                         logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，等待变化")
                         continue
@@ -733,9 +776,9 @@ class MarketTracker:
                 # gap 趋势仍作为安全阀
                 if gap_trend == "穿越":
                     # 但如果贝叶斯置信度很高（>60%），仍允许交易
-                    if updater and updater.n_updates >= 3:
+                    if updater and updater.n_updates >= strategy_cfg["late_min_updates"]:
                         b_conf = updater.get_direction_and_confidence()[2]
-                        if b_conf >= 0.6:
+                        if b_conf >= strategy_cfg["late_gap_cross_allow_conf"]:
                             logger.info(f"  ✅ gap穿越但贝叶斯置信度高({b_conf:.3f})，允许交易")
                         else:
                             logger.warning(f"\n⚠️ {market['coin']} gap穿越+贝叶斯弱({b_conf:.3f})，等待变化")
@@ -1165,10 +1208,16 @@ def main():
     global _runtime_max_reanalyze
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
     _runtime_max_reanalyze = int(os.environ.get("MAX_REANALYZE", "1"))
+    strategy_cfg = get_strategy_config()
     print("🤖 Polymarket 全自动交易机器人 v3.4 启动")
     print("   策略: PTB预获取 → 贝叶斯预热 → 趋势确认下注")
     print("   新增: SDK直连下单(延迟<50ms) | FOK即时平仓 | LMSR流动性评估")
-    print("   时间线: 2-40s获取PTB → 20-100s贝叶斯预热 → 100-160s下注")
+    print(
+        "   时间线: "
+        f"2-40s获取PTB → {strategy_cfg['warmup_start_seconds']}s起预热"
+        f" → early {strategy_cfg['early_bet_start']}-{strategy_cfg['early_bet_end']}s"
+        f" → late {strategy_cfg['late_bet_start']}-{strategy_cfg['late_bet_end']}s"
+    )
     print()
 
     # 初始化 CLOB SDK 客户端（全局单例，全程复用）

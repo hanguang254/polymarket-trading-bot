@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.5.2
+# Polymarket Trading Bot v10.5.3
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -8,17 +8,17 @@ Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-dr
 
 The bot uses Bayesian sequential updating to detect directional signals, enters when EV (p_win - execution_price) is positive with sufficient confidence, and manages positions with full-duration market-price stop-loss.
 
-### Execution Timeline (300s market)
+### Execution Timeline (300s market, all timings configurable via `.env`)
 
 ```
 0s    Market starts
 2s    PTB acquisition (crypto-price API, Playwright fallback)
-20s   Bayesian warmup (5s intervals, 3s after 80s)
+Ns    Bayesian warmup starts (WARMUP_START_SECONDS, default 20)
+      Sampling: WARMUP_SAMPLE_INTERVAL_EARLY (5s) → _LATE (3s) after early window
 40s   PTB deadline
-90s   Early bet window opens (lower thresholds, CLOB mispricing)
-95s   Early bet window closes
-100s  Late bet window opens (standard thresholds)
-160s  Late bet window closes → Real-time EV monitoring starts
+E0-E1 Early bet window (EARLY_BET_START-EARLY_BET_END, default 90-95s)
+L0-L1 Late bet window (LATE_BET_START-LATE_BET_END, default 100-160s)
+      → Real-time EV monitoring starts after bet
       ── Exit Protocol ──
 >30s  PTB Proximity Buffer: crypto near PTB → freeze direction signal (prevent noise stop-loss)
 >30s  -25% hard stop: unconditional market sell (proximity extreme stop at -50%)
@@ -124,7 +124,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **CLOB Keepalive 非阻塞**: `_keepalive` 线程使用 `_client_lock.acquire(blocking=False)` 获取锁，当下单/查簿正在执行时直接跳过本轮心跳，避免阻塞交易路径。
 - **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
 - **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
-- **Adaptive Warmup Sampling**: 5s intervals during 20-80s, accelerates to 3s during 80-100s (near bet window) for sharper Bayesian posterior. Price sourced from Chainlink RTDS (same oracle as PTB/settlement) with Binance fallback. Sample log shows source tag `(CL)`/`(BN)` for traceability.
+- **Adaptive Warmup Sampling**: `WARMUP_SAMPLE_INTERVAL_EARLY` (default 5s) intervals before early window, accelerates to `WARMUP_SAMPLE_INTERVAL_LATE` (default 3s) after early window opens. Warmup starts at `WARMUP_START_SECONDS` (default 20). Price sourced from Chainlink RTDS (same oracle as PTB/settlement) with Binance fallback. Sample log shows source tag `(CL)`/`(BN)` for traceability.
+- **Strategy Timing Config (`get_strategy_config()`)**: 预热/早期/晚期窗口的全部时序参数和贝叶斯阈值统一由 `.env` 配置，硬编码 magic numbers 已全部提取。包括 `EARLY_MIN_SAMPLES`、`LATE_MIN_UPDATES`、`LATE_LOW_CONF_THRESHOLD`、`LATE_GAP_CROSS_ALLOW_CONF`、`LATE_MATURE_SAMPLE_COUNT` 等。
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
 - **PTB 获取 (crypto-price API + Playwright 回退)**: 主路径使用 Polymarket `crypto-price` REST API（`get_price_to_beat_api()`，从 slug 时间戳构造请求参数，~50ms），无需浏览器进程。API 失败时回退 Playwright subprocess。3 次连续失败后跳过该币种。`get_current_markets()` 和 `position_monitor.get_ptb_from_slug()` 同步切换。
@@ -319,12 +320,20 @@ See `.env.example` for all configurable parameters:
 | `MIN_CONFIDENCE` | No | Min confidence for late window (default: 0.70) |
 | `MIN_ATR_DEVIATION` | No | Min ATR deviation for entry (default: 1.4) |
 | `P_WIN_CAP` | No | Max p_win cap (default: 0.92) |
+| `WARMUP_START_SECONDS` | No | Seconds after market start to begin warmup sampling (default: 20) |
+| `WARMUP_SAMPLE_INTERVAL_EARLY` | No | Warmup sample interval before the early bet window, in seconds (default: 5) |
+| `WARMUP_SAMPLE_INTERVAL_LATE` | No | Warmup sample interval after the early bet window opens, in seconds (default: 3) |
 | `EARLY_BET_START` | No | Early bet window start in seconds (default: 90) |
 | `EARLY_BET_END` | No | Early bet window end in seconds (default: 95) |
+| `EARLY_MIN_SAMPLES` | No | Minimum warmup sample count required before early-window bets are allowed (default: 4) |
 | `EARLY_MIN_EV` | No | Min EV for early window (default: 0.08) |
 | `EARLY_MIN_CONFIDENCE` | No | Min confidence for early window (default: 0.60) |
 | `LATE_BET_START` | No | Late bet window start (default: 100) |
 | `LATE_BET_END` | No | Late bet window end (default: 160) |
+| `LATE_MIN_UPDATES` | No | Minimum Bayesian update count required before late-window Bayesian gating applies (default: 3) |
+| `LATE_LOW_CONF_THRESHOLD` | No | Late-window confidence below this is treated as low-confidence skip (default: 0.15) |
+| `LATE_GAP_CROSS_ALLOW_CONF` | No | When gap crosses PTB, only allow late-window bets if confidence is at least this value (default: 0.60) |
+| `LATE_MATURE_SAMPLE_COUNT` | No | Mature-sample threshold used to stop repeatedly scanning low-confidence late setups (default: 8) |
 | `SLIPPAGE` | No | Empty book fallback slippage for last-trade-price ± (default: 0.02) |
 | `P0_BASE_PROFIT` | No | P0 take-profit base threshold (default: 0.20) |
 | `PROFIT_THRESHOLD` | No | General profit threshold (default: 0.15) |

@@ -541,6 +541,42 @@ class TestPtbFetchStrategy(unittest.TestCase):
         self.assertEqual(bot._ptb_failures.get("BTC", 0), 0)
 
 
+class TestStrategyConfig(unittest.TestCase):
+    def test_get_strategy_config_reads_timing_and_late_threshold_overrides(self):
+        with patch.dict(os.environ, {
+            "WARMUP_START_SECONDS": "8",
+            "WARMUP_SAMPLE_INTERVAL_EARLY": "3",
+            "WARMUP_SAMPLE_INTERVAL_LATE": "2",
+            "EARLY_BET_START": "20",
+            "EARLY_BET_END": "35",
+            "EARLY_MIN_SAMPLES": "4",
+            "LATE_BET_START": "90",
+            "LATE_BET_END": "220",
+            "LATE_MIN_UPDATES": "4",
+            "LATE_LOW_CONF_THRESHOLD": "0.18",
+            "LATE_GAP_CROSS_ALLOW_CONF": "0.65",
+            "LATE_MATURE_SAMPLE_COUNT": "10",
+            "LATE_REANALYZE_INTERVAL": "12",
+            "MAX_TRADE_RETRIES": "6",
+        }, clear=False):
+            cfg = bot.get_strategy_config()
+
+        self.assertEqual(cfg["warmup_start_seconds"], 8)
+        self.assertEqual(cfg["warmup_sample_interval_early"], 3.0)
+        self.assertEqual(cfg["warmup_sample_interval_late"], 2.0)
+        self.assertEqual(cfg["early_bet_start"], 20)
+        self.assertEqual(cfg["early_bet_end"], 35)
+        self.assertEqual(cfg["early_min_samples"], 4)
+        self.assertEqual(cfg["late_bet_start"], 90)
+        self.assertEqual(cfg["late_bet_end"], 220)
+        self.assertEqual(cfg["late_min_updates"], 4)
+        self.assertEqual(cfg["late_low_conf_threshold"], 0.18)
+        self.assertEqual(cfg["late_gap_cross_allow_conf"], 0.65)
+        self.assertEqual(cfg["late_mature_sample_count"], 10)
+        self.assertEqual(cfg["late_reanalyze_interval"], 12)
+        self.assertEqual(cfg["max_trade_retries"], 6)
+
+
 # ═══════════════════════════════════════════════════════════
 # 4. Cleanup 测试
 # ═══════════════════════════════════════════════════════════
