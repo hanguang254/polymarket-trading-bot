@@ -22,6 +22,43 @@ RTDS_URL = "wss://ws-live-data.polymarket.com"
 PING_INTERVAL = 5  # 文档要求每5秒 PING
 STALE_THRESHOLD = 15  # 超过15秒无更新视为过期（短暂抖动/波动期Chainlink推送可能延迟）
 
+
+def _coerce_timestamp(value):
+    """把秒/毫秒/微秒时间戳转成 epoch seconds。"""
+    if value is None:
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts > 1e15:
+        ts /= 1_000_000.0
+    elif ts > 1e12:
+        ts /= 1_000.0
+    if ts <= 0:
+        return None
+    return ts
+
+
+def _extract_source_timestamp(payload, data):
+    """尽量从 RTDS payload 提取源侧时间戳；字段不存在时返回 None。"""
+    for candidate in (
+        payload.get("timestamp"),
+        payload.get("ts"),
+        payload.get("time"),
+        payload.get("updated_at"),
+        payload.get("updatedAt"),
+        payload.get("publish_time"),
+        payload.get("publishTime"),
+        data.get("timestamp"),
+        data.get("ts"),
+        data.get("time"),
+    ):
+        ts = _coerce_timestamp(candidate)
+        if ts is not None:
+            return ts
+    return None
+
 # Chainlink symbol 映射（从 coins.py 动态加载）
 def _load_chainlink_symbols():
     try:
@@ -51,11 +88,14 @@ class ChainlinkPriceStream:
         self._initialized = True
         self.prices = {}        # {"BTC": 83521.50, "ETH": 1920.30}
         self.last_update = {}   # {"BTC": time.time(), ...}
+        self.source_timestamps = {}  # {"BTC": provider_ts, ...}
+        self.update_count = {}  # {"BTC": 123, ...}
         self._running = False
         self._thread = None
         self._ws = None
         self._reconnect_delay = 2
         self._price_event = threading.Event()  # 每次收到新价格时 set
+        self._last_event = None  # 最近一次推送的元数据（供监控日志）
 
     def start(self):
         if not _HAS_WEBSOCKET:
@@ -77,17 +117,48 @@ class ChainlinkPriceStream:
 
     def get_price(self, coin="BTC"):
         """获取 Chainlink 链上实时价格，数据超过15秒未更新则返回 None"""
-        price = self.prices.get(coin)
-        last = self.last_update.get(coin, 0)
-        if price and (time.time() - last) < STALE_THRESHOLD:
-            return price
+        snapshot = self.get_snapshot(coin)
+        if snapshot and not snapshot["stale"]:
+            return snapshot["price"]
         return None
 
-    def wait_for_update(self, timeout=1.0):
+    def get_snapshot(self, coin="BTC"):
+        """返回价格流调试信息，包含 age/source_age/update_count。"""
+        price = self.prices.get(coin)
+        last = self.last_update.get(coin, 0)
+        if price is None or last <= 0:
+            return None
+        now = time.time()
+        age_sec = max(0.0, now - last)
+        source_ts = self.source_timestamps.get(coin)
+        source_age_ms = round(max(0.0, now - source_ts) * 1000, 1) if source_ts else None
+        return {
+            "coin": coin,
+            "price": price,
+            "age_ms": round(age_sec * 1000, 1),
+            "stale": age_sec >= STALE_THRESHOLD,
+            "last_update_ts": last,
+            "source_ts": source_ts,
+            "source_age_ms": source_age_ms,
+            "updates": self.update_count.get(coin, 0),
+        }
+
+    def wait_for_update(self, timeout=1.0, with_details=False):
         """阻塞等待 Chainlink 推送新价格，或到 timeout 秒后返回。
         返回 True 表示收到新价格，False 表示超时（兜底轮询）。"""
+        started_at = time.time()
         updated = self._price_event.wait(timeout=timeout)
+        wait_ms = round(max(0.0, time.time() - started_at) * 1000, 1)
+        event = dict(self._last_event) if updated and isinstance(self._last_event, dict) else None
+        if event and event.get("received_at"):
+            event["age_ms"] = round(max(0.0, time.time() - event["received_at"]) * 1000, 1)
         self._price_event.clear()
+        if with_details:
+            return {
+                "updated": updated,
+                "wait_ms": wait_ms,
+                "event": event,
+            }
         return updated
 
     # ── WebSocket 内部 ──
@@ -160,8 +231,20 @@ class ChainlinkPriceStream:
         coin = _SYMBOL_TO_COIN.get(symbol)
         if coin and value is not None:
             try:
-                self.prices[coin] = float(value)
-                self.last_update[coin] = time.time()
+                price = float(value)
+                received_at = time.time()
+                source_ts = _extract_source_timestamp(payload, data)
+                self.prices[coin] = price
+                self.last_update[coin] = received_at
+                self.source_timestamps[coin] = source_ts
+                self.update_count[coin] = self.update_count.get(coin, 0) + 1
+                self._last_event = {
+                    "coin": coin,
+                    "price": price,
+                    "received_at": received_at,
+                    "source_ts": source_ts,
+                    "updates": self.update_count[coin],
+                }
                 self._price_event.set()  # 通知监控循环有新价格
             except (ValueError, TypeError):
                 pass

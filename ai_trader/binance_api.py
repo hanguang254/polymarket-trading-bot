@@ -18,6 +18,23 @@ except ImportError:
 BINANCE_API = "https://api.binance.com"
 
 
+def _coerce_timestamp(value):
+    """把秒/毫秒/微秒时间戳转成 epoch seconds。"""
+    if value is None:
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts > 1e15:
+        ts /= 1_000_000.0
+    elif ts > 1e12:
+        ts /= 1_000.0
+    if ts <= 0:
+        return None
+    return ts
+
+
 # ═══ Binance WebSocket 实时价格流（全局单例） ═══
 class BinancePriceStream:
     """后台 WebSocket 持续接收 BTC/ETH 实时成交价，get_price() 零延迟读内存"""
@@ -35,6 +52,9 @@ class BinancePriceStream:
         self._initialized = True
         self.prices = {}       # {"BTC": 83521.50, "ETH": 1920.30}
         self.last_update = {}  # {"BTC": time.time(), ...}
+        self.event_timestamps = {}  # {"BTC": event_time, ...}
+        self.trade_timestamps = {}  # {"BTC": trade_time, ...}
+        self.update_count = {}  # {"BTC": 123, ...}
         self._ws = None
         self._running = False
         self._thread = None
@@ -80,11 +100,17 @@ class BinancePriceStream:
             data = json.loads(message)
             symbol = data.get("s", "")
             price = float(data["p"])
+            received_at = time.time()
+            event_ts = _coerce_timestamp(data.get("E"))
+            trade_ts = _coerce_timestamp(data.get("T"))
             # 动态解析: BTCUSDT→BTC, ETHUSDT→ETH, BNBUSDT→BNB
             coin = symbol.replace("USDT", "").upper() if symbol.endswith("USDT") else None
             if coin:
                 self.prices[coin] = price
-                self.last_update[coin] = time.time()
+                self.last_update[coin] = received_at
+                self.event_timestamps[coin] = event_ts
+                self.trade_timestamps[coin] = trade_ts
+                self.update_count[coin] = self.update_count.get(coin, 0) + 1
         except Exception:
             pass
 
@@ -97,11 +123,35 @@ class BinancePriceStream:
 
     def get_price(self, coin="BTC"):
         """获取实时价格，数据超过5秒未更新则返回None（触发REST fallback）"""
+        snapshot = self.get_snapshot(coin)
+        if snapshot and not snapshot["stale"]:
+            return snapshot["price"]
+        return None
+
+    def get_snapshot(self, coin="BTC"):
+        """返回价格流调试信息，包含 age/event_age/trade_age/update_count。"""
         price = self.prices.get(coin)
         last = self.last_update.get(coin, 0)
-        if price and (time.time() - last) < 5:
-            return price
-        return None
+        if price is None or last <= 0:
+            return None
+        now = time.time()
+        age_sec = max(0.0, now - last)
+        event_ts = self.event_timestamps.get(coin)
+        trade_ts = self.trade_timestamps.get(coin)
+        event_age_ms = round(max(0.0, now - event_ts) * 1000, 1) if event_ts else None
+        trade_age_ms = round(max(0.0, now - trade_ts) * 1000, 1) if trade_ts else None
+        return {
+            "coin": coin,
+            "price": price,
+            "age_ms": round(age_sec * 1000, 1),
+            "stale": age_sec >= 5,
+            "last_update_ts": last,
+            "source_ts": event_ts,
+            "source_age_ms": event_age_ms,
+            "trade_ts": trade_ts,
+            "trade_age_ms": trade_age_ms,
+            "updates": self.update_count.get(coin, 0),
+        }
 
     def stop(self):
         self._running = False

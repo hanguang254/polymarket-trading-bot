@@ -10,6 +10,23 @@ import requests
 
 HERMES_BASE = "https://hermes.pyth.network"
 
+
+def _coerce_timestamp(value):
+    """把秒/毫秒/微秒时间戳转成 epoch seconds。"""
+    if value is None:
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts > 1e15:
+        ts /= 1_000_000.0
+    elif ts > 1e12:
+        ts /= 1_000.0
+    if ts <= 0:
+        return None
+    return ts
+
 # Pyth 官方 price feed IDs（从 coins.py 动态加载）
 def _load_pyth_feeds():
     try:
@@ -40,6 +57,8 @@ class PythPriceStream:
         self._initialized = True
         self.prices = {}        # {"BTC": 83521.50, "ETH": 1920.30}
         self.last_update = {}   # {"BTC": time.time(), ...}
+        self.source_timestamps = {}  # {"BTC": publish_time, ...}
+        self.update_count = {}  # {"BTC": 123, ...}
         self._running = False
         self._thread = None
 
@@ -78,6 +97,7 @@ class PythPriceStream:
     def _parse_sse_data(self, raw):
         try:
             data = json.loads(raw)
+            received_at = time.time()
             for item in data.get("parsed", []):
                 feed_id = item["id"]
                 coin = next((c for c, fid in PYTH_FEED_IDS.items() if fid == feed_id), None)
@@ -86,18 +106,44 @@ class PythPriceStream:
                 price_data = item["price"]
                 expo = price_data["expo"]
                 price = int(price_data["price"]) * (10 ** expo)
+                publish_ts = (
+                    _coerce_timestamp(price_data.get("publish_time"))
+                    or _coerce_timestamp(item.get("publish_time"))
+                )
                 self.prices[coin] = price
-                self.last_update[coin] = time.time()
+                self.last_update[coin] = received_at
+                self.source_timestamps[coin] = publish_ts
+                self.update_count[coin] = self.update_count.get(coin, 0) + 1
         except Exception:
             pass
 
     def get_price(self, coin="BTC"):
         """获取链上实时价格，数据超过5秒未更新则返回None"""
+        snapshot = self.get_snapshot(coin)
+        if snapshot and not snapshot["stale"]:
+            return snapshot["price"]
+        return None
+
+    def get_snapshot(self, coin="BTC"):
+        """返回价格流调试信息，包含 age/source_age/update_count。"""
         price = self.prices.get(coin)
         last = self.last_update.get(coin, 0)
-        if price and (time.time() - last) < 5:
-            return price
-        return None
+        if price is None or last <= 0:
+            return None
+        now = time.time()
+        age_sec = max(0.0, now - last)
+        source_ts = self.source_timestamps.get(coin)
+        source_age_ms = round(max(0.0, now - source_ts) * 1000, 1) if source_ts else None
+        return {
+            "coin": coin,
+            "price": price,
+            "age_ms": round(age_sec * 1000, 1),
+            "stale": age_sec >= 5,
+            "last_update_ts": last,
+            "source_ts": source_ts,
+            "source_age_ms": source_age_ms,
+            "updates": self.update_count.get(coin, 0),
+        }
 
     def stop(self):
         self._running = False

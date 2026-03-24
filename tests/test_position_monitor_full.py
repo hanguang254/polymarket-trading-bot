@@ -683,6 +683,48 @@ class TestGetMarketPrice(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestCryptoPriceObservability(unittest.TestCase):
+    @patch.object(pm, "_price_stream")
+    @patch.object(pm, "_pyth_stream")
+    @patch.object(pm, "_chainlink_stream")
+    def test_get_current_crypto_price_debug_prefers_chainlink_snapshot(self, mock_cl, mock_pyth, mock_bn):
+        mock_cl.get_snapshot.return_value = {"price": 71028.18, "age_ms": 820.0, "stale": False}
+        mock_pyth.get_snapshot.return_value = {"price": 71022.00, "age_ms": 110.0, "stale": False}
+        mock_bn.get_snapshot.return_value = {"price": 71020.50, "age_ms": 25.0, "stale": False}
+
+        debug = pm.get_current_crypto_price_debug("BTC")
+
+        self.assertEqual(debug["price"], 71028.18)
+        self.assertEqual(debug["source"], "CL")
+        self.assertEqual(debug["source_path"], "chainlink_stream")
+        self.assertEqual(debug["selected_age_ms"], 820.0)
+        self.assertEqual(debug["chainlink"]["price"], 71028.18)
+        self.assertEqual(debug["pyth"]["price"], 71022.00)
+        self.assertEqual(debug["binance"]["price"], 71020.50)
+
+    def test_format_price_observability_includes_skews_market_age_and_wake(self):
+        crypto_debug = {
+            "source_path": "chainlink_stream",
+            "selected_age_ms": 830.0,
+            "chainlink": {"price": 71028.18, "age_ms": 830.0, "stale": False},
+            "pyth": {"price": 71022.18, "age_ms": 120.0, "stale": False},
+            "binance": {"price": 71020.18, "age_ms": 35.0, "stale": False},
+        }
+        market_obs = {"source": "ws_bba", "age_ms": 28.0, "spread_pct": 4.2}
+        wake_context = {"label": "chainlink_push", "detail": "BTC/18ms"}
+
+        line = pm._format_price_observability(crypto_debug, market_obs, 40.0, wake_context)
+
+        self.assertIn("sel=chainlink_stream@830ms", line)
+        self.assertIn("CL=830ms", line)
+        self.assertIn("Pyth=120ms", line)
+        self.assertIn("BN=35ms", line)
+        self.assertIn("CL-Py=+6.00(+0.15ATR)", line)
+        self.assertIn("CL-BN=+8.00(+0.20ATR)", line)
+        self.assertIn("OB=28ms/ws_bba spr=4.2%", line)
+        self.assertIn("wake=chainlink_push(BTC/18ms)", line)
+
+
 class TestGetBestBid(unittest.TestCase):
     """get_best_bid: 止盈卖出价（含0.99折扣）"""
 

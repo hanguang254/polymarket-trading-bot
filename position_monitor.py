@@ -737,6 +737,118 @@ def _normalize_book_levels(levels):
     return normalized
 
 
+def _get_stream_snapshot(stream, coin):
+    """读取价格流 snapshot；mock/旧对象不支持时安全返回 None。"""
+    getter = getattr(stream, "get_snapshot", None)
+    if not callable(getter):
+        return None
+    try:
+        snapshot = getter(coin)
+    except Exception:
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _format_age_ms(age_ms):
+    age = _safe_float(age_ms)
+    if age is None:
+        return "N/A"
+    if age < 1000:
+        return f"{age:.0f}ms"
+    if age < 10_000:
+        return f"{age / 1000:.2f}s"
+    return f"{age / 1000:.1f}s"
+
+
+def _format_stream_age(label, snapshot):
+    if not isinstance(snapshot, dict):
+        return f"{label}=N/A"
+    age_label = _format_age_ms(snapshot.get("age_ms"))
+    source_age = _safe_float(snapshot.get("source_age_ms"))
+    source_label = f"/src={_format_age_ms(source_age)}" if source_age is not None else ""
+    stale = " stale" if snapshot.get("stale") else ""
+    return f"{label}={age_label}{source_label}{stale}"
+
+
+def _format_price_skew(label, left_snapshot, right_snapshot, atr_val):
+    if not isinstance(left_snapshot, dict) or not isinstance(right_snapshot, dict):
+        return f"{label}=N/A"
+    left_price = _safe_float(left_snapshot.get("price"))
+    right_price = _safe_float(right_snapshot.get("price"))
+    if left_price is None or right_price is None:
+        return f"{label}=N/A"
+    delta = left_price - right_price
+    if atr_val and atr_val > 0:
+        return f"{label}={delta:+.2f}({delta / atr_val:+.2f}ATR)"
+    return f"{label}={delta:+.2f}"
+
+
+def _get_market_observability(token_id):
+    """返回盘口快照 age/spread，便于对比盘口和 oracle 哪边先动。"""
+    try:
+        bba_snapshot = _poly_ws.get_best_bid_ask_snapshot(token_id)
+    except Exception:
+        bba_snapshot = None
+    if isinstance(bba_snapshot, dict):
+        best_bid = _safe_float(bba_snapshot.get("best_bid"))
+        best_ask = _safe_float(bba_snapshot.get("best_ask"))
+        mid = ((best_bid + best_ask) / 2.0) if best_bid is not None and best_ask is not None else None
+        spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid and best_ask >= best_bid else None
+        return {
+            "source": "ws_bba",
+            "age_ms": bba_snapshot.get("age_ms"),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread_pct": spread_pct,
+        }
+
+    try:
+        book_snapshot = _poly_ws.get_book_snapshot(token_id)
+    except Exception:
+        book_snapshot = None
+    if isinstance(book_snapshot, dict):
+        bids = _normalize_book_levels(book_snapshot.get("bids"))
+        asks = _normalize_book_levels(book_snapshot.get("asks"))
+        best_bid = bids[0][0] if bids else None
+        best_ask = asks[0][0] if asks else None
+        mid = ((best_bid + best_ask) / 2.0) if best_bid is not None and best_ask is not None else None
+        spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid and best_ask >= best_bid else None
+        return {
+            "source": "ws_book",
+            "age_ms": book_snapshot.get("age_ms"),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread_pct": spread_pct,
+        }
+    return None
+
+
+def _format_price_observability(crypto_debug, market_obs, atr_val, wake_context=None):
+    if not isinstance(crypto_debug, dict):
+        return None
+    selected_label = crypto_debug.get("source_path") or crypto_debug.get("source") or "N/A"
+    parts = [
+        f"sel={selected_label}@{_format_age_ms(crypto_debug.get('selected_age_ms'))}",
+        _format_stream_age("CL", crypto_debug.get("chainlink")),
+        _format_stream_age("Pyth", crypto_debug.get("pyth")),
+        _format_stream_age("BN", crypto_debug.get("binance")),
+        _format_price_skew("CL-Py", crypto_debug.get("chainlink"), crypto_debug.get("pyth"), atr_val),
+        _format_price_skew("CL-BN", crypto_debug.get("chainlink"), crypto_debug.get("binance"), atr_val),
+    ]
+    if isinstance(market_obs, dict):
+        spread_pct = _safe_float(market_obs.get("spread_pct"))
+        market_part = f"OB={_format_age_ms(market_obs.get('age_ms'))}/{market_obs.get('source') or 'N/A'}"
+        if spread_pct is not None:
+            market_part += f" spr={spread_pct:.1f}%"
+        parts.append(market_part)
+    if isinstance(wake_context, dict):
+        wake_label = wake_context.get("label")
+        wake_detail = wake_context.get("detail")
+        if wake_label:
+            parts.append(f"wake={wake_label}({wake_detail})" if wake_detail else f"wake={wake_label}")
+    return " | ".join(parts)
+
+
 def _get_fresh_exit_quote(token_id, price_hint=None):
     """退出前刷新最新 bid/book，优先 WS 快照，其次 SDK。"""
     try:
@@ -1266,42 +1378,59 @@ def get_settlement_reference_price(position, coin):
     if frozen is not None and frozen > 0:
         return frozen, "冻结价"
 
-    live = get_current_crypto_price(coin)
+    debug = get_current_crypto_price_debug(coin)
+    live = debug.get("price")
     if live is not None:
-        src = "CL" if _chainlink_stream.get_price(coin) is not None else "Pyth" if _pyth_stream.get_price(coin) is not None else "Binance"
-        return live, src
+        return live, debug.get("source")
     return None, None
 
-def get_current_crypto_price(coin):
-    """获取BTC/ETH当前实时价格 - PRICE_SOURCE=1 Chainlink优先, =2 Pyth优先"""
+
+def get_current_crypto_price_debug(coin):
+    """返回当前 crypto 价格及调试元数据，不改变原有选源优先级。"""
+    cl_snapshot = _get_stream_snapshot(_chainlink_stream, coin)
+    pyth_snapshot = _get_stream_snapshot(_pyth_stream, coin)
+    binance_snapshot = _get_stream_snapshot(_price_stream, coin)
+
+    debug = {
+        "coin": coin,
+        "price": None,
+        "source": None,
+        "source_path": None,
+        "selected_age_ms": None,
+        "chainlink": cl_snapshot,
+        "pyth": pyth_snapshot,
+        "binance": binance_snapshot,
+    }
+
+    def _select(price, source, source_path, age_ms=None):
+        debug["price"] = price
+        debug["source"] = source
+        debug["source_path"] = source_path
+        debug["selected_age_ms"] = _safe_float(age_ms)
+        return debug
+
     if PRICE_SOURCE == 2:
         # Pyth优先模式
-        pyth_price = _pyth_stream.get_price(coin)
-        if pyth_price is not None:
-            return pyth_price
+        if isinstance(pyth_snapshot, dict) and not pyth_snapshot.get("stale"):
+            return _select(pyth_snapshot.get("price"), "Pyth", "pyth_stream", pyth_snapshot.get("age_ms"))
         pyth_rest = get_pyth_price(coin)
         if pyth_rest is not None:
-            return pyth_rest
-        # fallback Chainlink
-        cl_price = _chainlink_stream.get_price(coin)
-        if cl_price is not None:
-            return cl_price
+            return _select(pyth_rest, "Pyth", "pyth_rest")
+        if isinstance(cl_snapshot, dict) and not cl_snapshot.get("stale"):
+            return _select(cl_snapshot.get("price"), "CL", "chainlink_stream", cl_snapshot.get("age_ms"))
     else:
         # Chainlink优先模式（默认，官方结算价）
-        cl_price = _chainlink_stream.get_price(coin)
-        if cl_price is not None:
-            return cl_price
-        # fallback Pyth
-        pyth_price = _pyth_stream.get_price(coin)
-        if pyth_price is not None:
-            return pyth_price
+        if isinstance(cl_snapshot, dict) and not cl_snapshot.get("stale"):
+            return _select(cl_snapshot.get("price"), "CL", "chainlink_stream", cl_snapshot.get("age_ms"))
+        if isinstance(pyth_snapshot, dict) and not pyth_snapshot.get("stale"):
+            return _select(pyth_snapshot.get("price"), "Pyth", "pyth_stream", pyth_snapshot.get("age_ms"))
         pyth_rest = get_pyth_price(coin)
         if pyth_rest is not None:
-            return pyth_rest
+            return _select(pyth_rest, "Pyth", "pyth_rest")
+
     # 最终 fallback: Binance
-    ws_price = _price_stream.get_price(coin)
-    if ws_price is not None:
-        return ws_price
+    if isinstance(binance_snapshot, dict) and not binance_snapshot.get("stale"):
+        return _select(binance_snapshot.get("price"), "WS", "binance_ws", binance_snapshot.get("age_ms"))
     try:
         symbol = _get_binance_symbol(coin)
         resp = requests.get(
@@ -1310,10 +1439,15 @@ def get_current_crypto_price(coin):
         )
         if resp.status_code == 200:
             data = resp.json()
-            return float(data["price"])
+            return _select(float(data["price"]), "REST", "binance_rest")
     except Exception:
         pass
-    return None
+    return debug
+
+
+def get_current_crypto_price(coin):
+    """获取BTC/ETH当前实时价格 - PRICE_SOURCE=1 Chainlink优先, =2 Pyth优先"""
+    return get_current_crypto_price_debug(coin).get("price")
 
 def get_ptb_from_slug(slug):
     """从 slug 获取 PTB，优先 crypto-price API，失败时回退 Playwright。"""
@@ -2252,6 +2386,7 @@ def monitor():
     close_intents = {}  # (slug, entry_time) -> {"reason": str}
     tail_oracle_prices = {}  # (slug, entry_time) -> deque(maxlen=7) 最近oracle价格
     tail_oracle_wrong_streak = {}  # (slug, entry_time) -> 尾盘oracle错误确认计数
+    last_wake_context = {"label": "startup", "detail": None}
     
     while True:
         try:
@@ -2325,7 +2460,8 @@ def monitor():
                 remaining = (end_time - now).total_seconds()
                 
                 ptb_price = pos.get("ptb") or pos.get("price_to_beat")
-                crypto_price = get_current_crypto_price(coin)
+                crypto_debug = get_current_crypto_price_debug(coin)
+                crypto_price = crypto_debug.get("price")
                 if ptb_price and crypto_price and remaining <= 5:
                     freeze_settlement_reference_price(pos, crypto_price)
 
@@ -2385,6 +2521,7 @@ def monitor():
                 current_price = get_market_price(token_id)
                 if current_price is None:
                     continue
+                market_obs = _get_market_observability(token_id)
                 
                 profit_rate = (current_price - entry_price) / entry_price if entry_price > 0 else 0
                 atr_val = pos.get("atr_val") or get_atr_from_binance(coin)
@@ -2433,21 +2570,16 @@ def monitor():
 
                 status = "🟢赢" if is_winning else "🔴输" if is_losing else "⚪"
                 # 补充显示：用加密货币方向替代可能失真的 token 利润率
-                # 价格来源标记：CL=Chainlink结算价, Pyth=链上, WS=Binance WebSocket, REST=Binance REST
-                if _chainlink_stream.get_price(coin) is not None:
-                    price_source = "CL"
-                elif _pyth_stream.get_price(coin) is not None:
-                    price_source = "Pyth"
-                elif _price_stream.get_price(coin) is not None:
-                    price_source = "WS"
-                else:
-                    price_source = "REST"
+                price_source = crypto_debug.get("source") or "N/A"
                 crypto_label = f" | {coin}=${crypto_price:,.2f}({price_source})" if crypto_price else ""
                 if direction_correct is not None:
                     dir_icon = "✅" if direction_correct else "❌"
                     print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status} | 方向{dir_icon}{crypto_label}")
                 else:
                     print(f"  📈 {coin} {direction} | ${entry_price:.2f}→${current_price:.2f} ({profit_rate*100:+.1f}%) | 剩余{remaining:.0f}s | {status}{crypto_label}")
+                observability = _format_price_observability(crypto_debug, market_obs, atr_val, last_wake_context)
+                if observability:
+                    print(f"  📡 源观测: {observability}")
                 if tail_info and tail_info["active"]:
                     median_gap = tail_info["median_gap"]
                     enter_margin = tail_info["enter_margin"]
@@ -3317,12 +3449,24 @@ def monitor():
         except Exception as e:
             print(f"❌ 监控错误: {e}")
 
-        # [P2] Chainlink 推送新价格时立刻唤醒，否则最多等 1s（兜底轮询）
-        _p2_woken = _chainlink_stream.wait_for_update(timeout=1.0)
-        if _p2_woken:
-            print("  [P2] Chainlink推送唤醒")
+        # [P2] Chainlink 推送新价格时立刻唤醒，否则最多等 100ms（兜底轮询）
+        wake_info = _chainlink_stream.wait_for_update(timeout=0.1, with_details=True)
+        if wake_info.get("updated"):
+            event = wake_info.get("event") or {}
+            event_coin = event.get("coin") or "?"
+            event_age = _format_age_ms(event.get("age_ms"))
+            last_wake_context = {
+                "label": "chainlink_push",
+                "detail": f"{event_coin}/{event_age}",
+            }
+            print(f"  [P2] Chainlink推送唤醒 | coin={event_coin} | age={event_age} | wait={wake_info.get('wait_ms', 0):.0f}ms")
         else:
-            print("  [P2] 1s超时兜底")
+            wait_ms = wake_info.get("wait_ms")
+            last_wake_context = {
+                "label": "timeout_poll",
+                "detail": _format_age_ms(wait_ms),
+            }
+            print(f"  [P2] 100ms超时兜底 | wait={wait_ms:.0f}ms")
 
 
 def self_notify(pos, sell_price, coin, direction, size, label):
