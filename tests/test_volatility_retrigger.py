@@ -514,19 +514,22 @@ class TestPtbFetchStrategy(unittest.TestCase):
     def setUp(self):
         bot._ptb_failures.clear()
 
+    @patch("auto_bot_v3.time.sleep")
     @patch("auto_bot_v3.subprocess.run")
-    @patch("auto_bot_v3.get_price_to_beat_api", return_value=70182.430585)
-    def test_get_ptb_multi_strategy_prefers_crypto_price_api(self, mock_api, mock_run):
+    @patch("auto_bot_v3.get_price_to_beat_api", side_effect=[None, None, 70182.430585])
+    def test_get_ptb_multi_strategy_retries_crypto_price_api_before_playwright(self, mock_api, mock_run, mock_sleep):
         ptb = bot.get_ptb_multi_strategy("btc-updown-5m-1774328700")
 
         self.assertEqual(ptb, 70182.430585)
-        mock_api.assert_called_once_with("btc-updown-5m-1774328700", timeout=3)
+        self.assertEqual(mock_api.call_count, 3)
         mock_run.assert_not_called()
+        self.assertEqual(mock_sleep.call_count, 2)
         self.assertEqual(bot._ptb_failures.get("BTC", 0), 0)
 
+    @patch("auto_bot_v3.time.sleep")
     @patch("auto_bot_v3.get_price_to_beat_api", return_value=None)
     @patch("auto_bot_v3.subprocess.run")
-    def test_get_ptb_multi_strategy_falls_back_to_playwright(self, mock_run, mock_api):
+    def test_get_ptb_multi_strategy_falls_back_to_playwright_after_api_retries(self, mock_run, mock_api, mock_sleep):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="测试 slug: btc-updown-5m-1774328700\nPTB=70182.43, 耗时=1.0s\n",
@@ -536,8 +539,9 @@ class TestPtbFetchStrategy(unittest.TestCase):
         ptb = bot.get_ptb_multi_strategy("btc-updown-5m-1774328700")
 
         self.assertEqual(ptb, 70182.43)
-        mock_api.assert_called_once_with("btc-updown-5m-1774328700", timeout=3)
+        self.assertEqual(mock_api.call_count, bot.PTB_API_RETRY_ATTEMPTS)
         mock_run.assert_called_once()
+        self.assertEqual(mock_sleep.call_count, bot.PTB_API_RETRY_ATTEMPTS - 1)
         self.assertEqual(bot._ptb_failures.get("BTC", 0), 0)
 
 

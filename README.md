@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.5.3
+# Polymarket Trading Bot v10.5.4
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -128,7 +128,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Strategy Timing Config (`get_strategy_config()`)**: 预热/早期/晚期窗口的全部时序参数和贝叶斯阈值统一由 `.env` 配置，硬编码 magic numbers 已全部提取。包括 `EARLY_MIN_SAMPLES`、`LATE_MIN_UPDATES`、`LATE_LOW_CONF_THRESHOLD`、`LATE_GAP_CROSS_ALLOW_CONF`、`LATE_MATURE_SAMPLE_COUNT` 等。
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause
-- **PTB 获取 (crypto-price API + Playwright 回退)**: 主路径使用 Polymarket `crypto-price` REST API（`get_price_to_beat_api()`，从 slug 时间戳构造请求参数，~50ms），无需浏览器进程。API 失败时回退 Playwright subprocess。3 次连续失败后跳过该币种。`get_current_markets()` 和 `position_monitor.get_ptb_from_slug()` 同步切换。
+- **PTB 获取 (crypto-price API + Playwright 回退)**: 主路径使用 Polymarket `crypto-price` REST API（`get_price_to_beat_api()`，从 slug 时间戳构造请求参数，~50ms），无需浏览器进程。市场早期 API 可能尚未返回值，`_fetch_ptb_api()` 自动重试轮询（`PTB_API_RETRY_ATTEMPTS` 次，间隔 `PTB_API_RETRY_INTERVAL` 秒），全部无值时回退 Playwright subprocess。3 次连续失败后跳过该币种。`get_current_markets()` 和 `position_monitor.get_ptb_from_slug()` 同步切换。
 - **Volatility Re-Trigger**: Skipped markets monitored for large price moves — piggybacks on existing sampling loop (no extra API calls), re-enters analysis when volatility exceeds threshold
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.

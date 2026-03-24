@@ -57,6 +57,10 @@ _circuit_open_until = 0    # 熔断恢复时间戳（Unix）
 CIRCUIT_BREAK_THRESHOLD = 5   # 连续失败N次触发熔断
 CIRCUIT_BREAK_DURATION = 300  # 熔断持续时间（秒）
 _runtime_max_reanalyze = None
+PTB_FETCH_START_SECONDS = 2
+PTB_API_RETRY_ATTEMPTS = 8
+PTB_API_RETRY_INTERVAL = 1.0
+PTB_API_REQUEST_TIMEOUT = 1.0
 
 # 持仓数检查锁 + 预占计数：防止并行线程同时通过 MAX_OPEN_POSITIONS 检查
 _position_lock = threading.Lock()
@@ -221,11 +225,20 @@ def get_strategy_config():
     }
 
 
-def _fetch_ptb_api(slug, timeout=3):
-    """单个 PTB HTTP 获取，主路径走 crypto-price 接口。"""
+def _fetch_ptb_api(slug, timeout=None, retry_attempts=None, retry_interval=None):
+    """单个 PTB HTTP 获取，主路径走 crypto-price 接口，首轮无值时重复轮询。"""
+    timeout = PTB_API_REQUEST_TIMEOUT if timeout is None else timeout
+    retry_attempts = PTB_API_RETRY_ATTEMPTS if retry_attempts is None else retry_attempts
+    retry_interval = PTB_API_RETRY_INTERVAL if retry_interval is None else retry_interval
+
     t0 = time.time()
-    ptb = get_price_to_beat_api(slug, timeout=timeout)
-    return ptb, time.time() - t0, "crypto-price"
+    for attempt in range(retry_attempts):
+        ptb = get_price_to_beat_api(slug, timeout=timeout)
+        if ptb:
+            return ptb, time.time() - t0, "crypto-price"
+        if attempt < retry_attempts - 1 and retry_interval > 0:
+            time.sleep(retry_interval)
+    return None, time.time() - t0, "crypto-price"
 
 
 def _fetch_ptb_subprocess(slug):
@@ -260,6 +273,7 @@ def get_ptb_multi_strategy(slug):
     try:
         ptb, elapsed, source = _fetch_ptb_api(slug)
         if not ptb:
+            logger.info(f"   PTB API 暂无值，{coin} 回退 Playwright | api_wait={elapsed:.2f}s")
             ptb, elapsed, source = _fetch_ptb_subprocess(slug)
         if ptb:
             _ptb_failures[coin] = 0
@@ -577,7 +591,7 @@ class MarketTracker:
             remaining = (end_dt - now).total_seconds()
             
             # === PTB 获取期：2s-40s（收集待获取列表，循环末尾并行获取） ===
-            if 2 <= elapsed < 40 and slug not in self.ptb_cache:
+            if PTB_FETCH_START_SECONDS <= elapsed < 40 and slug not in self.ptb_cache:
                 if slug not in self._ptb_pending:
                     self._ptb_pending[slug] = market['coin']
             
@@ -1214,7 +1228,7 @@ def main():
     print("   新增: SDK直连下单(延迟<50ms) | FOK即时平仓 | LMSR流动性评估")
     print(
         "   时间线: "
-        f"2-40s获取PTB → {strategy_cfg['warmup_start_seconds']}s起预热"
+        f"{PTB_FETCH_START_SECONDS}-40s获取PTB → {strategy_cfg['warmup_start_seconds']}s起预热"
         f" → early {strategy_cfg['early_bet_start']}-{strategy_cfg['early_bet_end']}s"
         f" → late {strategy_cfg['late_bet_start']}-{strategy_cfg['late_bet_end']}s"
     )
