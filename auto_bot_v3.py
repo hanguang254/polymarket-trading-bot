@@ -627,6 +627,20 @@ class MarketTracker:
                     logger.info(f"\n🆕 新市场: {market['coin']} | {slug}")
                     et_dt = end_dt - timedelta(hours=5)  # UTC-5 (EST)
                     logger.info(f"   结束: {et_dt.strftime('%H:%M:%S')} ET | 剩余: {remaining:.0f}s")
+
+                # v12: 市场发现时立即获取 token_id + WS 订阅（比预热提前 8s）
+                # 狙击在 15s 触发时 WS 已有数据
+                if slug not in self.token_cache:
+                    try:
+                        up_t, down_t = get_token_ids(slug)
+                        if up_t and down_t:
+                            self.token_cache[slug] = (up_t, down_t)
+                            clob_client.precache_tokens([up_t, down_t])
+                            from ai_trader.polymarket_ws import poly_ws
+                            poly_ws.subscribe([up_t, down_t])
+                            logger.info(f"   📡 提前订阅 WS + 预缓存 token")
+                    except Exception:
+                        pass
             else:
                 self.tracked[slug]["up_odds"] = market["up_odds"]
                 self.tracked[slug]["down_odds"] = market["down_odds"]
@@ -684,17 +698,17 @@ class MarketTracker:
                     except Exception as e:
                         logger.warning(f"\n🔥 预热开始(无贝叶斯): {market['coin']} | {slug} | {e}")
 
-                    # 预热阶段提前获取token_ids + 预缓存SDK参数（省去分析时~2s延迟）
-                    try:
-                        up_t, down_t = get_token_ids(slug)
-                        if up_t and down_t:
-                            self.token_cache[slug] = (up_t, down_t)
-                            clob_client.precache_tokens([up_t, down_t])
-                            # 订阅 Polymarket WS 实时 orderbook
-                            from ai_trader.polymarket_ws import poly_ws
-                            poly_ws.subscribe([up_t, down_t])
-                    except Exception:
-                        pass
+                    # token_ids + WS 已在市场发现时提前获取，这里只补漏
+                    if slug not in self.token_cache:
+                        try:
+                            up_t, down_t = get_token_ids(slug)
+                            if up_t and down_t:
+                                self.token_cache[slug] = (up_t, down_t)
+                                clob_client.precache_tokens([up_t, down_t])
+                                from ai_trader.polymarket_ws import poly_ws
+                                poly_ws.subscribe([up_t, down_t])
+                        except Exception:
+                            pass
 
                 # 按配置间隔采集，有PTB时才做贝叶斯更新
                 ptb_now = self.ptb_cache.get(slug)
@@ -788,9 +802,18 @@ class MarketTracker:
                                         _t0 = time.time()
                                         from ai_trader.polymarket_ws import poly_ws
                                         ws_bid, ws_ask = poly_ws.get_best_bid_ask(sniper_token)
+                                        # WS 无数据时 REST 兜底（~30ms，仍比完整分析快得多）
+                                        if not ws_ask or ws_ask <= 0.01:
+                                            try:
+                                                _rest_book = clob_client.get_orderbook(sniper_token, max_age=2)
+                                                if _rest_book and _rest_book.asks:
+                                                    ws_ask = float(_rest_book.asks[0].price)
+                                                    ws_bid = float(_rest_book.bids[0].price) if _rest_book.bids else None
+                                            except Exception:
+                                                pass
                                         _t_ws = time.time()
                                         if not ws_ask or ws_ask <= 0.01:
-                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | WS无ask数据")
+                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | WS+REST均无ask数据")
                                         elif ws_ask > SNIPER_MAX_PRICE:
                                             logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | CLOB=${ws_ask:.2f}>${SNIPER_MAX_PRICE}")
                                         else:
