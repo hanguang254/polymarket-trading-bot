@@ -348,15 +348,20 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     # 不校准 → 决策用0.50算EV=+0.30，实际买入价0.85，真实EV=-0.03，每单亏钱
     if liquidity_info and liquidity_info.get("best_ask"):
         exec_price = liquidity_info["best_ask"]
-        # 空簿检测：best_ask >= 0.95 说明CLOB无真实卖单，用 last-trade-price 替代
+        # 空簿检测：best_ask >= 0.95 说明CLOB无真实卖单
         if exec_price >= 0.95 and token_id:
             details["clob_empty_book"] = True
             details["clob_raw_ask"] = round(exec_price, 4)
             last_price = clob_client.get_last_trade_price(token_id)
             if last_price and 0.01 < last_price < 0.99:
-                exec_price = last_price
-                liquidity_info["best_ask"] = last_price
-                print(f"  📡 C1校准：CLOB空簿，使用last-trade-price=${last_price:.3f}替代best_ask")
+                # v12 fix: last-trade-price 也 >= 0.90 说明市场真的定价到极端，不是空簿
+                # 这时候不应该用更低的价格覆盖，而是承认"没有入场机会"
+                if last_price >= 0.90:
+                    print(f"  📡 C1校准：市场已极端定价 ask=${exec_price:.3f} last=${last_price:.3f}，非空簿")
+                else:
+                    exec_price = last_price
+                    liquidity_info["best_ask"] = last_price
+                    print(f"  📡 C1校准：CLOB空簿，使用last-trade-price=${last_price:.3f}替代best_ask")
         if 0.01 < exec_price < 0.99:
             details["gamma_odds"] = round(target_odds, 4)
             details["exec_price"] = round(exec_price, 4)
@@ -970,12 +975,18 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             print(f"  📡 midpoint回退: ${mid:.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
 
     # 4. 分析阶段的 CLOB 执行价兜底（C1校准后的价格）
+    # v12 fix: 仅当 CLOB 没有极端定价时才回退分析价
+    # 如果 CLOB raw_ask >= 0.90（市场已极端定价），分析价可能是过时的 Gamma 赔率，不能用
     if not _is_valid_clob_price(price) and entry_details:
-        analysis_price = entry_details.get("exec_price") or entry_details.get("target_odds")
-        if analysis_price and 0.01 < float(analysis_price) < 0.99:
-            price = min(round(float(analysis_price) + SLIPPAGE, 2), 0.99)
-            price_source = "analysis_exec_price"
-            print(f"  📡 分析价回退: ${float(analysis_price):.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
+        clob_raw = entry_details.get("clob_raw_ask", 0)
+        if clob_raw and float(clob_raw) >= 0.90:
+            print(f"  📡 分析价回退跳过: CLOB原始ask=${float(clob_raw):.2f}≥0.90，市场已极端定价")
+        else:
+            analysis_price = entry_details.get("exec_price") or entry_details.get("target_odds")
+            if analysis_price and 0.01 < float(analysis_price) < 0.99:
+                price = min(round(float(analysis_price) + SLIPPAGE, 2), 0.99)
+                price_source = "analysis_exec_price"
+                print(f"  📡 分析价回退: ${float(analysis_price):.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
 
     # 安全检查：全部失败
     if not _is_valid_clob_price(price):
