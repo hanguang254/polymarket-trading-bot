@@ -97,6 +97,24 @@ class TestAtrDecayArming(unittest.TestCase):
 class TestProximityGuardRelease(unittest.TestCase):
     """proximity 保护在不同亏损级别下的释放条件"""
 
+    def setUp(self):
+        # 隔离 env，防止 .env 泄漏影响测试
+        self._env_patch = patch.dict(os.environ, {
+            "PTB_PROXIMITY_EXTREME_STOP": "0.50",
+            "PRICE_DROP_HARD_STOP": "0.25",
+        }, clear=False)
+        self._env_patch.start()
+        # 刷新模块级常量（这些在 import 时被固化，需要手动同步）
+        self._orig_extreme = pm.PTB_PROXIMITY_EXTREME_STOP
+        self._orig_hard = pm.PRICE_DROP_HARD_STOP
+        pm.PTB_PROXIMITY_EXTREME_STOP = 0.50
+        pm.PRICE_DROP_HARD_STOP = 0.25
+
+    def tearDown(self):
+        pm.PTB_PROXIMITY_EXTREME_STOP = self._orig_extreme
+        pm.PRICE_DROP_HARD_STOP = self._orig_hard
+        self._env_patch.stop()
+
     def test_extreme_loss_releases_immediately(self):
         released, extreme_stop, threshold = pm.should_release_proximity_guard(-0.51, 130, 1, 0.25)
         self.assertTrue(released)
@@ -1218,7 +1236,8 @@ class TestExecuteDipBuy(unittest.TestCase):
         }
         pos = {"size": 4.0, "token_balance": 4.0}
 
-        success, size, price = pm.execute_dip_buy("token1", 4, "BTC", "slug", pos)
+        with patch.dict(os.environ, {"MIN_BET_SIZE": "5"}, clear=False):
+            success, size, price = pm.execute_dip_buy("token1", 4, "BTC", "slug", pos)
 
         self.assertTrue(success)
         self.assertAlmostEqual(size, 5.02656, places=5)

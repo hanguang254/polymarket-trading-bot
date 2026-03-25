@@ -317,7 +317,7 @@ def _estimate_slippage(asks, size):
         last_price = float(asks[-1]["price"]) if asks else best_ask
         total_cost += remaining * last_price * 1.10
 
-    avg_price = total_cost / size
+    avg_price = total_cost / size if size > 0 else best_ask
     slippage = (avg_price - best_ask) / best_ask if best_ask > 0 else 0
 
     return max(0, slippage)

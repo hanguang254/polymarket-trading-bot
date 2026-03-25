@@ -381,9 +381,15 @@ class TestBayesianFusionModes(unittest.TestCase):
 
         with patch.dict(os.environ, {
             "MIN_CONFIDENCE": "0.40",
+            "MIN_CONFIDENCE_UP": "0.40",
+            "MIN_CONFIDENCE_DOWN": "0.40",
             "MIN_EV": "0.01",
+            "MIN_EV_UP": "0.01",
+            "MIN_EV_DOWN": "0.01",
             "MIN_ATR_DEVIATION": "1.5",
             "MAX_BUY_PRICE": "0.92",
+            "MAX_BUY_PRICE_UP": "0.92",
+            "MAX_BUY_PRICE_DOWN": "0.92",
         }, clear=False):
             with patch.object(ai_analyze_v2, "analyze_market", return_value=("UP", 0.40, base_details.copy())):
                 with patch.object(ai_analyze_v2, "get_base_rate", return_value=0.55):
@@ -411,7 +417,11 @@ class TestBayesianFusionModes(unittest.TestCase):
         self.assertTrue(should_bet)
         self.assertEqual(direction, "UP")
         self.assertEqual(details["confidence_source"], "bayesian_gate_support")
-        self.assertAlmostEqual(details["p_win_final"], rw_p_win, places=4)
+        # v12: gate_support 不改变 p_win（通过 p_win_raw 验证），shrinkage 是后续统一步骤
+        self.assertAlmostEqual(details["p_win_raw"], rw_p_win, places=4)
+        shrinkage = float(os.environ.get("P_WIN_SHRINKAGE", "0.70"))
+        expected_p_win = 0.5 + (rw_p_win - 0.5) * shrinkage
+        self.assertAlmostEqual(details["p_win_final"], expected_p_win, places=3)
         self.assertGreater(confidence, 0.40)
 
     def test_incremental_alignment_can_improve_p_win(self):
@@ -420,9 +430,15 @@ class TestBayesianFusionModes(unittest.TestCase):
 
         with patch.dict(os.environ, {
             "MIN_CONFIDENCE": "0.40",
+            "MIN_CONFIDENCE_UP": "0.40",
+            "MIN_CONFIDENCE_DOWN": "0.40",
             "MIN_EV": "0.01",
+            "MIN_EV_UP": "0.01",
+            "MIN_EV_DOWN": "0.01",
             "MIN_ATR_DEVIATION": "1.5",
             "MAX_BUY_PRICE": "0.92",
+            "MAX_BUY_PRICE_UP": "0.92",
+            "MAX_BUY_PRICE_DOWN": "0.92",
         }, clear=False):
             with patch.object(ai_analyze_v2, "analyze_market", return_value=("UP", 0.40, base_details.copy())):
                 with patch.object(ai_analyze_v2, "get_base_rate", return_value=0.55):
@@ -450,7 +466,8 @@ class TestBayesianFusionModes(unittest.TestCase):
         self.assertTrue(should_bet)
         self.assertEqual(direction, "UP")
         self.assertEqual(details["confidence_source"], "bayesian_fused")
-        self.assertGreater(details["p_win_final"], rw_p_win)
+        # v12: fusion 提升了 p_win（通过 p_win_raw 验证），p_win_final 经过 shrinkage
+        self.assertGreater(details["p_win_raw"], rw_p_win)
         self.assertGreater(confidence, 0.40)
 
 

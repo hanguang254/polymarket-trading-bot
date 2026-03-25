@@ -31,6 +31,9 @@ class TestDirectionalEnvConfig(unittest.TestCase):
             "MAX_BUY_PRICE_DOWN": "0.79",
             "MIN_EV": "0.04",
             "MIN_CONFIDENCE": "0.50",
+            "P_WIN_SHRINKAGE": "1.0",
+            "P_WIN_CAP": "0.95",
+            "MIN_ATR_DEVIATION": "1.5",
         }, clear=False):
             should_bet, direction, _, details = ai_analyze_v2.analyze_and_decide(
                 "BTC", 200.0, 0.50, 0.50, "btc-test"
@@ -66,6 +69,9 @@ class TestDirectionalEnvConfig(unittest.TestCase):
             "MAX_BUY_PRICE_DOWN": "0.79",
             "MIN_EV": "0.04",
             "MIN_CONFIDENCE": "0.50",
+            "P_WIN_SHRINKAGE": "1.0",
+            "P_WIN_CAP": "0.95",
+            "MIN_ATR_DEVIATION": "1.5",
         }, clear=False):
             should_bet, direction, _, details = ai_analyze_v2.analyze_and_decide(
                 "BTC", 200.0, 0.50, 0.50, "btc-test"

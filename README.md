@@ -1,6 +1,6 @@
-# Polymarket Trading Bot v11.0.1
+# Polymarket Trading Bot v12.0
 
-Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
+Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, momentum sniper fast-path, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
 ## Strategy
 
@@ -50,7 +50,11 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Random Walk p_win**: Uses `Φ(|gap|/σ√t)` (normal CDF) to compute real probability from price deviation, replacing static base_rate lookup. More theoretically grounded for 5-min markets.
 - **Base Rate Calibration**: Conservative ATR-band priors (0.50-0.85), auto-calibrates with empirical data after 30+ samples per band. Weak edge (base_rate < 0.55) halves Kelly.
 - **Strict Binary EV**: `EV = p_win - price` (replaces discount/odds ratio). Minimum edge required (configurable via `MIN_EV`).
-- **Early Bet Window (90-95s)**: Enters before CLOB fully prices in, with lower thresholds (`EARLY_MIN_EV`, `EARLY_MIN_CONFIDENCE`). Captures mispricing before market makers adjust.
+- **Early Bet Window (35-99s)**: Enters before CLOB fully prices in, with lower thresholds (`EARLY_MIN_EV`, `EARLY_MIN_CONFIDENCE`). Captures mispricing before market makers adjust.
+- **Momentum Sniper (v12)**: 动量狙击快速通道 — 预热采样中检测到大波动（ATR≥1.0 + gap方向=贝叶斯方向 + CLOB token≤$0.55）时，跳过完整分析流程（省掉 get_klines/LMSR/CLOB刷新 共 ~1.5s），直接用 Bayesian p_hat + random walk 计算 p_win → execute_bet。从检测到下单 ~300ms（仅 FOK 网络延迟），抢在 CLOB 做市商定价前入场。15 秒起可触发（独立于早期窗口），覆盖早期+晚期全时段。Telegram 通知区分 `⚡动量狙击成交` vs `🎯正常下注`。日志含分步耗时（WS读取/计算/FOK）。
+- **p_win Shrinkage Calibration (v12)**: `P_WIN_SHRINKAGE` 参数将 p_win 向 0.5 收缩（默认 0.80），纠正 Random Walk + Bayesian 融合的系统性过度自信。`p_win = 0.5 + (raw - 0.5) × shrinkage`。日志输出 `p_win_raw` 用于对比校准效果。
+- **Continuous estimated_value (v12)**: ATR→token估值从离散 if-elif 表改为线性插值（`_interpolate_estimated_value`），消除 1.01 ATR 和 1.49 ATR 估值相同的阶梯跳变。
+- **Bidirectional Bayesian Fusion (v12)**: `p_win = max(p_win, fused_p)` 单向阀门改为 `p_win = fused_p` 双向融合，允许 Bayesian 拉低过高的 Random Walk p_win。
 - **5-min K-line Trend Filter**: Checks Binance 5-min candle trend (same timeframe as market) to avoid counter-trend trades. Replaces 15-min filter which was too slow for 5-minute markets.
 - **Bayesian Fusion (v2.1 Gate)**: 贝叶斯引擎升级为增量信号(Δprice) + 状态信号(gap/ATR/剩余时间) 双通道。`_gate_signal()` 融合两路信号（方向一致时 state 权重 65%，冲突时 85%），输出统一的 direction/confidence 供预筛和 EV 计算。p_win 融合仅使用增量后验（避免 state probability 双重计入 EV），gate confidence 用于整体置信度。持续方向翻面时执行软重置（`_maybe_soft_reset`，gap ≥ 0.6 ATR + 连续3轮反向 → 重置后验到 0.58 种子），减少早期错误方向的锚定。
 - **Cross-Validation**: Flags overestimation when `estimated_value > p_win + 0.15` (reduces confidence 15%).
@@ -77,7 +81,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 
 ### Exit (P0-P1 + P4)
 - **PTB Proximity Buffer**: When `abs(crypto_price - ptb_price) / ATR < dynamic_threshold`, crypto is in the "noise zone" near PTB — direction signal is unreliable. Freezes `direction_correct = True` (trusts original bet), suppressing all direction-based stop-losses. Threshold decays with time: 0.7 ATR (first 2min) → 0.3 ATR (mid) → 0.15 ATR (last 1min). Extreme safety valve: token drop ≥50% (`PTB_PROXIMITY_EXTREME_STOP`) forces exit regardless. Configurable via `PTB_PROXIMITY_ATR`.
-- **-25% Hard Stop**: When token drops ≥25% from entry price, market sell when direction is not confirmed correct. In proximity zone, direction is frozen True so hard stop only fires via extreme safety valve (-50%).
+- **-20% Hard Stop (v12)**: When token drops ≥20% from entry price, market sell when direction is not confirmed correct. In proximity zone, direction is frozen True so hard stop only fires via extreme safety valve (-25%). **v12: 从 -25%/-50% 收紧到 -20%/-25%，实盘验证减少灾难性亏损（$2.08→$0.49）。**
+- **Force-Close Escalation (v12)**: 平仓意图锁定后连续 5 次 FOK 失败，自动以地板价 $0.01 强制清仓，防止持仓永远挂死。
 - **Direction Flip Exit (Consecutive Confirmation)**: Tracks `direction_correct` across cycles. True→False flip now requires **consecutive confirmation** (2 rounds for ATR<1.5, 1 round for ATR≥1.5) before liquidation — prevents single-poll noise from triggering premature exits. `direction_wrong_streak` counter resets when direction returns to True.
 - **ATR 3-Layer Decision Matrix**: When token drops ≥15% (`PRICE_DROP_TRIGGER`), action depends on ATR deviation (crypto distance from PTB in ATR units):
   - **ATR ≥ 2.0** (safe zone): 🟢 Dip-buy — adds 50% of original position at best_ask via FOK. Requires: direction correct, remaining > 60s, max 1 dip-buy per position. Averages down cost basis for higher profit if direction holds.
@@ -129,7 +134,9 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **CLOB Keepalive 非阻塞**: `_keepalive` 线程使用 `_client_lock.acquire(blocking=False)` 获取锁，当下单/查簿正在执行时直接跳过本轮心跳，避免阻塞交易路径。
 - **Warmup Token Pre-Cache**: During warmup phase, token_ids + SDK parameters (neg_risk/fee_rate/tick_size) are fetched and cached in parallel, saving ~2s at analysis time.
 - **Orderbook Cache (2s TTL)**: `get_orderbook()` caches results for 2 seconds to eliminate duplicate HTTP requests within the same analysis cycle. Auto-invalidated after order placement.
-- **Adaptive Warmup Sampling**: `WARMUP_SAMPLE_INTERVAL_EARLY` (default 5s) intervals before early window, accelerates to `WARMUP_SAMPLE_INTERVAL_LATE` (default 3s) after early window opens. Warmup starts at `WARMUP_START_SECONDS` (default 20). Price sourced from Chainlink RTDS (same oracle as PTB/settlement) with Binance fallback. Sample log shows source tag `(CL)`/`(BN)` for traceability.
+- **Adaptive Warmup Sampling**: `WARMUP_SAMPLE_INTERVAL_EARLY` (default 3s) intervals before early window, accelerates to `WARMUP_SAMPLE_INTERVAL_LATE` (default 2s) after early window opens. Warmup starts at `WARMUP_START_SECONDS` (default 8). **v12: 预热采样改用 Binance WS（0ms 内存读取），比 Chainlink 快 1-5s 发现价格移动**，Chainlink 无数据时自动 fallback。入场决策仍用 Chainlink（与结算同源）。Sample log shows source tag `(BN)`/`(CL)` for traceability.
+- **7-Coin Support (v12)**: 支持 BTC/ETH/BNB/SOL/HYPE/DOGE/XRP 七个币种并行交易。`coins.py` 统一管理 Binance WS/Chainlink/Pyth feed 配置。PTB 价格校验下限从 $100 降至 $0.01，兼容 SOL($92)/HYPE($40)/DOGE($0.20)/XRP($2.5) 等低价币种。
+- **Execution Speed Optimization (v12)**: execute_bet 去掉多余的 REST 订单簿请求（之前获取两次），WS 数据超时从 400ms 放宽到 2000ms（优先用 WS 实时数据而非 REST fallback），新增分析价兜底（WS/REST/last-trade 都无数据时用分析阶段 CLOB 价格）。总执行延迟从 ~1.5s 降至 ~300ms（WS 可用时）。
 - **Strategy Timing Config (`get_strategy_config()`)**: 预热/早期/晚期窗口的全部时序参数和贝叶斯阈值统一由 `.env` 配置，硬编码 magic numbers 已全部提取。包括 `EARLY_MIN_SAMPLES`、`LATE_MIN_UPDATES`、`LATE_LOW_CONF_THRESHOLD`、`LATE_GAP_CROSS_ALLOW_CONF`、`LATE_MATURE_SAMPLE_COUNT` 等。
 - **Trend Safety Valve**: Gap expanding/shrinking/crossing/oscillating → adjusts min discount
 - **Network Circuit Breaker**: 5 consecutive API failures → 300s pause

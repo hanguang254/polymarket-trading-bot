@@ -73,7 +73,7 @@ def get_price_to_beat_api(slug, timeout=3, variant="fiveminute"):
         if open_price is None:
             return None
         price = float(open_price)
-        if 100 < price < 10_000_000:
+        if 0.01 < price < 10_000_000:
             return price
     except Exception:
         pass
@@ -89,7 +89,7 @@ def get_price_to_beat_browser(slug, timeout=10):
             match = re.search(r'"priceToBeat":([\d.]+)', resp.text)
             if match:
                 price = float(match.group(1))
-                if 100 < price < 10_000_000:
+                if 0.01 < price < 10_000_000:
                     return price
     except Exception:
         pass

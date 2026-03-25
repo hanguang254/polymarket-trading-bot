@@ -2878,6 +2878,21 @@ def monitor():
                 if active_close_intent:
                     reason = active_close_intent.get("reason") or "锁定平仓"
                     prior_attempts = stop_loss_attempts.get(attempt_key, 0)
+                    # v12: 强制升级 — 连续失败 5 次后用地板价 FOK 清仓
+                    if prior_attempts >= 5:
+                        print(f"  🚨 强制清仓: {reason} | 连续{prior_attempts}次失败 → 地板价$0.01退出")
+                        from py_clob_client.order_builder.constants import SELL
+                        floor_info = clob_client.place_fok_order(token_id, SELL, 0.01, size)
+                        if floor_info.get("matched"):
+                            floor_price = round(floor_info.get("taking", 0) / size, 4) if size > 0 else 0.01
+                            sold = True
+                            sold_price = floor_price
+                            self_notify(pos, sold_price, coin, direction, size, f"{reason}(强制清仓)")
+                            _clear_close_intent(pos)
+                            close_position(pos, sold_price)
+                            for d in (close_attempts, stop_loss_attempts, dip_bought, direction_wrong_streak, direction_history, close_intents):
+                                d.pop(attempt_key, None)
+                            continue
                     print(f"  🔒 平仓锁定: {reason} | 已重试{prior_attempts}次 | 继续退出")
                     attempted_stop_loss = True
                     ok, actual_price = market_sell_immediate(token_id, size, position=pos)
@@ -3234,8 +3249,8 @@ def monitor():
                 else:
                     # ═══ 旧止损逻辑（ENABLE_EV_GATE=0）═══
                     # --- 0A. ATR衰减止损 ---
-                    atr_decay_armed = should_arm_atr_decay_exit(diff_atr, entry_atr_val, profit_rate)
-                    decay_pct = (1 - diff_atr / entry_atr_val) * 100 if atr_decay_armed else None
+                    atr_decay_armed = should_arm_atr_decay_exit(diff_atr, entry_atr_val, profit_rate) if entry_atr_val and entry_atr_val > 0 else False
+                    decay_pct = (1 - diff_atr / entry_atr_val) * 100 if atr_decay_armed and entry_atr_val and entry_atr_val > 0 else None
 
                     # --- 0B. ATR加速下降止损 ---
                     atr_accel_armed = False

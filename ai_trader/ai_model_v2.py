@@ -21,6 +21,34 @@ from ai_trader.binance_api import get_klines
 from ai_trader.indicators import ema, rsi, atr
 
 
+# v12: estimated_value 连续插值表（替代离散 if-elif）
+# 节点: (ATR倍数, token估值) — 节点之间线性插值
+_EV_KNOTS = [
+    (0.5, 0.51),
+    (0.7, 0.55),
+    (1.0, 0.58),
+    (1.5, 0.63),
+    (2.0, 0.69),
+    (3.0, 0.75),
+    (4.0, 0.83),
+    (6.0, 0.88),
+]
+
+
+def _interpolate_estimated_value(diff_in_atr):
+    """ATR偏离 → token估值，线性插值消除离散跳变"""
+    if diff_in_atr <= _EV_KNOTS[0][0]:
+        return 0.50
+    if diff_in_atr >= _EV_KNOTS[-1][0]:
+        return _EV_KNOTS[-1][1]
+    for i in range(1, len(_EV_KNOTS)):
+        if diff_in_atr <= _EV_KNOTS[i][0]:
+            x0, y0 = _EV_KNOTS[i - 1]
+            x1, y1 = _EV_KNOTS[i]
+            return y0 + (y1 - y0) * (diff_in_atr - x0) / (x1 - x0)
+    return _EV_KNOTS[-1][1]
+
+
 def analyze_5m_trend(coin, price_to_beat):
     """
     5分钟K线趋势分析 — 与5分钟市场同频的趋势过滤
@@ -132,29 +160,10 @@ def analyze_market(coin, price_to_beat, up_odds, down_odds):
     # ═══════════════════════════════════════
     # 核心指标2：折价空间（最重要的指标）
     # ═══════════════════════════════════════
-    # token实际价值估算：基于当前偏离度
+    # token实际价值估算：基于当前偏离度（v12: 连续插值替代离散表）
     # 偏离越大 → 领先方token价值越接近1.0
     # 但5分钟市场会均值回归，所以打折
-    #
-    # 实际价值 = 0.5 + 偏离贡献
-    # 偏离贡献随ATR倍数递增但有上限（因为会回归）
-    # 偏离越大，翻盘越难，但要保守估值（5分钟会均值回归）
-    if diff_in_atr > 4.0:
-        estimated_value = 0.88  # 极大幅领先，翻盘概率极低
-    elif diff_in_atr > 3.0:
-        estimated_value = 0.83  # 大幅领先
-    elif diff_in_atr > 2.0:
-        estimated_value = 0.75
-    elif diff_in_atr > 1.5:
-        estimated_value = 0.69
-    elif diff_in_atr > 1.0:
-        estimated_value = 0.63
-    elif diff_in_atr > 0.7:
-        estimated_value = 0.58
-    elif diff_in_atr > 0.5:
-        estimated_value = 0.55
-    else:
-        estimated_value = 0.51  # 几乎平盘，不值得
+    estimated_value = _interpolate_estimated_value(diff_in_atr)
 
     # 折价空间 = 估算价值 - 买入赔率
     # 例：estimated_value=0.80, leading_odds=0.65 → 折价=0.15（15%利润空间）

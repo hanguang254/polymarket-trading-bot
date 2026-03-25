@@ -28,6 +28,34 @@ ALL_COINS = {
         "pyth_feed": "2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f",
         "slug_prefix": "bnb-updown-5m",
     },
+    "SOL": {
+        "binance_symbol": "SOLUSDT",
+        "binance_ws": "solusdt@trade",
+        "chainlink": "sol/usd",
+        "pyth_feed": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+        "slug_prefix": "sol-updown-5m",
+    },
+    "HYPE": {
+        "binance_symbol": "HYPEUSDT",
+        "binance_ws": "hypeusdt@trade",
+        "chainlink": "hype/usd",
+        "pyth_feed": "068cd0617cbdd1dda615ed2b5ab4fe07d2e9f46347f5e785484844aa10d22dc5",
+        "slug_prefix": "hype-updown-5m",
+    },
+    "DOGE": {
+        "binance_symbol": "DOGEUSDT",
+        "binance_ws": "dogeusdt@trade",
+        "chainlink": "doge/usd",
+        "pyth_feed": "dcef50dd0a4cd2dcc17e45df1676dcb336a11a61c69df7a0299b0150c672d25c",
+        "slug_prefix": "doge-updown-5m",
+    },
+    "XRP": {
+        "binance_symbol": "XRPUSDT",
+        "binance_ws": "xrpusdt@trade",
+        "chainlink": "xrp/usd",
+        "pyth_feed": "ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8",
+        "slug_prefix": "xrp-updown-5m",
+    },
 }
 
 

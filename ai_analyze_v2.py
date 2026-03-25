@@ -261,9 +261,10 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         fusion_threshold = 0.15 if is_early_window else 0.3
 
         if gate_dir == direction and incremental_dir == direction and incremental_conf > fusion_threshold:
-            # 仅用“增量后验”参与 p_win 融合，避免把 state probability 双重计入 EV。
+            # 仅用”增量后验”参与 p_win 融合，避免把 state probability 双重计入 EV。
+            # v12 fix: 双向融合，允许 Bayesian 拉低过高的 RW p_win
             fused_p = p_win * 0.4 + incremental_p_hat * 0.6
-            p_win = max(p_win, fused_p)
+            p_win = fused_p
             confidence = confidence * 0.4 + gate_conf * 0.6
             details["confidence_source"] = "bayesian_fused"
         elif gate_dir == direction and gate_conf > fusion_threshold:
@@ -289,6 +290,15 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
 
     P_WIN_CAP = float(os.environ.get("P_WIN_CAP", "0.92"))
     p_win = min(p_win, P_WIN_CAP)  # P1: 防止贝叶斯累积推高 p_win (env可配置)
+
+    # v12: Shrinkage toward 0.5 — 纠正 RW + Bayesian 系统性过度自信
+    # 模型说 0.85 → 校准后 0.745; 说 0.70 → 校准后 0.64
+    # 用实盘数据逐步调整: 胜率持续高于预期就放大，低于预期就缩小
+    P_WIN_SHRINKAGE = float(os.environ.get("P_WIN_SHRINKAGE", "0.70"))
+    p_win_raw = p_win
+    p_win = 0.5 + (p_win - 0.5) * P_WIN_SHRINKAGE
+    details["p_win_raw"] = round(p_win_raw, 4)
+    details["p_win_shrinkage"] = P_WIN_SHRINKAGE
 
     # 交叉验证：estimated_value 比 p_win 高 0.15+ → 高估警告
     estimated_value = details.get("estimated_value", 0.5)
@@ -688,7 +698,9 @@ def _build_quote_from_levels(bids, asks, source, age_ms=None):
 
 
 def _get_execution_quote(token_id, fallback_book=None, force_fresh=False):
-    ws_max_age_ms = float(os.environ.get("ENTRY_WS_MAX_AGE_MS", "400"))
+    # v12: WS 超时放宽到 2000ms — WS 实时推送每 ~100ms 更新一次，2s 内的数据完全可用
+    # 这避免了 ~300ms 的 REST 回退，是执行加速的关键
+    ws_max_age_ms = float(os.environ.get("ENTRY_WS_MAX_AGE_MS", "2000"))
     ws_quote = None
     try:
         from ai_trader.polymarket_ws import poly_ws
@@ -717,6 +729,7 @@ def _get_execution_quote(token_id, fallback_book=None, force_fresh=False):
     except Exception:
         ws_quote = None
 
+    # WS 无数据时回退 REST（~300ms）
     rest_book = None
     try:
         rest_book = clob_client.get_orderbook(token_id, max_age=0 if force_fresh else 1)
@@ -908,18 +921,14 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         kelly_reduction: Kelly 缩减因子（base_rate/相关性）
         pre_balance: 预取的余额（调用方提前获取，省~250ms）
     """
-    # ── 余额 + 订单簿 ──
+    # ── 余额 ──
     # 余额：优先用调用方预取的结果，省一次HTTP
+    # v12: 订单簿不再此处获取，由 _get_execution_quote 统一处理（WS优先，避免双重REST）
     if pre_balance is not None:
         balance = pre_balance
-        # 只需获取 orderbook（复用1s内缓存，分析阶段刚拉过）
-        book = clob_client.get_orderbook(token_id, max_age=1)
     else:
-        # fallback：并行获取余额+订单簿
-        fut_balance = _bet_executor.submit(clob_client.get_balance)
-        fut_book = _bet_executor.submit(clob_client.get_orderbook, token_id, 1)  # 1s内复用缓存
-        balance = fut_balance.result(timeout=5)
-        book = fut_book.result(timeout=5)
+        balance = clob_client.get_balance()
+    book = None  # 由 _get_execution_quote 处理
 
     # 余额不足时直接跳过，不记录为失败
     MIN_BALANCE = float(os.environ.get("MIN_BALANCE", "5.0"))
@@ -960,9 +969,17 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             price_source = "midpoint"
             print(f"  📡 midpoint回退: ${mid:.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
 
+    # 4. 分析阶段的 CLOB 执行价兜底（C1校准后的价格）
+    if not _is_valid_clob_price(price) and entry_details:
+        analysis_price = entry_details.get("exec_price") or entry_details.get("target_odds")
+        if analysis_price and 0.01 < float(analysis_price) < 0.99:
+            price = min(round(float(analysis_price) + SLIPPAGE, 2), 0.99)
+            price_source = "analysis_exec_price"
+            print(f"  📡 分析价回退: ${float(analysis_price):.2f} + 滑点${SLIPPAGE} → 限价${price:.2f}")
+
     # 安全检查：全部失败
     if not _is_valid_clob_price(price):
-        print(f"  ⚠️ 无法获取真实价格（last-trade+midpoint均失败），跳过下注")
+        print(f"  ⚠️ 无法获取真实价格（WS+REST+last-trade+midpoint+分析价均失败），跳过下注")
         return False, 0, 0, "SKIP_NO_PRICE"
 
     # 价格四舍五入到2位小数（Polymarket要求）

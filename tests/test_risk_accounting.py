@@ -95,6 +95,7 @@ class TestKellySizing(unittest.TestCase):
             "MIN_BET_SIZE": "5",
             "MAX_BET_SIZE": "10",
             "P_WIN_CAP": "0.92",
+            "MAX_ENTRY_BALANCE_PCT": "0.20",
         }):
             size_plan = ai_analyze_v2.calculate_kelly_size(
                 confidence=0.75,
