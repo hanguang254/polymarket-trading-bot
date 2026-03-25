@@ -122,6 +122,9 @@ EV_ATR_SIGMA_RATIO = float(os.environ.get("EV_ATR_SIGMA_RATIO", "1.5"))
 EV_CIRCUIT_BREAKER_LOSS = float(os.environ.get("EV_CIRCUIT_BREAKER_LOSS", "0.70"))
 EV_CIRCUIT_BREAKER_BLIND_SECS = float(os.environ.get("EV_CIRCUIT_BREAKER_BLIND_SECS", "120"))
 
+# 狙击入场保护期：狙击线程入场后 N 秒内 EV-Gate 不生效（电路断路器仍生效）
+SNIPER_GRACE_SECONDS = float(os.environ.get("SNIPER_GRACE_SECONDS", "8"))
+
 # BN 预警加速：当 Binance 检测到快速不利移动时，折扣 P(win)
 BN_EW_VELOCITY_ATR = 0.3   # BN 每秒移动 ≥ 0.3ATR 触发
 BN_EW_DISCOUNT = 0.80      # P(win) × 0.80
@@ -3193,6 +3196,23 @@ def monitor():
                             send_telegram(msg)
                         else:
                             print(f"    ⚠️ 抄底未成交，方向安全继续持有 | {atr_str} | 剩余{remaining:.0f}s")
+                        continue
+
+                    # --- 狙击入场保护期：前N秒EV-Gate不生效，防止CLOB噪音秒杀 ---
+                    _is_sniper = pos.get("sniper_thread", False)
+                    _entry_age = 999.0
+                    if _is_sniper and entry_time:
+                        try:
+                            _entry_dt = datetime.fromisoformat(entry_time)
+                            if _entry_dt.tzinfo is None:
+                                _entry_dt = _entry_dt.replace(tzinfo=timezone.utc)
+                            _entry_age = (now - _entry_dt).total_seconds()
+                        except (ValueError, TypeError):
+                            pass
+
+                    if _is_sniper and _entry_age < SNIPER_GRACE_SECONDS and _ev_should_exit:
+                        print(f"  🛡️ 狙击保护期: {_entry_age:.1f}s/{SNIPER_GRACE_SECONDS:.0f}s | EV退出信号已忽略 | edge={_ev_edge:+.3f}")
+                        ev_exit_confirm.pop(attempt_key, None)
                         continue
 
                     # --- EV-Gated 退出 ---

@@ -1347,7 +1347,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         # 从 entry_details 提取关键字段（供 monitor 的 EV 计算使用）
         if entry_details:
             for key in ("price_to_beat", "atr", "estimated_value", "diff_in_atr",
-                         "base_rate", "p_win_final"):
+                         "base_rate", "p_win_final", "sniper_thread"):
                 if key in entry_details:
                     position[key] = entry_details[key]
             # 兼容字段名
