@@ -666,14 +666,14 @@ class MarketTracker:
             ptb = self.ptb_cache.get(slug)
             updater = self.bayesian_updaters.get(slug)
             if not ptb or not updater or not updater.atr_val or updater.atr_val <= 0:
-                logger.debug(f"  🔫 狙击线程跳过: {coin} | 数据未就绪(ptb={'✓' if ptb else '✗'} atr={'✓' if updater and updater.atr_val else '✗'})")
+                logger.info(f"  🔫 狙击线程跳过: {coin} | 数据未就绪(ptb={'✓' if ptb else '✗'} atr={'✓' if updater and updater.atr_val else '✗'})")
                 continue
             if updater.n_updates < 2:
-                logger.debug(f"  🔫 狙击线程跳过: {coin} | 贝叶斯更新不足({updater.n_updates}<2)")
+                logger.info(f"  🔫 狙击线程跳过: {coin} | 贝叶斯更新不足({updater.n_updates}<2)")
                 continue
             tokens = self.token_cache.get(slug)
             if not tokens:
-                logger.debug(f"  🔫 狙击线程跳过: {coin} | 无token缓存")
+                logger.info(f"  🔫 狙击线程跳过: {coin} | 无token缓存")
                 continue
 
             # ── 时间窗口检查 ──
@@ -682,7 +682,7 @@ class MarketTracker:
             elapsed = (now - start_dt).total_seconds()
             remaining = (end_dt - now).total_seconds()
             if not (_sniper_early <= elapsed <= _sniper_late):
-                logger.debug(f"  🔫 狙击线程跳过: {coin} | 不在时间窗口(elapsed={elapsed:.0f}s, 需{_sniper_early}-{_sniper_late}s)")
+                logger.info(f"  🔫 狙击线程跳过: {coin} | 不在时间窗口(elapsed={elapsed:.0f}s, 需{_sniper_early}-{_sniper_late}s)")
                 continue
 
             # ── 获取实时价格：Chainlink WS（与结算同源）→ Binance WS fallback ──
@@ -692,7 +692,7 @@ class MarketTracker:
                 price = binance_stream.get_price(coin)
                 _price_src = "Binance"
             if price is None:
-                logger.debug(f"  🔫 狙击线程跳过: {coin} | 无实时价格(CL=✗ Binance=✗)")
+                logger.info(f"  🔫 狙击线程跳过: {coin} | 无实时价格(CL=✗ Binance=✗)")
                 continue
 
             # ── 核心计算：gap → ATR偏离 → 方向 ──
@@ -701,7 +701,7 @@ class MarketTracker:
             if diff_atr < SNIPER_MIN_ATR:
                 # 只在接近阈值时打印（减少噪音）
                 if diff_atr >= SNIPER_MIN_ATR * 0.6:
-                    logger.debug(
+                    logger.info(
                         f"  🔫 狙击线程跳过: {coin} | ATR不足 {diff_atr:.2f}<{SNIPER_MIN_ATR} "
                         f"| gap={gap:.0f} price={price:.2f}({_price_src}) ptb={ptb:.2f}"
                     )
@@ -712,18 +712,18 @@ class MarketTracker:
             # ── 贝叶斯方向确认 ──
             signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
             if not signal:
-                logger.debug(f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | 无贝叶斯信号")
+                logger.info(f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | 无贝叶斯信号")
                 continue
             bayesian_dir = signal.get("direction")
             bayesian_conf = signal.get("confidence", 0)
             if bayesian_dir != gap_dir:
-                logger.debug(
+                logger.info(
                     f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
                     f"方向不一致(gap={gap_dir} 贝叶斯={bayesian_dir} conf={bayesian_conf:.3f})"
                 )
                 continue
             if bayesian_conf < SNIPER_MIN_CONF:
-                logger.debug(
+                logger.info(
                     f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
                     f"置信度不足({bayesian_conf:.3f}<{SNIPER_MIN_CONF})"
                 )
@@ -736,13 +736,13 @@ class MarketTracker:
             _t_ws = time.time()
 
             if not real_ask or real_ask <= 0.01 or real_ask >= 0.99:
-                logger.debug(
+                logger.info(
                     f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
                     f"无可执行价(up={clob.get('up_ask')} down={clob.get('down_ask')})"
                 )
                 continue
             if real_ask > SNIPER_MAX_PRICE:
-                logger.debug(
+                logger.info(
                     f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
                     f"价格过高 ${real_ask:.2f}>${SNIPER_MAX_PRICE}"
                 )
@@ -757,7 +757,7 @@ class MarketTracker:
             _t_calc = time.time()
 
             if ev_est <= SNIPER_MIN_EV:
-                logger.debug(
+                logger.info(
                     f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
                     f"EV不足 {ev_est:+.4f}<={SNIPER_MIN_EV} | CLOB=${real_ask:.2f} p_win={p_win:.3f}"
                 )
