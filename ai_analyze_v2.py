@@ -753,6 +753,35 @@ def _get_execution_quote(token_id, fallback_book=None, force_fresh=False):
         if _is_valid_clob_price(quote.get("best_ask")):
             return quote
 
+    # v12 fix: 没有有效 ask 但 bid ≥ 0.90 → 市场已极端定价，返回 ask=0.99
+    # 这让 MAX_PRICE 检查自然拦截，不会走到分析价回退产生幻影信号
+    for candidate in [ws_quote, None]:
+        # 检查所有已获取的订单簿来源
+        pass
+    best_bid_seen = None
+    for source_book in [rest_book, fallback_book]:
+        if source_book:
+            try:
+                _b, _ = _extract_orderbook_levels(source_book)
+                if _b:
+                    best_bid_seen = float(_b[0]["price"])
+                    break
+            except Exception:
+                pass
+    if best_bid_seen is None and ws_quote and ws_quote.get("best_bid"):
+        best_bid_seen = ws_quote["best_bid"]
+
+    if best_bid_seen is not None and best_bid_seen >= 0.90:
+        return {
+            "best_bid": best_bid_seen,
+            "best_ask": 0.99,
+            "bids": [],
+            "asks": [],
+            "bid_depth": None,
+            "source": "extreme_priced",
+            "age_ms": None,
+        }
+
     return ws_quote or {
         "best_bid": None,
         "best_ask": None,
