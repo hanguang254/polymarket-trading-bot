@@ -150,9 +150,10 @@ class TestSniperScanConditions(unittest.TestCase):
         )
 
         mock_chainlink = MagicMock()
-        mock_chainlink.get_price.return_value = price  # gap = 138, diff_atr = 1.22
+        mock_chainlink.get_price.return_value = None
 
         mock_binance = MagicMock()
+        mock_binance.get_price.return_value = price  # gap = 138, diff_atr = 1.22
 
         mock_clob = {
             "up_ask": 0.55, "down_ask": 0.45,
@@ -256,12 +257,12 @@ class TestSniperScanConditions(unittest.TestCase):
         # gap = 69650 - 69612 = 38, diff_atr = 38/113 = 0.34 < 2.0
         self._setup_market(slug=slug, elapsed=50, gap_price=69650, ptb=69612)
 
-        mock_chainlink = MagicMock()
-        mock_chainlink.get_price.return_value = 69650
+        mock_binance = MagicMock()
+        mock_binance.get_price.return_value = 69650
 
         with patch.dict(sys.modules, {
-                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=mock_chainlink),
-                 "ai_trader.binance_api": MagicMock(price_stream=MagicMock()),
+                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=MagicMock()),
+                 "ai_trader.binance_api": MagicMock(price_stream=mock_binance),
              }), \
              patch("auto_bot_v3._get_bayesian_signal", return_value={
                  "direction": "UP", "p_hat": 0.75, "confidence": 0.45,
@@ -282,12 +283,12 @@ class TestSniperScanConditions(unittest.TestCase):
             gap_price=69750, ptb=69612
         )
 
-        mock_chainlink = MagicMock()
-        mock_chainlink.get_price.return_value = 69750
+        mock_binance = MagicMock()
+        mock_binance.get_price.return_value = 69750
 
         with patch.dict(sys.modules, {
-                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=mock_chainlink),
-                 "ai_trader.binance_api": MagicMock(price_stream=MagicMock()),
+                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=MagicMock()),
+                 "ai_trader.binance_api": MagicMock(price_stream=mock_binance),
              }), \
              patch("auto_bot_v3._get_bayesian_signal", return_value={
                  "direction": "DOWN", "p_hat": 0.75, "confidence": 0.45,
@@ -306,16 +307,16 @@ class TestSniperScanConditions(unittest.TestCase):
         slug = "btc-updown-5m-1700000000"
         self._setup_market(slug=slug, elapsed=50, gap_price=69750, ptb=69612)
 
-        mock_chainlink = MagicMock()
-        mock_chainlink.get_price.return_value = 69750
+        mock_binance = MagicMock()
+        mock_binance.get_price.return_value = 69750
 
         # ask = 0.80 > SNIPER_MAX_PRICE=0.65
         mock_clob = {"up_ask": 0.80, "down_ask": 0.20}
 
         with patch("auto_bot_v3.get_realtime_odds", return_value=mock_clob), \
              patch.dict(sys.modules, {
-                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=mock_chainlink),
-                 "ai_trader.binance_api": MagicMock(price_stream=MagicMock()),
+                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=MagicMock()),
+                 "ai_trader.binance_api": MagicMock(price_stream=mock_binance),
              }), \
              patch("auto_bot_v3._get_bayesian_signal", return_value={
                  "direction": "UP", "p_hat": 0.75, "confidence": 0.45,
@@ -351,8 +352,8 @@ class TestSniperThreadSafety(unittest.TestCase):
         self.tracker.bayesian_updaters[slug] = FakeUpdater()
         self.tracker.token_cache[slug] = ("up_token", "down_token")
 
-        mock_chainlink = MagicMock()
-        mock_chainlink.get_price.return_value = 69750
+        mock_binance = MagicMock()
+        mock_binance.get_price.return_value = 69750
 
         mock_clob = {"up_ask": 0.55, "down_ask": 0.45}
         mock_execute = MagicMock(return_value=(False, 0, 0, "FOK killed"))
@@ -364,8 +365,8 @@ class TestSniperThreadSafety(unittest.TestCase):
                  "SNIPER_EARLY": "5", "P_WIN_SHRINKAGE": "0.80",
              }), \
              patch.dict(sys.modules, {
-                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=mock_chainlink),
-                 "ai_trader.binance_api": MagicMock(price_stream=MagicMock()),
+                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=MagicMock()),
+                 "ai_trader.binance_api": MagicMock(price_stream=mock_binance),
              }), \
              patch("auto_bot_v3._get_bayesian_signal", return_value={
                  "direction": "UP", "p_hat": 0.75, "confidence": 0.45,
@@ -388,8 +389,8 @@ class TestSniperThreadSafety(unittest.TestCase):
         self.tracker.bayesian_updaters[slug] = FakeUpdater()
         self.tracker.token_cache[slug] = ("up_token", "down_token")
 
-        mock_chainlink = MagicMock()
-        mock_chainlink.get_price.return_value = 69750
+        mock_binance = MagicMock()
+        mock_binance.get_price.return_value = 69750
 
         mock_clob = {"up_ask": 0.55, "down_ask": 0.45}
         mock_execute = MagicMock(return_value=(True, 0.55, 10.0, "OK"))
@@ -401,8 +402,8 @@ class TestSniperThreadSafety(unittest.TestCase):
                  "SNIPER_EARLY": "5", "P_WIN_SHRINKAGE": "0.80",
              }), \
              patch.dict(sys.modules, {
-                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=mock_chainlink),
-                 "ai_trader.binance_api": MagicMock(price_stream=MagicMock()),
+                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=MagicMock()),
+                 "ai_trader.binance_api": MagicMock(price_stream=mock_binance),
              }), \
              patch("auto_bot_v3._get_bayesian_signal", return_value={
                  "direction": "UP", "p_hat": 0.75, "confidence": 0.45,
@@ -423,13 +424,13 @@ class TestSniperThreadSafety(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════
 
 class TestSniperPriceFallback(unittest.TestCase):
-    """Chainlink WS → Binance WS 价格源降级"""
+    """Binance WS → Chainlink WS 价格源降级"""
 
     def setUp(self):
         self.tracker = bot.MarketTracker()
 
-    def test_uses_binance_when_chainlink_unavailable(self):
-        """Chainlink无数据时应fallback到Binance"""
+    def test_uses_binance_as_primary(self):
+        """Binance为主价格源，Chainlink为fallback"""
         slug = "btc-updown-5m-1700000000"
         market = make_market("BTC", slug, elapsed=50)
         self.tracker.tracked[slug] = market
@@ -466,7 +467,7 @@ class TestSniperPriceFallback(unittest.TestCase):
             sys.modules["ai_analyze_v2"].execute_bet = mock_execute
             self.tracker._sniper_scan()
 
-        self.assertTrue(mock_execute.called, "Binance fallback应触发狙击")
+        self.assertTrue(mock_execute.called, "Binance主价格源应触发狙击")
         mock_binance.get_price.assert_called()
 
     def test_skip_when_no_price_source(self):
@@ -520,16 +521,16 @@ class TestSniperDownDirection(unittest.TestCase):
         )
         self.tracker.token_cache[slug] = ("up_token", "down_token")
 
-        mock_chainlink = MagicMock()
-        mock_chainlink.get_price.return_value = 69470  # gap = -142, diff_atr = 1.26
+        mock_binance = MagicMock()
+        mock_binance.get_price.return_value = 69470  # gap = -142, diff_atr = 1.26
 
         mock_clob = {"up_ask": 0.55, "down_ask": 0.50}
         mock_execute = MagicMock(return_value=(True, 0.50, 10.0, "OK"))
 
         with patch("auto_bot_v3.get_realtime_odds", return_value=mock_clob), \
              patch.dict(sys.modules, {
-                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=mock_chainlink),
-                 "ai_trader.binance_api": MagicMock(price_stream=MagicMock()),
+                 "ai_trader.polymarket_rtds": MagicMock(chainlink_stream=MagicMock()),
+                 "ai_trader.binance_api": MagicMock(price_stream=mock_binance),
              }), \
              patch("auto_bot_v3._get_bayesian_signal", return_value={
                  "direction": "DOWN", "p_hat": 0.75, "confidence": 0.45,
