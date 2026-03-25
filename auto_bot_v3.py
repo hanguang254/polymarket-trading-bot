@@ -695,7 +695,9 @@ class MarketTracker:
                             clob_client.precache_tokens([up_t, down_t])
                             from ai_trader.polymarket_ws import poly_ws
                             poly_ws.subscribe([up_t, down_t])
-                            logger.info(f"   📡 token + WS 已就绪")
+                            # v12.2: WS 订阅后立即 REST 预读种子，消除初始无快照
+                            poly_ws.seed_from_rest([up_t, down_t], clob_client)
+                            logger.info(f"   📡 token + WS + REST种子 已就绪")
                     except Exception:
                         pass
 
@@ -752,10 +754,10 @@ class MarketTracker:
                                 logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                             # ═══ v12: 动量狙击 — 检测到大波动时跳过完整分析直接下单 ═══
                             # 从检测到下单 <500ms（vs 正常路径 3-5s），抢在CLOB做市商定价前入场
-                            SNIPER_MIN_ATR = 1.0       # 0.5太弱(2笔亏损)，1.0+才有方向确定性
-                            SNIPER_MAX_PRICE = 0.58    # 狙击入场的最高token价格
+                            SNIPER_MIN_ATR = float(os.environ.get("SNIPER_MIN_ATR", "0.5"))   # 0.5起步（日志验证2笔成交都是0.5ATR）
+                            SNIPER_MAX_PRICE = float(os.environ.get("SNIPER_MAX_PRICE", "0.65"))  # 0.58→0.65: 放宽入场上限，EV正就进
                             SNIPER_MIN_SAMPLES = 2     # 2个样本够了（gap方向是主信号，贝叶斯只确认）
-                            _sniper_early = 15         # 独立于早期窗口，15s就开始狙击
+                            _sniper_early = int(os.environ.get("SNIPER_EARLY", "5"))  # 5s起步（抢在做市商定价前）
                             _sniper_late = strategy_cfg.get("late_bet_end", 220)
                             if (updater and updater.atr_val and updater.atr_val > 0
                                     and slug not in self.analyzed

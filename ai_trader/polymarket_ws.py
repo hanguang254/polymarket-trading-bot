@@ -113,6 +113,52 @@ class PolymarketOrderbookStream:
             except Exception:
                 pass
 
+    # ── REST 种子（WS 订阅后立即用 REST 预读，避免初始无快照） ──
+
+    def seed_from_rest(self, asset_ids, clob_client):
+        """WS 订阅后立即用 REST 读一次 orderbook 写入内存，
+        解决新市场 WS 初始无推送的问题。后续 WS 推送会自动覆盖。
+        """
+        if isinstance(asset_ids, str):
+            asset_ids = [asset_ids]
+        for token_id in asset_ids:
+            # 已有新鲜数据则跳过
+            with self._lock:
+                existing = self._bba.get(token_id)
+            if existing and (time.time() - existing["ts"]) < 5:
+                continue
+            try:
+                book = clob_client.get_orderbook(token_id)
+                if not book:
+                    continue
+                raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
+                raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
+                sorted_bids = sorted(raw_bids, key=lambda x: float(x.get("price", 0)), reverse=True)
+                sorted_asks = sorted(raw_asks, key=lambda x: float(x.get("price", 0)))
+                if not sorted_bids or not sorted_asks:
+                    continue
+                bb = float(sorted_bids[0]["price"])
+                ba = float(sorted_asks[0]["price"])
+                if bb <= 0 or ba <= 0 or bb >= ba:
+                    continue
+                with self._lock:
+                    # 只在 WS 还没推送时写入（避免覆盖更新鲜的 WS 数据）
+                    fresh = self._bba.get(token_id)
+                    if not fresh or (time.time() - fresh["ts"]) >= 2:
+                        self._bba[token_id] = {
+                            "best_bid": bb,
+                            "best_ask": ba,
+                            "spread": round(ba - bb, 4),
+                            "ts": time.time(),
+                        }
+                        self._books[token_id] = {
+                            "bids": sorted_bids,
+                            "asks": sorted_asks,
+                            "ts": time.time(),
+                        }
+            except Exception:
+                pass
+
     # ── 数据读取（零延迟） ──
 
     def get_best_bid(self, asset_id):
