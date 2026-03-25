@@ -628,19 +628,7 @@ class MarketTracker:
                     et_dt = end_dt - timedelta(hours=5)  # UTC-5 (EST)
                     logger.info(f"   结束: {et_dt.strftime('%H:%M:%S')} ET | 剩余: {remaining:.0f}s")
 
-                # v12: 市场发现时立即获取 token_id + WS 订阅（比预热提前 8s）
-                # 狙击在 15s 触发时 WS 已有数据
-                if slug not in self.token_cache:
-                    try:
-                        up_t, down_t = get_token_ids(slug)
-                        if up_t and down_t:
-                            self.token_cache[slug] = (up_t, down_t)
-                            clob_client.precache_tokens([up_t, down_t])
-                            from ai_trader.polymarket_ws import poly_ws
-                            poly_ws.subscribe([up_t, down_t])
-                            logger.info(f"   📡 提前订阅 WS + 预缓存 token")
-                    except Exception:
-                        pass
+                # token 获取移到预热(8s)，0秒时 Gamma API 可能返回旧市场 token
             else:
                 self.tracked[slug]["up_odds"] = market["up_odds"]
                 self.tracked[slug]["down_odds"] = market["down_odds"]
@@ -699,21 +687,15 @@ class MarketTracker:
                         logger.warning(f"\n🔥 预热开始(无贝叶斯): {market['coin']} | {slug} | {e}")
 
                     # v12 fix: 预热时强制刷新 token（0秒发现时 Gamma API 可能返回旧 token）
+                    # 预热开始时获取 token + 订阅 WS（确保是当前市场的 token）
                     try:
                         up_t, down_t = get_token_ids(slug)
                         if up_t and down_t:
-                            old_tokens = self.token_cache.get(slug)
-                            if old_tokens and old_tokens != (up_t, down_t):
-                                logger.info(f"   📡 token 已刷新（0s缓存的是旧市场）")
-                                # 退订旧 token，订阅新 token
-                                from ai_trader.polymarket_ws import poly_ws
-                                poly_ws.unsubscribe(list(old_tokens))
-                                poly_ws.subscribe([up_t, down_t])
-                            elif not old_tokens:
-                                from ai_trader.polymarket_ws import poly_ws
-                                poly_ws.subscribe([up_t, down_t])
                             self.token_cache[slug] = (up_t, down_t)
                             clob_client.precache_tokens([up_t, down_t])
+                            from ai_trader.polymarket_ws import poly_ws
+                            poly_ws.subscribe([up_t, down_t])
+                            logger.info(f"   📡 token + WS 已就绪")
                     except Exception:
                         pass
 
@@ -770,7 +752,7 @@ class MarketTracker:
                                 logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                             # ═══ v12: 动量狙击 — 检测到大波动时跳过完整分析直接下单 ═══
                             # 从检测到下单 <500ms（vs 正常路径 3-5s），抢在CLOB做市商定价前入场
-                            SNIPER_MIN_ATR = 0.5       # 触发狙击的最低ATR偏离（MAX_PRICE兜底安全）
+                            SNIPER_MIN_ATR = 1.0       # 0.5太弱(2笔亏损)，1.0+才有方向确定性
                             SNIPER_MAX_PRICE = 0.58    # 狙击入场的最高token价格
                             SNIPER_MIN_SAMPLES = 2     # 2个样本够了（gap方向是主信号，贝叶斯只确认）
                             _sniper_early = 15         # 独立于早期窗口，15s就开始狙击
