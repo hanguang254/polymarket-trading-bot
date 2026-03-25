@@ -766,6 +766,88 @@ class TestOracleStaleWatch(unittest.TestCase):
         self.assertTrue(info["recovered"])
 
 
+class TestEvGate(unittest.TestCase):
+    """EV-Gate 止损纯函数测试"""
+
+    def test_random_walk_p_win_direction_correct_near_ptb(self):
+        """ATR≈0, direction correct → p_win slightly > 0.50 (HOLD)"""
+        # BTC UP, crypto=70001 vs ptb=70000, gap=+1, ATR=50, remaining=200s
+        p = pm.random_walk_p_win("UP", 70001, 70000, 50, 200)
+        self.assertGreater(p, 0.50)
+        self.assertLess(p, 0.55)
+
+    def test_random_walk_p_win_direction_wrong_near_ptb(self):
+        """ATR≈0, direction wrong → p_win slightly < 0.50"""
+        p = pm.random_walk_p_win("UP", 69999, 70000, 50, 200)
+        self.assertLess(p, 0.50)
+        self.assertGreater(p, 0.45)
+
+    def test_random_walk_p_win_strong_correct(self):
+        """Large gap correct side → high p_win"""
+        p = pm.random_walk_p_win("DOWN", 69900, 70000, 50, 120)
+        self.assertGreater(p, 0.75)
+
+    def test_random_walk_p_win_strong_wrong(self):
+        """Large gap wrong side → low p_win"""
+        p = pm.random_walk_p_win("DOWN", 70100, 70000, 50, 60)
+        self.assertLess(p, 0.25)
+
+    def test_random_walk_p_win_no_time_left_correct(self):
+        """remaining=0, on correct side → nearly certain win"""
+        p = pm.random_walk_p_win("UP", 70050, 70000, 50, 0)
+        self.assertGreater(p, 0.90)
+
+    def test_random_walk_p_win_no_time_left_wrong(self):
+        """remaining=0, on wrong side → nearly certain loss"""
+        p = pm.random_walk_p_win("UP", 69950, 70000, 50, 0)
+        self.assertLess(p, 0.10)
+
+    def test_random_walk_p_win_zero_atr(self):
+        """ATR=0 → 0.50 (coin flip)"""
+        p = pm.random_walk_p_win("UP", 70050, 70000, 0, 200)
+        self.assertEqual(p, 0.50)
+
+    def test_ev_comparison_hold_when_direction_correct_atr_near_zero(self):
+        """Core case: direction correct, ATR near zero, token crashed → should HOLD"""
+        result = pm.calc_ev_comparison(
+            direction="UP", crypto_price=70001, ptb_price=70000,
+            atr_val=50, remaining_seconds=200, entry_price=0.70,
+            current_bid_net=0.33,
+        )
+        self.assertFalse(result["should_exit"])
+        self.assertGreater(result["ev_edge"], 0.10)
+
+    def test_ev_comparison_exit_when_p_win_very_low(self):
+        """Large wrong gap + little time → should EXIT"""
+        result = pm.calc_ev_comparison(
+            direction="UP", crypto_price=69850, ptb_price=70000,
+            atr_val=50, remaining_seconds=30, entry_price=0.70,
+            current_bid_net=0.30,
+        )
+        self.assertTrue(result["should_exit"])
+        self.assertLess(result["p_win"], 0.30)
+
+    def test_ev_comparison_hold_when_bid_depressed(self):
+        """p_win near 0.50 but bid is very low → HOLD (market overreacted)"""
+        result = pm.calc_ev_comparison(
+            direction="UP", crypto_price=69990, ptb_price=70000,
+            atr_val=50, remaining_seconds=180, entry_price=0.70,
+            current_bid_net=0.25,
+        )
+        self.assertFalse(result["should_exit"])
+
+    def test_ev_comparison_exit_when_bid_exceeds_p_win(self):
+        """bid > p_win → should EXIT"""
+        result = pm.calc_ev_comparison(
+            direction="UP", crypto_price=69850, ptb_price=70000,
+            atr_val=50, remaining_seconds=60, entry_price=0.70,
+            current_bid_net=0.40,
+        )
+        # p_win should be low (wrong direction, little time)
+        if result["p_win"] < 0.40:
+            self.assertTrue(result["should_exit"])
+
+
 class TestGetBestBid(unittest.TestCase):
     """get_best_bid: 止盈卖出价（含0.99折扣）"""
 

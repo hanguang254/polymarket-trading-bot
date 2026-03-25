@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v10.6.4
+# Polymarket Trading Bot v11.0
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -84,6 +84,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
   - **ATR 1.0-2.0** (uncertain): 🟡 Hold — no action, continue monitoring. ATR rising → enters safe zone, ATR falling → enters danger zone.
   - **ATR < 1.0** (danger zone): 🔴 Stop-loss — immediate sell at best_bid, only when direction is wrong. Direction correct + ATR dip is normal volatility, not a stop signal.
 - **Hyperbolic Discounting Profit-Take (P0)**: Dynamic threshold `base × (1 + k × minutes_remaining)` — faraway paper profits are less reliable, so the further from settlement, the higher the profit bar. Configurable via `P0_BASE_PROFIT` (default 0.20) and `P0_HYPERBOLIC_K` (default 0.15). P0 sells at entry_price (guaranteed fill) instead of best_bid.
+- **EV-Gate 止损 (v11)**: 二元市场核心止损重构。`calc_ev_comparison()` 每 tick 比较 `EV(持有到结算) = P(win)` vs `EV(卖出) = net_bid_price`，仅当卖出更优时才止损。`random_walk_p_win()` 用 oracle(Chainlink) 的 gap/ATR/剩余时间计算胜率，不依赖 CLOB token 价格。解决了旧逻辑中"方向正确但ATR≈0被误杀"的核心问题（13/23笔亏损）。需连续 `EV_EXIT_CONFIRMATIONS`（默认2）轮确认才执行。三个电路断路器绕过 EV Gate：CB1(oracle缺失+亏损>30%)、CB2(token跌≥70%)、CB3(结算临近+tail oracle确认方向错误)。`ENABLE_EV_GATE=0` 可回退旧逻辑。
 - **Market-Price Immediate Stop-Loss**: `market_sell_immediate()` cancels existing orders first (prevents balance lock), then ladder sells at bid→95%→90%→80%→$0.05→$0.01 (~6s to clear). On "not enough balance / allowance" error with confirmed on-chain balance, auto-refreshes allowance and retries before falling back to reduced-size attempts.
 - **Opposite Token Hedge (P1)**: When losing and bid < $0.05 (no buyers), buys the opposite token to form a guaranteed pair (UP + DOWN = $1.00 at settlement). Only hedges when `opposite_ask < (1.00 - entry_price - 0.02)`, ensuring net profit. Opposite token_id is recorded at entry time.
 - **EV-Driven Diamond Hands**: Direction correct + token drop < 15% → calculates real-time EV. High EV (>0.03) or large ATR deviation (≥ time-decayed threshold) → hold to settlement. Weak signal → releases to Stage 2/3/4 for fine-grained exit.
