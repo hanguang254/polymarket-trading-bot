@@ -122,6 +122,12 @@ EV_ATR_SIGMA_RATIO = float(os.environ.get("EV_ATR_SIGMA_RATIO", "1.5"))
 EV_CIRCUIT_BREAKER_LOSS = float(os.environ.get("EV_CIRCUIT_BREAKER_LOSS", "0.70"))
 EV_CIRCUIT_BREAKER_BLIND_SECS = float(os.environ.get("EV_CIRCUIT_BREAKER_BLIND_SECS", "120"))
 
+# BN 预警加速：当 Binance 检测到快速不利移动时，折扣 P(win)
+BN_EW_VELOCITY_ATR = 0.3   # BN 每秒移动 ≥ 0.3ATR 触发
+BN_EW_DISCOUNT = 0.80      # P(win) × 0.80
+BN_EW_MIN_SAMPLES = 3      # 至少3个快照
+BN_EW_WINDOW_SEC = 3.0     # 3秒窗口
+
 def calc_proximity_threshold(remaining):
     """proximity zone 宽度随时间衰减：越接近到期 buffer 越窄"""
     if remaining > 180:
@@ -1001,6 +1007,67 @@ def calc_ev_comparison(direction, crypto_price, ptb_price, atr_val,
         "should_exit": should_exit,
         "reason": reason,
     }
+
+
+def calc_bn_early_warning(direction, ptb_price, atr_val, bn_history):
+    """
+    Binance 预警加速：检测 BN 价格是否在快速向不利方向移动。
+
+    bn_history: deque of (timestamp, price) 最近几秒的 BN 价格快照
+    Returns dict:
+        active:    True = BN 检测到快速不利移动
+        velocity:  BN 每秒变化量（signed，负=对 UP 方向不利）
+        velocity_atr: 每秒变化的 ATR 倍数
+        discount:  P(win) 应乘以此因子（active 时 < 1.0）
+        reason:    说明
+    """
+    inactive = {
+        "active": False,
+        "velocity": 0.0,
+        "velocity_atr": 0.0,
+        "discount": 1.0,
+        "reason": None,
+    }
+    if not bn_history or len(bn_history) < BN_EW_MIN_SAMPLES:
+        return inactive
+    if atr_val is None or atr_val <= 0 or ptb_price is None:
+        return inactive
+
+    # 取窗口内的样本
+    now_ts = bn_history[-1][0]
+    window_start = now_ts - BN_EW_WINDOW_SEC
+    window = [(ts, p) for ts, p in bn_history if ts >= window_start]
+    if len(window) < BN_EW_MIN_SAMPLES:
+        return inactive
+
+    oldest_ts, oldest_price = window[0]
+    newest_ts, newest_price = window[-1]
+    dt = newest_ts - oldest_ts
+    if dt < 0.3:
+        return inactive
+
+    # velocity = 价格变化速度（signed）
+    raw_velocity = (newest_price - oldest_price) / dt  # $/sec
+
+    # 对方向的不利速度：UP方向下跌是不利，DOWN方向上涨是不利
+    if direction == "UP":
+        adverse_velocity = -raw_velocity  # 下跌 → positive adverse
+    elif direction == "DOWN":
+        adverse_velocity = raw_velocity   # 上涨 → positive adverse
+    else:
+        return inactive
+
+    velocity_atr = adverse_velocity / atr_val if atr_val > 0 else 0.0
+
+    if velocity_atr >= BN_EW_VELOCITY_ATR:
+        return {
+            "active": True,
+            "velocity": round(raw_velocity, 2),
+            "velocity_atr": round(velocity_atr, 4),
+            "discount": BN_EW_DISCOUNT,
+            "reason": f"BN快跌{velocity_atr:.2f}ATR/s",
+        }
+    return inactive
 
 
 def _get_fresh_exit_quote(token_id, price_hint=None):
@@ -2548,6 +2615,7 @@ def monitor():
     oracle_stale_watch_streak = {}  # (slug, entry_time) -> CL-BN 持续偏离确认轮数（仅告警）
     oracle_stale_watch_active = {}  # (slug, entry_time) -> 是否已进入快市场领先告警态
     ev_exit_confirm = {}  # (slug, entry_time) -> 连续EV退出确认轮数（EV-Gate用）
+    bn_price_history = {}  # (slug, entry_time) -> deque of (ts, price) BN价格快照
     last_wake_context = {"label": "startup", "detail": None}
     
     while True:
@@ -2577,6 +2645,7 @@ def monitor():
             oracle_stale_watch_streak = {k: v for k, v in oracle_stale_watch_streak.items() if k in open_keys}
             oracle_stale_watch_active = {k: v for k, v in oracle_stale_watch_active.items() if k in open_keys}
             ev_exit_confirm = {k: v for k, v in ev_exit_confirm.items() if k in open_keys}
+            bn_price_history = {k: v for k, v in bn_price_history.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -2981,6 +3050,19 @@ def monitor():
 
                 # ═══ EV-Gate 止损（v11）═══
                 if ENABLE_EV_GATE:
+                    # --- BN 预警加速：收集 BN 价格快照 ---
+                    bn_snapshot = crypto_debug.get("binance") if isinstance(crypto_debug, dict) else None
+                    bn_price_now = _safe_float(bn_snapshot.get("price")) if isinstance(bn_snapshot, dict) else None
+                    if bn_price_now and bn_price_now > 0:
+                        if attempt_key not in bn_price_history:
+                            bn_price_history[attempt_key] = deque(maxlen=30)
+                        bn_price_history[attempt_key].append((time.time(), bn_price_now))
+
+                    bn_ew = calc_bn_early_warning(
+                        direction, ptb_price, atr_val,
+                        bn_price_history.get(attempt_key),
+                    )
+
                     # --- EV Gate 计算 ---
                     _ev_bid_net = calc_net_exit_value(token_id, size)
                     ev_gate = calc_ev_comparison(
@@ -2988,13 +3070,25 @@ def monitor():
                         remaining, entry_price, _ev_bid_net,
                     )
                     _ev_p_win = ev_gate["p_win"]
+
+                    # BN 预警折扣
+                    _bn_ew_label = ""
+                    if bn_ew["active"]:
+                        _ev_p_win_raw = _ev_p_win
+                        _ev_p_win = max(EV_P_WIN_FLOOR, _ev_p_win * bn_ew["discount"])
+                        ev_gate["p_win"] = _ev_p_win
+                        ev_gate["ev_hold"] = round(_ev_p_win, 4)
+                        ev_gate["ev_edge"] = round(_ev_p_win - ev_gate["ev_sell"], 4)
+                        ev_gate["should_exit"] = ev_gate["ev_sell"] > _ev_p_win
+                        _bn_ew_label = f" | ⚡BN预警:{bn_ew['velocity_atr']:.2f}ATR/s→P×{bn_ew['discount']}"
+
                     _ev_hold = ev_gate["ev_hold"]
                     _ev_sell = ev_gate["ev_sell"]
                     _ev_edge = ev_gate["ev_edge"]
                     _ev_should_exit = ev_gate["should_exit"]
                     print(
                         f"  [EV] P(win)={_ev_p_win:.1%} | hold=${_ev_hold:.3f} sell=${_ev_sell:.3f} "
-                        f"| edge={_ev_edge:+.3f} | {'EXIT' if _ev_should_exit else 'HOLD'} | {atr_str}"
+                        f"| edge={_ev_edge:+.3f} | {'EXIT' if _ev_should_exit else 'HOLD'} | {atr_str}{_bn_ew_label}"
                     )
 
                     # --- 电路断路器（绕过 EV Gate）---
@@ -3044,6 +3138,7 @@ def monitor():
                             direction_history.pop(attempt_key, None)
                             close_intents.pop(attempt_key, None)
                             ev_exit_confirm.pop(attempt_key, None)
+                            bn_price_history.pop(attempt_key, None)
                             continue
                         stop_loss_attempt_recorded = True
                         stop_loss_attempts[attempt_key] = stop_loss_attempts.get(attempt_key, 0) + 1
@@ -3111,6 +3206,7 @@ def monitor():
                             close_attempts.pop(attempt_key, None)
                             close_intents.pop(attempt_key, None)
                             ev_exit_confirm.pop(attempt_key, None)
+                            bn_price_history.pop(attempt_key, None)
                             continue
                         if sold:
                             _clear_close_intent(pos)
@@ -3122,6 +3218,7 @@ def monitor():
                             direction_history.pop(attempt_key, None)
                             close_intents.pop(attempt_key, None)
                             ev_exit_confirm.pop(attempt_key, None)
+                            bn_price_history.pop(attempt_key, None)
                             continue
                         stop_loss_attempt_recorded = True
                         stop_loss_attempts[attempt_key] = stop_loss_attempts.get(attempt_key, 0) + 1

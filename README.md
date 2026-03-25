@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v11.0
+# Polymarket Trading Bot v11.0.1
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
