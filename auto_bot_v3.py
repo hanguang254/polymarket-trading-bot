@@ -563,6 +563,7 @@ class MarketTracker:
         self._sniper_thread = None
         self._sniper_lock = threading.Lock()       # 防止同一slug被主线程和狙击线程同时执行
         self._sniper_processing = set()            # 狙击线程正在处理的slug
+        self._sniper_last_reason = {}              # slug -> last_reason, 去重日志用
         self._restore_recent_market_state()
 
     def _restore_recent_market_state(self):
@@ -655,6 +656,7 @@ class MarketTracker:
         for slug, market in list(self.tracked.items()):
             # ── 快速跳过：已分析/已持仓/正在狙击中 ──
             if slug in self.analyzed or slug in self.positions:
+                self._sniper_last_reason.pop(slug, None)
                 continue
             with self._sniper_lock:
                 if slug in self._sniper_processing:
@@ -662,18 +664,25 @@ class MarketTracker:
 
             coin = market["coin"]
 
+            # 去重日志辅助：同一slug同一原因只打印一次
+            def _log_skip(reason_key, msg):
+                prev = self._sniper_last_reason.get(slug)
+                if prev != reason_key:
+                    self._sniper_last_reason[slug] = reason_key
+                    logger.info(msg)
+
             # ── 必要数据就绪检查 ──
             ptb = self.ptb_cache.get(slug)
             updater = self.bayesian_updaters.get(slug)
             if not ptb or not updater or not updater.atr_val or updater.atr_val <= 0:
-                logger.info(f"  🔫 狙击线程跳过: {coin} | 数据未就绪(ptb={'✓' if ptb else '✗'} atr={'✓' if updater and updater.atr_val else '✗'})")
+                _log_skip("no_data", f"  🔫 狙击线程: {coin} 等待数据(ptb={'✓' if ptb else '✗'} atr={'✓' if updater and updater.atr_val else '✗'})")
                 continue
             if updater.n_updates < 2:
-                logger.info(f"  🔫 狙击线程跳过: {coin} | 贝叶斯更新不足({updater.n_updates}<2)")
+                _log_skip("low_updates", f"  🔫 狙击线程: {coin} 贝叶斯更新不足({updater.n_updates}<2)")
                 continue
             tokens = self.token_cache.get(slug)
             if not tokens:
-                logger.info(f"  🔫 狙击线程跳过: {coin} | 无token缓存")
+                _log_skip("no_token", f"  🔫 狙击线程: {coin} 无token缓存")
                 continue
 
             # ── 时间窗口检查 ──
@@ -682,7 +691,7 @@ class MarketTracker:
             elapsed = (now - start_dt).total_seconds()
             remaining = (end_dt - now).total_seconds()
             if not (_sniper_early <= elapsed <= _sniper_late):
-                logger.info(f"  🔫 狙击线程跳过: {coin} | 不在时间窗口(elapsed={elapsed:.0f}s, 需{_sniper_early}-{_sniper_late}s)")
+                _log_skip("time_window", f"  🔫 狙击线程: {coin} 不在时间窗口(elapsed={elapsed:.0f}s, 需{_sniper_early}-{_sniper_late}s)")
                 continue
 
             # ── 获取实时价格：Chainlink WS（与结算同源）→ Binance WS fallback ──
@@ -692,19 +701,16 @@ class MarketTracker:
                 price = binance_stream.get_price(coin)
                 _price_src = "Binance"
             if price is None:
-                logger.info(f"  🔫 狙击线程跳过: {coin} | 无实时价格(CL=✗ Binance=✗)")
+                _log_skip("no_price", f"  🔫 狙击线程: {coin} 无实时价格(CL=✗ Binance=✗)")
                 continue
 
             # ── 核心计算：gap → ATR偏离 → 方向 ──
             gap = price - ptb
             diff_atr = abs(gap) / updater.atr_val
             if diff_atr < SNIPER_MIN_ATR:
-                # 只在接近阈值时打印（减少噪音）
-                if diff_atr >= SNIPER_MIN_ATR * 0.6:
-                    logger.info(
-                        f"  🔫 狙击线程跳过: {coin} | ATR不足 {diff_atr:.2f}<{SNIPER_MIN_ATR} "
-                        f"| gap={gap:.0f} price={price:.2f}({_price_src}) ptb={ptb:.2f}"
-                    )
+                _log_skip(f"atr_{round(diff_atr,1)}",
+                    f"  🔫 狙击线程: {coin} ATR={diff_atr:.2f}<{SNIPER_MIN_ATR} "
+                    f"| gap={gap:.0f} price={price:.2f}({_price_src})")
                 continue
 
             gap_dir = "UP" if gap > 0 else "DOWN"
@@ -712,21 +718,19 @@ class MarketTracker:
             # ── 贝叶斯方向确认 ──
             signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
             if not signal:
-                logger.info(f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | 无贝叶斯信号")
+                _log_skip("no_signal", f"  🔫 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | 无贝叶斯信号")
                 continue
             bayesian_dir = signal.get("direction")
             bayesian_conf = signal.get("confidence", 0)
             if bayesian_dir != gap_dir:
-                logger.info(
-                    f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
-                    f"方向不一致(gap={gap_dir} 贝叶斯={bayesian_dir} conf={bayesian_conf:.3f})"
-                )
+                _log_skip(f"dir_{bayesian_dir}",
+                    f"  🔫 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
+                    f"方向不一致(gap={gap_dir} 贝叶斯={bayesian_dir} conf={bayesian_conf:.3f})")
                 continue
             if bayesian_conf < SNIPER_MIN_CONF:
-                logger.info(
-                    f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
-                    f"置信度不足({bayesian_conf:.3f}<{SNIPER_MIN_CONF})"
-                )
+                _log_skip("low_conf",
+                    f"  🔫 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
+                    f"置信度不足({bayesian_conf:.3f}<{SNIPER_MIN_CONF})")
                 continue
 
             # ── CLOB 执行价获取 ──
@@ -736,16 +740,14 @@ class MarketTracker:
             _t_ws = time.time()
 
             if not real_ask or real_ask <= 0.01 or real_ask >= 0.99:
-                logger.info(
-                    f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
-                    f"无可执行价(up={clob.get('up_ask')} down={clob.get('down_ask')})"
-                )
+                _log_skip("no_ask",
+                    f"  🔫 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
+                    f"无可执行价(up={clob.get('up_ask')} down={clob.get('down_ask')})")
                 continue
             if real_ask > SNIPER_MAX_PRICE:
-                logger.info(
-                    f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
-                    f"价格过高 ${real_ask:.2f}>${SNIPER_MAX_PRICE}"
-                )
+                _log_skip(f"price_{round(real_ask,2)}",
+                    f"  🔫 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
+                    f"价格过高 ${real_ask:.2f}>${SNIPER_MAX_PRICE}")
                 continue
 
             # ── EV 计算 ──
@@ -757,11 +759,13 @@ class MarketTracker:
             _t_calc = time.time()
 
             if ev_est <= SNIPER_MIN_EV:
-                logger.info(
-                    f"  🔫 狙击线程跳过: {coin} {gap_dir} ATR={diff_atr:.2f} | "
-                    f"EV不足 {ev_est:+.4f}<={SNIPER_MIN_EV} | CLOB=${real_ask:.2f} p_win={p_win:.3f}"
-                )
+                _log_skip(f"ev_{round(ev_est,2)}",
+                    f"  🔫 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
+                    f"EV不足 {ev_est:+.4f}<={SNIPER_MIN_EV} | CLOB=${real_ask:.2f} p_win={p_win:.3f}")
                 continue
+
+            # 条件全通过，清除跳过记录
+            self._sniper_last_reason.pop(slug, None)
 
             # ── 标记正在狙击，防止主线程同时处理 ──
             with self._sniper_lock:
