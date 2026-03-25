@@ -749,7 +749,7 @@ class MarketTracker:
                                 logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                             # ═══ v12: 动量狙击 — 检测到大波动时跳过完整分析直接下单 ═══
                             # 从检测到下单 <500ms（vs 正常路径 3-5s），抢在CLOB做市商定价前入场
-                            SNIPER_MIN_ATR = 1.0       # 触发狙击的最低ATR偏离
+                            SNIPER_MIN_ATR = 0.5       # 触发狙击的最低ATR偏离（MAX_PRICE兜底安全）
                             SNIPER_MAX_PRICE = 0.55    # 狙击入场的最高token价格
                             SNIPER_MIN_SAMPLES = 2     # 2个样本够了（gap方向是主信号，贝叶斯只确认）
                             _sniper_early = 15         # 独立于早期窗口，15s就开始狙击
