@@ -564,6 +564,7 @@ class MarketTracker:
         self._sniper_lock = threading.Lock()       # 防止同一slug被主线程和狙击线程同时执行
         self._sniper_processing = set()            # 狙击线程正在处理的slug
         self._sniper_last_reason = {}              # slug -> last_reason, 去重日志用
+        self._sniper_updaters = {}                 # slug -> 独立BayesianUpdater（100ms自更新）
         self._restore_recent_market_state()
 
     def _restore_recent_market_state(self):
@@ -605,7 +606,7 @@ class MarketTracker:
             logger.info(f"♻️ 启动恢复: open={restored_open} | recent_closed={restored_recent}")
 
     # ═══════════════════════════════════════════════════════════
-    # 独立狙击监听线程 — 200ms高频轮询，从检测到下单 <500ms
+    # 独立狙击监听线程 — 100ms高频轮询，独立贝叶斯，PTB就绪200ms内可狙击
     # ═══════════════════════════════════════════════════════════
 
     def start_sniper_thread(self):
@@ -625,7 +626,7 @@ class MarketTracker:
 
     def _sniper_loop(self):
         """狙击线程主循环 — 高频轮询所有活跃市场"""
-        POLL_MS = int(os.environ.get("SNIPER_POLL_MS", "200"))
+        POLL_MS = int(os.environ.get("SNIPER_POLL_MS", "100"))
         poll_interval = POLL_MS / 1000.0
 
         while self._sniper_running:
@@ -673,12 +674,10 @@ class MarketTracker:
 
             # ── 必要数据就绪检查 ──
             ptb = self.ptb_cache.get(slug)
-            updater = self.bayesian_updaters.get(slug)
-            if not ptb or not updater or not updater.atr_val or updater.atr_val <= 0:
-                _log_skip("no_data", f"  [狙] 狙击线程: {coin} 等待数据(ptb={'✓' if ptb else '✗'} atr={'✓' if updater and updater.atr_val else '✗'})")
-                continue
-            if updater.n_updates < 2:
-                _log_skip("low_updates", f"  [狙] 狙击线程: {coin} 贝叶斯更新不足({updater.n_updates}<2)")
+            shared_updater = self.bayesian_updaters.get(slug)
+            atr_val = shared_updater.atr_val if shared_updater else None
+            if not ptb or not atr_val or atr_val <= 0:
+                _log_skip("no_data", f"  [狙] 狙击线程: {coin} 等待数据(ptb={'✓' if ptb else '✗'} atr={'✓' if atr_val else '✗'})")
                 continue
             tokens = self.token_cache.get(slug)
             if not tokens:
@@ -704,9 +703,21 @@ class MarketTracker:
                 _log_skip("no_price", f"  [狙] 狙击线程: {coin} 无实时价格(Binance=✗ CL=✗)")
                 continue
 
+            # ── 独立贝叶斯：狙击线程自己维护updater，100ms自更新 ──
+            if slug not in self._sniper_updaters:
+                from ai_trader.bayesian_engine import BayesianUpdater
+                self._sniper_updaters[slug] = BayesianUpdater(prior_up=0.5, atr_val=atr_val)
+                logger.info(f"  [狙] 狙击线程: {coin} 创建独立贝叶斯(ATR={atr_val:.2f})")
+            updater = self._sniper_updaters[slug]
+            updater.update(price, ptb)
+
+            if updater.n_updates < 2:
+                _log_skip("low_updates", f"  [狙] 狙击线程: {coin} 独立贝叶斯更新中({updater.n_updates}/2)")
+                continue
+
             # ── 核心计算：gap → ATR偏离 → 方向 ──
             gap = price - ptb
-            diff_atr = abs(gap) / updater.atr_val
+            diff_atr = abs(gap) / atr_val
             if diff_atr < SNIPER_MIN_ATR:
                 _log_skip("atr_low",
                     f"  [狙] 狙击线程: {coin} ATR={diff_atr:.2f}<{SNIPER_MIN_ATR} "
@@ -715,7 +726,7 @@ class MarketTracker:
 
             gap_dir = "UP" if gap > 0 else "DOWN"
 
-            # ── 贝叶斯方向确认 ──
+            # ── 贝叶斯方向确认（独立updater） ──
             signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
             if not signal:
                 _log_skip("no_signal", f"  [狙] 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | 无贝叶斯信号")
@@ -1767,6 +1778,8 @@ class MarketTracker:
                 self.ptb_cache.pop(slug, None)
                 self.positions.pop(slug, None)
                 self.bayesian_updaters.pop(slug, None)
+                self._sniper_updaters.pop(slug, None)
+                self._sniper_last_reason.pop(slug, None)
                 self.token_cache.pop(slug, None)
                 self.skipped_markets.pop(slug, None)
                 self.trade_attempts.pop(slug, None)

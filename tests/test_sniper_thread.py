@@ -133,8 +133,12 @@ class TestSniperScanConditions(unittest.TestCase):
         self.tracker.bayesian_updaters[slug] = FakeUpdater(
             atr_val=atr_val, direction=direction, p_hat=p_hat, confidence=confidence
         )
+        # 预填充独立贝叶斯（跳过import，直接用FakeUpdater）
+        self.tracker._sniper_updaters[slug] = FakeUpdater(
+            atr_val=atr_val, direction=direction, p_hat=p_hat, confidence=confidence
+        )
         self.tracker.token_cache[slug] = ("up_token", "down_token")
-        return market, gap_price  # gap_price = simulated chainlink price
+        return market, gap_price
 
     @patch.dict(os.environ, {
         "SNIPER_MIN_ATR": "0.5", "SNIPER_MAX_PRICE": "0.65",
@@ -350,6 +354,7 @@ class TestSniperThreadSafety(unittest.TestCase):
         self.tracker.tracked[slug] = market
         self.tracker.ptb_cache[slug] = 69612
         self.tracker.bayesian_updaters[slug] = FakeUpdater()
+        self.tracker._sniper_updaters[slug] = FakeUpdater()
         self.tracker.token_cache[slug] = ("up_token", "down_token")
 
         mock_binance = MagicMock()
@@ -387,6 +392,7 @@ class TestSniperThreadSafety(unittest.TestCase):
         self.tracker.tracked[slug] = market
         self.tracker.ptb_cache[slug] = 69612
         self.tracker.bayesian_updaters[slug] = FakeUpdater()
+        self.tracker._sniper_updaters[slug] = FakeUpdater()
         self.tracker.token_cache[slug] = ("up_token", "down_token")
 
         mock_binance = MagicMock()
@@ -436,6 +442,7 @@ class TestSniperPriceFallback(unittest.TestCase):
         self.tracker.tracked[slug] = market
         self.tracker.ptb_cache[slug] = 69612
         self.tracker.bayesian_updaters[slug] = FakeUpdater()
+        self.tracker._sniper_updaters[slug] = FakeUpdater()
         self.tracker.token_cache[slug] = ("up_token", "down_token")
 
         mock_chainlink = MagicMock()
@@ -477,6 +484,7 @@ class TestSniperPriceFallback(unittest.TestCase):
         self.tracker.tracked[slug] = market
         self.tracker.ptb_cache[slug] = 69612
         self.tracker.bayesian_updaters[slug] = FakeUpdater()
+        self.tracker._sniper_updaters[slug] = FakeUpdater()
         self.tracker.token_cache[slug] = ("up_token", "down_token")
 
         mock_chainlink = MagicMock()
@@ -517,6 +525,9 @@ class TestSniperDownDirection(unittest.TestCase):
         self.tracker.tracked[slug] = market
         self.tracker.ptb_cache[slug] = 69612
         self.tracker.bayesian_updaters[slug] = FakeUpdater(
+            direction="DOWN", p_hat=0.75, confidence=0.45
+        )
+        self.tracker._sniper_updaters[slug] = FakeUpdater(
             direction="DOWN", p_hat=0.75, confidence=0.45
         )
         self.tracker.token_cache[slug] = ("up_token", "down_token")
@@ -570,6 +581,7 @@ class TestSniperEnvConfig(unittest.TestCase):
         tracker = bot.MarketTracker()
         self.assertFalse(tracker._sniper_running)
         self.assertIsNone(tracker._sniper_thread)
+        self.assertIsInstance(tracker._sniper_updaters, dict)
         self.assertIsInstance(tracker._sniper_lock, type(threading.Lock()))
         self.assertIsInstance(tracker._sniper_processing, set)
 
