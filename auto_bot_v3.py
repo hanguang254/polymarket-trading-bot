@@ -558,6 +558,11 @@ class MarketTracker:
         self.last_analysis_time = {}  # slug -> 上次入场分析时间戳（早/晚期窗口冷却用）
         self._ptb_pending = {}  # slug -> coin, 待并行获取PTB的市场
         self.restored_slugs = set()
+        # ═══ 独立狙击监听线程状态 ═══
+        self._sniper_running = False
+        self._sniper_thread = None
+        self._sniper_lock = threading.Lock()       # 防止同一slug被主线程和狙击线程同时执行
+        self._sniper_processing = set()            # 狙击线程正在处理的slug
         self._restore_recent_market_state()
 
     def _restore_recent_market_state(self):
@@ -597,7 +602,223 @@ class MarketTracker:
 
         if restored_open or restored_recent:
             logger.info(f"♻️ 启动恢复: open={restored_open} | recent_closed={restored_recent}")
-    
+
+    # ═══════════════════════════════════════════════════════════
+    # 独立狙击监听线程 — 200ms高频轮询，从检测到下单 <500ms
+    # ═══════════════════════════════════════════════════════════
+
+    def start_sniper_thread(self):
+        """启动独立狙击监听线程"""
+        if self._sniper_running:
+            return
+        self._sniper_running = True
+        self._sniper_thread = threading.Thread(
+            target=self._sniper_loop, daemon=True, name="sniper-thread"
+        )
+        self._sniper_thread.start()
+        logger.info("🔫 独立狙击监听线程已启动")
+
+    def stop_sniper_thread(self):
+        """停止狙击线程"""
+        self._sniper_running = False
+
+    def _sniper_loop(self):
+        """狙击线程主循环 — 高频轮询所有活跃市场"""
+        POLL_MS = int(os.environ.get("SNIPER_POLL_MS", "200"))
+        poll_interval = POLL_MS / 1000.0
+
+        while self._sniper_running:
+            try:
+                self._sniper_scan()
+            except Exception as e:
+                logger.debug(f"  🔇 狙击线程异常: {e}")
+            time.sleep(poll_interval)
+
+    def _sniper_scan(self):
+        """单次狙击扫描 — 遍历所有活跃市场检测狙击机会
+
+        读取 Chainlink/Binance WS 内存价格（0ms），
+        计算 gap/ATR → 条件通过则获取CLOB价格 → EV正则直接下单。
+        """
+        from ai_trader.polymarket_rtds import chainlink_stream
+        from ai_trader.binance_api import price_stream as binance_stream
+
+        now = datetime.now(timezone.utc)
+        strategy_cfg = get_strategy_config()
+        SNIPER_MIN_ATR = float(os.environ.get("SNIPER_MIN_ATR", "0.5"))
+        SNIPER_MAX_PRICE = float(os.environ.get("SNIPER_MAX_PRICE", "0.65"))
+        SNIPER_MIN_CONF = float(os.environ.get("SNIPER_MIN_CONF", "0.25"))
+        SNIPER_MIN_EV = float(os.environ.get("SNIPER_MIN_EV", "0.01"))
+        _sniper_early = int(os.environ.get("SNIPER_EARLY", "5"))
+        _sniper_late = strategy_cfg.get("late_bet_end", 220)
+
+        for slug, market in list(self.tracked.items()):
+            # ── 快速跳过：已分析/已持仓/正在狙击中 ──
+            if slug in self.analyzed or slug in self.positions:
+                continue
+            with self._sniper_lock:
+                if slug in self._sniper_processing:
+                    continue
+
+            # ── 必要数据就绪检查 ──
+            ptb = self.ptb_cache.get(slug)
+            updater = self.bayesian_updaters.get(slug)
+            if not ptb or not updater or not updater.atr_val or updater.atr_val <= 0:
+                continue
+            if updater.n_updates < 2:
+                continue
+            tokens = self.token_cache.get(slug)
+            if not tokens:
+                continue
+
+            # ── 时间窗口检查 ──
+            end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
+            start_dt = end_dt - timedelta(minutes=5)
+            elapsed = (now - start_dt).total_seconds()
+            remaining = (end_dt - now).total_seconds()
+            if not (_sniper_early <= elapsed <= _sniper_late):
+                continue
+
+            coin = market["coin"]
+
+            # ── 获取实时价格：Chainlink WS（与结算同源）→ Binance WS fallback ──
+            price = chainlink_stream.get_price(coin)
+            if price is None:
+                price = binance_stream.get_price(coin)
+            if price is None:
+                continue
+
+            # ── 核心计算：gap → ATR偏离 → 方向 ──
+            gap = price - ptb
+            diff_atr = abs(gap) / updater.atr_val
+            if diff_atr < SNIPER_MIN_ATR:
+                continue
+
+            gap_dir = "UP" if gap > 0 else "DOWN"
+
+            # ── 贝叶斯方向确认 ──
+            signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
+            if not signal:
+                continue
+            if signal.get("direction") != gap_dir:
+                continue
+            if signal.get("confidence", 0) < SNIPER_MIN_CONF:
+                continue
+
+            # ── CLOB 执行价获取 ──
+            _t0 = time.time()
+            clob = get_realtime_odds(tokens[0], tokens[1])
+            real_ask = clob.get("up_ask") if gap_dir == "UP" else clob.get("down_ask")
+            _t_ws = time.time()
+
+            if not real_ask or real_ask <= 0.01 or real_ask >= 0.99:
+                continue
+            if real_ask > SNIPER_MAX_PRICE:
+                continue
+
+            # ── EV 计算 ──
+            from ai_analyze_v2 import _random_walk_p_win
+            rw_pw = _random_walk_p_win(abs(gap), updater.atr_val, remaining)
+            P_WIN_SHRINKAGE = float(os.environ.get("P_WIN_SHRINKAGE", "0.80"))
+            p_win = 0.5 + (max(rw_pw, signal["p_hat"]) - 0.5) * P_WIN_SHRINKAGE
+            ev_est = round(p_win - real_ask, 4)
+            _t_calc = time.time()
+
+            if ev_est <= SNIPER_MIN_EV:
+                continue
+
+            # ── 标记正在狙击，防止主线程同时处理 ──
+            with self._sniper_lock:
+                if slug in self.analyzed or slug in self._sniper_processing:
+                    continue
+                self._sniper_processing.add(slug)
+
+            logger.info(
+                f"\n⚡ 狙击线程: {coin} {gap_dir} | "
+                f"gap={gap:.0f} ({diff_atr:.1f}ATR) | CLOB=${real_ask:.2f} | "
+                f"p_win={p_win:.3f} EV={ev_est:+.3f} | "
+                f"Bayesian conf={signal['confidence']:.3f} | "
+                f"耗时: WS={(_t_ws-_t0)*1000:.0f}ms 计算={(_t_calc-_t_ws)*1000:.0f}ms"
+            )
+
+            # ── 持仓检查 + 下单 ──
+            sniper_token = tokens[0] if gap_dir == "UP" else tokens[1]
+            _did_sniper_inc = False
+            global _pending_bets
+            try:
+                with _position_lock:
+                    MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "2"))
+                    open_count = 0
+                    if os.path.exists(POSITIONS_FILE):
+                        try:
+                            with open(POSITIONS_FILE) as _f:
+                                for _line in _f:
+                                    _p = json.loads(_line.strip())
+                                    if not _p.get("closed", False):
+                                        open_count += 1
+                        except Exception:
+                            pass
+                    if open_count + _pending_bets >= MAX_OPEN_POSITIONS:
+                        logger.info(f"  ⚡ 狙击线程放弃: 持仓已满 {open_count}+{_pending_bets}")
+                        continue
+                    else:
+                        _pending_bets += 1
+                        _did_sniper_inc = True
+
+                from ai_analyze_v2 import execute_bet
+                sniper_details = {
+                    "p_win_final": round(p_win, 4),
+                    "expected_value": ev_est,
+                    "diff_in_atr": round(diff_atr, 2),
+                    "atr": round(updater.atr_val, 2),
+                    "estimated_value": round(p_win, 3),
+                    "base_rate": 0.55,
+                    "price_to_beat": ptb,
+                    "opposite_token_id": tokens[1] if gap_dir == "UP" else tokens[0],
+                    "sniper": True,
+                    "sniper_thread": True,
+                }
+                success, entry_price, bet_size, output = execute_bet(
+                    slug, gap_dir, sniper_token,
+                    confidence=signal["confidence"],
+                    ev=ev_est,
+                    p_hat=signal["p_hat"],
+                    entry_details=sniper_details,
+                    kelly_reduction=1.0,
+                    pre_balance=999.0,
+                )
+                _t_done = time.time()
+                total_ms = round((_t_done - _t0) * 1000)
+                ws_ms = round((_t_ws - _t0) * 1000)
+                calc_ms = round((_t_calc - _t_ws) * 1000)
+                fok_ms = round((_t_done - _t_calc) * 1000)
+
+                if success:
+                    logger.info(
+                        f"  ⚡ 狙击线程成交! ${entry_price:.3f}×{bet_size}份 | "
+                        f"总耗时={total_ms}ms (WS={ws_ms}ms 计算={calc_ms}ms FOK={fok_ms}ms)"
+                    )
+                    self.analyzed.add(slug)
+                    cost = round(entry_price * bet_size, 4)
+                    record_bet_cost(slug, cost)
+                    self.positions[slug] = Position(
+                        slug, sniper_token, gap_dir, entry_price, bet_size,
+                        datetime.now(timezone.utc).isoformat()
+                    )
+                    send_notification(coin, gap_dir, signal["confidence"], ev_est,
+                                      entry_price, bet_size, sniper=True)
+                else:
+                    logger.info(
+                        f"  ⚡ 狙击线程未成交: {str(output)[:80]} | "
+                        f"总耗时={total_ms}ms (WS={ws_ms}ms 计算={calc_ms}ms FOK={fok_ms}ms)"
+                    )
+            finally:
+                if _did_sniper_inc:
+                    with _position_lock:
+                        _pending_bets = max(0, _pending_bets - 1)
+                with self._sniper_lock:
+                    self._sniper_processing.discard(slug)
+
     def update_markets(self):
         """更新市场列表"""
         if not circuit_breaker_check():
@@ -754,6 +975,8 @@ class MarketTracker:
                                 logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                             # ═══ v12: 动量狙击 — 检测到大波动时跳过完整分析直接下单 ═══
                             # 从检测到下单 <500ms（vs 正常路径 3-5s），抢在CLOB做市商定价前入场
+                            # 注意：独立狙击线程 (_sniper_scan) 200ms轮询已覆盖此逻辑，
+                            #       这里作为fallback保留，防止线程异常时漏单
                             SNIPER_MIN_ATR = float(os.environ.get("SNIPER_MIN_ATR", "0.5"))   # 0.5起步（日志验证2笔成交都是0.5ATR）
                             SNIPER_MAX_PRICE = float(os.environ.get("SNIPER_MAX_PRICE", "0.65"))  # 0.58→0.65: 放宽入场上限，EV正就进
                             SNIPER_MIN_SAMPLES = 2     # 2个样本够了（gap方向是主信号，贝叶斯只确认）
@@ -762,6 +985,7 @@ class MarketTracker:
                             if (updater and updater.atr_val and updater.atr_val > 0
                                     and slug not in self.analyzed
                                     and slug not in self.positions
+                                    and slug not in self._sniper_processing  # 狙击线程正在处理时跳过
                                     and _sniper_early <= elapsed <= _sniper_late
                                     and len(samples) >= SNIPER_MIN_SAMPLES):
                                 diff_atr = abs(gap) / updater.atr_val
@@ -1550,9 +1774,12 @@ def main():
     poly_ws.start()
 
     tracker = MarketTracker()
+    # 启动独立狙击监听线程（200ms轮询，比主循环3-5s采样快15倍）
+    if os.environ.get("SNIPER_THREAD_ENABLED", "1") == "1":
+        tracker.start_sniper_thread()
     error_count = 0
     max_errors = 100
-    
+
     try:
         while True:
             try:
