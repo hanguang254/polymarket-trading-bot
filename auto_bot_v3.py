@@ -765,16 +765,35 @@ class MarketTracker:
                                 gap_dir = "UP" if gap > 0 else "DOWN"
                                 bayesian_dir = signal.get("direction") if signal else None
                                 bayesian_aligned = bayesian_dir == gap_dir
-                                if diff_atr >= SNIPER_MIN_ATR and bayesian_aligned and signal.get("confidence", 0) >= 0.25:
+                                # 狙击条件检查 + 日志
+                                _sniper_reason = None
+                                if diff_atr < SNIPER_MIN_ATR:
+                                    _sniper_reason = f"ATR={diff_atr:.2f}<{SNIPER_MIN_ATR}"
+                                elif not bayesian_aligned:
+                                    _sniper_reason = f"方向不一致(gap={gap_dir},贝叶斯={bayesian_dir})"
+                                elif signal.get("confidence", 0) < 0.25:
+                                    _sniper_reason = f"conf={signal.get('confidence',0):.0%}<25%"
+
+                                if _sniper_reason:
+                                    # 只在 ATR ≥ 0.3 时打印（过滤纯噪音）
+                                    if diff_atr >= 0.3:
+                                        logger.debug(f"  🔇 狙击跳过: {coin} {gap_dir} | {_sniper_reason} | ATR={diff_atr:.2f}")
+                                else:
                                     sniper_dir = gap_dir
                                     tokens = self.token_cache.get(slug)
-                                    if tokens:
+                                    if not tokens:
+                                        logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} | 无token缓存")
+                                    else:
                                         sniper_token = tokens[0] if sniper_dir == "UP" else tokens[1]
                                         _t0 = time.time()
                                         from ai_trader.polymarket_ws import poly_ws
                                         ws_bid, ws_ask = poly_ws.get_best_bid_ask(sniper_token)
                                         _t_ws = time.time()
-                                        if ws_ask and 0.01 < ws_ask <= SNIPER_MAX_PRICE:
+                                        if not ws_ask or ws_ask <= 0.01:
+                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | WS无ask数据")
+                                        elif ws_ask > SNIPER_MAX_PRICE:
+                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | CLOB=${ws_ask:.2f}>${SNIPER_MAX_PRICE}")
+                                        else:
                                             t_sniper = time.time()
                                             b_conf = signal["confidence"]
                                             b_phat = signal["p_hat"]
