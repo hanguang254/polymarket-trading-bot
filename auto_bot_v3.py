@@ -799,24 +799,46 @@ class MarketTracker:
                                         logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} | 无token缓存")
                                     else:
                                         sniper_token = tokens[0] if sniper_dir == "UP" else tokens[1]
+                                        opposite_token = tokens[1] if sniper_dir == "UP" else tokens[0]
                                         _t0 = time.time()
                                         from ai_trader.polymarket_ws import poly_ws
+
+                                        # ═══ 真实可执行价 = min(本方ask, 1 - 对手方bid) ═══
+                                        # Polymarket CLOB 自动撮合: BUY UP@$0.57 会匹配 DOWN bid≥$0.43
+                                        # 只看本方 ask 会看到 $0.99（没人直接卖），必须算对手方
                                         ws_bid, ws_ask = poly_ws.get_best_bid_ask(sniper_token)
-                                        # WS 无数据时 REST 兜底（~30ms，仍比完整分析快得多）
-                                        if not ws_ask or ws_ask <= 0.01:
+                                        opp_bid, opp_ask = poly_ws.get_best_bid_ask(opposite_token)
+
+                                        # WS 无数据时 REST 兜底
+                                        if (not ws_ask or ws_ask > 0.95) and (not opp_bid):
+                                            try:
+                                                _rest_opp = clob_client.get_orderbook(opposite_token, max_age=2)
+                                                if _rest_opp and _rest_opp.bids:
+                                                    opp_bid = float(_rest_opp.bids[0].price)
+                                            except Exception:
+                                                pass
+                                        if not ws_ask or ws_ask > 0.95:
                                             try:
                                                 _rest_book = clob_client.get_orderbook(sniper_token, max_age=2)
                                                 if _rest_book and _rest_book.asks:
                                                     ws_ask = float(_rest_book.asks[0].price)
-                                                    ws_bid = float(_rest_book.bids[0].price) if _rest_book.bids else None
                                             except Exception:
                                                 pass
+
+                                        # 计算真实可执行价
+                                        real_ask = ws_ask if ws_ask and 0.01 < ws_ask < 0.95 else None
+                                        if opp_bid and opp_bid > 0.01:
+                                            synthetic_ask = round(1.0 - opp_bid, 2)
+                                            if real_ask is None or synthetic_ask < real_ask:
+                                                real_ask = synthetic_ask
+
                                         _t_ws = time.time()
-                                        if not ws_ask or ws_ask <= 0.01:
-                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | WS+REST均无ask数据")
-                                        elif ws_ask > SNIPER_MAX_PRICE:
-                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | CLOB=${ws_ask:.2f}>${SNIPER_MAX_PRICE}")
+                                        if not real_ask or real_ask <= 0.01:
+                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | 无可执行价(ask={ws_ask},opp_bid={opp_bid})")
+                                        elif real_ask > SNIPER_MAX_PRICE:
+                                            logger.info(f"  🔇 狙击跳过: {coin} {sniper_dir} ATR={diff_atr:.2f} | 真实价=${real_ask:.2f}>${SNIPER_MAX_PRICE} (raw_ask=${ws_ask},1-opp_bid={round(1-opp_bid,2) if opp_bid else 'N/A'})")
                                         else:
+                                            ws_ask = real_ask  # 后续用真实价
                                             t_sniper = time.time()
                                             b_conf = signal["confidence"]
                                             b_phat = signal["p_hat"]
