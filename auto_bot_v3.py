@@ -698,17 +698,24 @@ class MarketTracker:
                     except Exception as e:
                         logger.warning(f"\n🔥 预热开始(无贝叶斯): {market['coin']} | {slug} | {e}")
 
-                    # token_ids + WS 已在市场发现时提前获取，这里只补漏
-                    if slug not in self.token_cache:
-                        try:
-                            up_t, down_t = get_token_ids(slug)
-                            if up_t and down_t:
-                                self.token_cache[slug] = (up_t, down_t)
-                                clob_client.precache_tokens([up_t, down_t])
+                    # v12 fix: 预热时强制刷新 token（0秒发现时 Gamma API 可能返回旧 token）
+                    try:
+                        up_t, down_t = get_token_ids(slug)
+                        if up_t and down_t:
+                            old_tokens = self.token_cache.get(slug)
+                            if old_tokens and old_tokens != (up_t, down_t):
+                                logger.info(f"   📡 token 已刷新（0s缓存的是旧市场）")
+                                # 退订旧 token，订阅新 token
+                                from ai_trader.polymarket_ws import poly_ws
+                                poly_ws.unsubscribe(list(old_tokens))
+                                poly_ws.subscribe([up_t, down_t])
+                            elif not old_tokens:
                                 from ai_trader.polymarket_ws import poly_ws
                                 poly_ws.subscribe([up_t, down_t])
-                        except Exception:
-                            pass
+                            self.token_cache[slug] = (up_t, down_t)
+                            clob_client.precache_tokens([up_t, down_t])
+                    except Exception:
+                        pass
 
                 # 按配置间隔采集，有PTB时才做贝叶斯更新
                 ptb_now = self.ptb_cache.get(slug)
