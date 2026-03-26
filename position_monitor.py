@@ -3198,7 +3198,10 @@ def monitor():
                             print(f"    ⚠️ 抄底未成交，方向安全继续持有 | {atr_str} | 剩余{remaining:.0f}s")
                         continue
 
-                    # --- 狙击入场保护期：前N秒EV-Gate不生效，防止CLOB噪音秒杀 ---
+                    # --- v12.7: 狙击动态保护 — 基于ATR偏离衰减而非固定时间 ---
+                    # 旧方案：固定N秒保护期 → 时间到了不管ATR多少都放行 → 噪音止损
+                    # 新方案：只要当前ATR偏离 > 入场ATR的30%，就继续持有（方向没反转）
+                    #         ATR偏离跌破30% 或 token跌>15% 才允许EV止损
                     _is_sniper = pos.get("sniper_thread", False)
                     _entry_age = 999.0
                     if _is_sniper and entry_time:
@@ -3210,10 +3213,39 @@ def monitor():
                         except (ValueError, TypeError):
                             pass
 
-                    if _is_sniper and _entry_age < SNIPER_GRACE_SECONDS and _ev_should_exit:
-                        print(f"  🛡️ 狙击保护期: {_entry_age:.1f}s/{SNIPER_GRACE_SECONDS:.0f}s | EV退出信号已忽略 | edge={_ev_edge:+.3f}")
-                        ev_exit_confirm.pop(attempt_key, None)
-                        continue
+                    if _is_sniper and _ev_should_exit:
+                        _sniper_entry_atr = pos.get("diff_in_atr", 0)
+                        _sniper_atr_floor = float(os.environ.get("SNIPER_ATR_HOLD_RATIO", "0.30"))
+                        _sniper_loss_override = float(os.environ.get("SNIPER_LOSS_OVERRIDE", "0.15"))
+                        # 当前ATR偏离（从EV-Gate获取，或用0）
+                        _current_atr_dev = ev_gate.get("atr_deviation", 0)
+                        # 如果 ev_gate 没有 atr_deviation，从日志里的 atr_str 解析
+                        if _current_atr_dev == 0:
+                            try:
+                                _current_atr_dev = float(atr_str.replace("ATR", ""))
+                            except (ValueError, AttributeError):
+                                _current_atr_dev = 0
+
+                        _token_drop = (price_now - entry_price) / entry_price if entry_price > 0 else 0
+                        _atr_still_valid = (_sniper_entry_atr > 0 and
+                                           _current_atr_dev >= _sniper_entry_atr * _sniper_atr_floor)
+                        _loss_small = _token_drop > -_sniper_loss_override  # drop < 15%
+
+                        # 固定保护期（兜底，防止ATR数据缺失时完全无保护）
+                        _in_grace = _entry_age < SNIPER_GRACE_SECONDS
+
+                        if (_atr_still_valid and _loss_small) or _in_grace:
+                            _reason = ""
+                            if _in_grace:
+                                _reason = f"保护期{_entry_age:.1f}s/{SNIPER_GRACE_SECONDS:.0f}s"
+                            else:
+                                _reason = f"ATR持有({_current_atr_dev:.2f}≥{_sniper_entry_atr*_sniper_atr_floor:.2f})"
+                            print(
+                                f"  🛡️ 狙击保护: {_reason} | "
+                                f"ATR={_current_atr_dev:.2f}/{_sniper_entry_atr:.2f} "
+                                f"跌幅={_token_drop:+.1%} | edge={_ev_edge:+.3f}")
+                            ev_exit_confirm.pop(attempt_key, None)
+                            continue
 
                     # --- EV-Gated 退出 ---
                     if _ev_should_exit:
