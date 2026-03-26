@@ -3226,7 +3226,7 @@ def monitor():
                             except (ValueError, AttributeError):
                                 _current_atr_dev = 0
 
-                        _token_drop = (price_now - entry_price) / entry_price if entry_price > 0 else 0
+                        _token_drop = (current_price - entry_price) / entry_price if entry_price and entry_price > 0 and current_price else 0
                         _atr_still_valid = (_sniper_entry_atr > 0 and
                                            _current_atr_dev >= _sniper_entry_atr * _sniper_atr_floor)
                         _loss_small = _token_drop > -_sniper_loss_override  # drop < 15%
