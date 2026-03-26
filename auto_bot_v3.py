@@ -418,11 +418,20 @@ def get_realtime_odds(up_token, down_token):
     return result
 
 
-def send_notification(coin, direction, confidence, ev, price, size, sniper=False):
+def send_notification(coin, direction, confidence, ev, price, size, sniper=False, sniper_thread=False):
     """发送下注通知（直接发送Telegram）"""
-    title = "Polymarket 动量狙击成交" if sniper else "Polymarket 下注成功"
-    icon = "⚡" if sniper else "🎯"
-    sniper_tag = "\n模式: 动量狙击" if sniper else ""
+    if sniper_thread:
+        title = "Polymarket 狙击线程成交"
+        icon = "🔫"
+        sniper_tag = "\n模式: 狙击线程(独立)"
+    elif sniper:
+        title = "Polymarket 动量狙击成交"
+        icon = "⚡"
+        sniper_tag = "\n模式: 动量狙击(主线程)"
+    else:
+        title = "Polymarket 下注成功"
+        icon = "🎯"
+        sniper_tag = ""
     notify_text = (
         f"{icon} <b>{title}</b>\n\n"
         f"币种: {coin}\n"
@@ -899,7 +908,7 @@ class MarketTracker:
                         datetime.now(timezone.utc).isoformat()
                     )
                     send_notification(coin, gap_dir, signal["confidence"], ev_est,
-                                      entry_price, bet_size, sniper=True)
+                                      entry_price, bet_size, sniper=True, sniper_thread=True)
                 else:
                     logger.info(
                         f"  ⚡ 狙击线程未成交: {str(output)[:80]} | "
@@ -1121,6 +1130,22 @@ class MarketTracker:
                                             real_ask = clob.get("up_ask")
                                         else:
                                             real_ask = clob.get("down_ask")
+
+                                        # v12.7.3: WS→REST价格校正（和狙击线程对齐）
+                                        # WS价格可能严重失真(如$0.53 vs REST$0.73)，必须校正后再做决策
+                                        if real_ask and 0.01 < real_ask < 0.99:
+                                            try:
+                                                from ai_analyze_v2 import _get_execution_quote
+                                                _rest_q = _get_execution_quote(sniper_token, force_fresh=True)
+                                                _rest_ask = _rest_q.get("best_ask") if _rest_q else None
+                                                if _rest_ask and 0.01 < _rest_ask < 0.99:
+                                                    if abs(_rest_ask - real_ask) > 0.03:
+                                                        logger.info(
+                                                            f"  [动量狙击] WS→REST校正: {coin} {sniper_dir} "
+                                                            f"WS=${real_ask:.2f}→REST=${_rest_ask:.2f}")
+                                                        real_ask = _rest_ask
+                                            except Exception:
+                                                pass
 
                                         _t_ws = time.time()
                                         if not real_ask or real_ask <= 0.01 or real_ask >= 0.99:
