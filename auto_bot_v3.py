@@ -748,6 +748,24 @@ class MarketTracker:
             _t0 = time.time()
             clob = get_realtime_odds(tokens[0], tokens[1])
             real_ask = clob.get("up_ask") if gap_dir == "UP" else clob.get("down_ask")
+
+            # v12.6: WS→REST 价格校正 — 防止 WS 陈旧价导致虚假 EV
+            # DOWN token 在 WS 上更新稀疏，经常返回开盘初始价($0.50附近)
+            # 而真实 ask 已涨到 $0.70+，导致 DOWN 永远触发后被 price_cap 拦截
+            if real_ask and 0.01 < real_ask < 0.99:
+                _target_token = tokens[0] if gap_dir == "UP" else tokens[1]
+                try:
+                    from ai_analyze_v2 import _get_execution_quote
+                    _rest_q = _get_execution_quote(_target_token, force_fresh=True)
+                    _rest_ask = _rest_q.get("best_ask") if _rest_q else None
+                    if _rest_ask and 0.01 < _rest_ask < 0.99:
+                        if abs(_rest_ask - real_ask) > 0.03:
+                            logger.info(
+                                f"  [狙] WS→REST校正: {coin} {gap_dir} "
+                                f"WS=${real_ask:.2f}→REST=${_rest_ask:.2f}")
+                            real_ask = _rest_ask
+                except Exception:
+                    pass
             _t_ws = time.time()
 
             if not real_ask or real_ask <= 0.01 or real_ask >= 0.99:
