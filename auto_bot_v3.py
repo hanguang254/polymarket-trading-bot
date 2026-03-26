@@ -566,6 +566,7 @@ class MarketTracker:
         self._sniper_last_reason = {}              # slug -> last_reason, 去重日志用
         self._sniper_updaters = {}                 # slug -> 独立BayesianUpdater（100ms自更新）
         self._sniper_epoch_used = set()            # v12.7: 已狙击的epoch(如"1774490400")，同epoch只狙1次
+        self._sniper_rest_cache = {}               # v12.7.2: token_id -> (ask, ts) REST校正缓存，500ms内不重复请求
         self._restore_recent_market_state()
 
     def _restore_recent_market_state(self):
@@ -627,7 +628,7 @@ class MarketTracker:
 
     def _sniper_loop(self):
         """狙击线程主循环 — 高频轮询所有活跃市场"""
-        POLL_MS = int(os.environ.get("SNIPER_POLL_MS", "100"))
+        POLL_MS = int(os.environ.get("SNIPER_POLL_MS", "50"))  # v12.7.2: 100→50ms
         poll_interval = POLL_MS / 1000.0
 
         while self._sniper_running:
@@ -705,12 +706,15 @@ class MarketTracker:
                     f"  [狙] 狙击线程: {coin} epoch={epoch} 已有{epoch_count}笔狙击，跳过(limit={SNIPER_MAX_PER_EPOCH})")
                 continue
 
-            # ── 获取实时价格：Binance WS（更快）→ Chainlink WS fallback ──
-            price = binance_stream.get_price(coin)
-            _price_src = "Binance"
+            # ── 获取实时价格：Chainlink优先（和结算价一致）→ Binance fallback ──
+            # v12.7.2: Binance vs Chainlink 价差可达 $26(0.5+ATR)，
+            # Binance说涨但Chainlink说跌 → 狙击方向判断错误
+            # 结算用Chainlink，狙击也必须用Chainlink判断方向
+            price = chainlink_stream.get_price(coin)
+            _price_src = "CL"
             if price is None:
-                price = chainlink_stream.get_price(coin)
-                _price_src = "CL"
+                price = binance_stream.get_price(coin)
+                _price_src = "Binance"
             if price is None:
                 _log_skip("no_price", f"  [狙] 狙击线程: {coin} 无实时价格(Binance=✗ CL=✗)")
                 continue
@@ -761,9 +765,7 @@ class MarketTracker:
             clob = get_realtime_odds(tokens[0], tokens[1])
             real_ask = clob.get("up_ask") if gap_dir == "UP" else clob.get("down_ask")
 
-            # v12.6: WS→REST 价格校正 — 防止 WS 陈旧价导致虚假 EV
-            # DOWN token 在 WS 上更新稀疏，经常返回开盘初始价($0.50附近)
-            # 而真实 ask 已涨到 $0.70+，导致 DOWN 永远触发后被 price_cap 拦截
+            # v12.6: WS→REST 价格校正
             if real_ask and 0.01 < real_ask < 0.99:
                 _target_token = tokens[0] if gap_dir == "UP" else tokens[1]
                 try:
@@ -1023,17 +1025,18 @@ class MarketTracker:
                 )
                 if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
                     try:
-                        # v12: 预热采样用 Binance WS（0ms内存读取，比 Chainlink 快 1-5s）
-                        # 入场决策仍用 Chainlink（与结算同源），仅预热用 Binance 抢速度
-                        from ai_trader.binance_api import price_stream as _bn_stream
+                        # v12.7.2: 预热采样改回 Chainlink 优先（和结算同源）
+                        # Binance vs Chainlink 价差可达 $26(0.5+ATR)，
+                        # Binance 训练的贝叶斯方向可能和 Chainlink 结算方向相反
+                        from ai_trader.price_oracle import get_onchain_price
                         coin = market['coin']
-                        price = _bn_stream.get_price(coin)
-                        price_src = "BN"
+                        price, price_src = get_onchain_price(coin, with_source=True)
+                        price_src = price_src or "CL"
                         if not price:
-                            # Binance 无数据时回退 Chainlink（新币种可能 Binance 没有）
-                            from ai_trader.price_oracle import get_onchain_price
-                            price, price_src = get_onchain_price(coin, with_source=True)
-                            price_src = price_src or "CL"
+                            # Chainlink 无数据时回退 Binance
+                            from ai_trader.binance_api import price_stream as _bn_stream
+                            price = _bn_stream.get_price(coin)
+                            price_src = "BN"
                         if price and ptb_now:
                             gap = round(price - ptb_now, 2)
                             samples.append({"price": price, "gap": gap, "ts": time.time()})

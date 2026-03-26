@@ -1,0 +1,86 @@
+{
+  "0x2bab726b39fa039c4535aae2faca18cdc8f0213da8352ba143684aaa56af2cb3": {
+    "slug": "Bitcoin Up or Down - March 25, 11:10PM-11:15PM ET",
+    "value": 0.022586,
+    "size": 0.022586,
+    "tx_hash": "71f678427cdda7c0a900543bda24b351466c7e48ff62971c9627f7b55ad3ce80",
+    "time": "2026-03-26 03:21:16"
+  },
+  "0x682d6fcbdbdd473dd34f4b3627edf49a32913faed90601ccc6f55441825a2fe5": {
+    "slug": "Bitcoin Up or Down - March 25, 11:15PM-11:20PM ET",
+    "value": 0.0,
+    "size": 0.024701,
+    "tx_hash": "18a5c2b4fcf5badd6252f80594b01c0a95461e107bb4904ef38e63ef536445a1",
+    "time": "2026-03-26 03:28:08"
+  },
+  "0xd8012602c0c4c461deab29613d9777f50cdbfdecbc3b8f8a60baeed0e11d3168": {
+    "slug": "Ethereum Up or Down - March 25, 11:55PM-12:00AM ET",
+    "value": 0.008521845,
+    "size": 0.024701,
+    "tx_hash": "1fb4bff4b20efe213ce1f4e43518c8341574f6ed898b4e4c2638c6f9634f7a4a",
+    "time": "2026-03-26 04:03:24"
+  },
+  "0xcfd3e1e95fe6b1632ef176e70f8450f102902d4b04f41dbc9d0f8ed0d043ec3c": {
+    "slug": "Ethereum Up or Down - March 26, 12:05AM-12:10AM ET",
+    "value": 0.0,
+    "size": 0.023306,
+    "tx_hash": "5ca8d9d0e0b0688f0f9f41ae435bfc29eaabcefdc6a804142e002d70f262badf",
+    "time": "2026-03-26 04:16:46"
+  },
+  "0x6f26f469a923063515257e9585cb6dbfb52c6e587004281035ab1c0a5273386c": {
+    "slug": "Ethereum Up or Down - March 26, 12:10AM-12:15AM ET",
+    "value": 2.157946,
+    "size": 2.157946,
+    "tx_hash": "2e88c889a61b490ff45c1d944ce009b10ecc2b0b433e97d593343515435d827c",
+    "time": "2026-03-26 04:23:27"
+  },
+  "0x1e987a3a066fbd2557dcaad4c19868453ad13ff261ed9eb1977644a3024d93b3": {
+    "slug": "Bitcoin Up or Down - March 26, 12:10AM-12:15AM ET",
+    "value": 0.026777,
+    "size": 0.026777,
+    "tx_hash": "0d0dbd7d381c1d8cd2bd43c08cef9902548666b0eb2fb2f0f141dfc7e2d6688e",
+    "time": "2026-03-26 04:23:27"
+  },
+  "0x444211b8e5ecbf85f69dfe577f6e107e158b2b804ba85271296bbd6cd20eed9f": {
+    "slug": "Ethereum Up or Down - March 26, 12:25AM-12:30AM ET",
+    "value": 0.029409,
+    "size": 0.029409,
+    "tx_hash": "f8d02fa255bcfdddd71007ecf57d1fade7082e2addd19b52db82a6dce0826e0d",
+    "time": "2026-03-26 04:36:43"
+  },
+  "0xc52717eee2b0ae5a4a68b81b4711e1e7060ed9a60fd9dda2261926a69cc51004": {
+    "slug": "Bitcoin Up or Down - March 26, 12:25AM-12:30AM ET",
+    "value": 0.020926,
+    "size": 0.020926,
+    "tx_hash": "457a7761ba0dae8255d35e83a8e97099e059585884ebce9061687ec27772e1d6",
+    "time": "2026-03-26 04:36:44"
+  },
+  "0x59c5bc77ce309ac47fe73f42194af33b3fb49a24e22af1e04bed38cdaa1ea443": {
+    "slug": "Bitcoin Up or Down - March 26, 12:35AM-12:40AM ET",
+    "value": 0.016214,
+    "size": 0.0268,
+    "tx_hash": "199d7cbc97f48e2fc690e51e40ca38da2e844475220efe875afda727eab1a89a",
+    "time": "2026-03-26 04:43:29"
+  },
+  "0x09cccf27dda69020e32e2ae678f88d9f4078d79265e7359f8572d3bb967d3ccd": {
+    "slug": "Bitcoin Up or Down - March 26, 12:30AM-12:35AM ET",
+    "value": 0.0,
+    "size": 0.022622,
+    "tx_hash": "f2733d4fee15c0b9c9675e961ede1d7fa7044957075012362b914f873b05a660",
+    "time": "2026-03-26 04:43:30"
+  },
+  "0x60cf746c0814bfa16c87b3f43a1273da3e4aa301b52383470be15b1091910128": {
+    "slug": "Ethereum Up or Down - March 26, 12:35AM-12:40AM ET",
+    "value": 0.01914729,
+    "size": 0.020926,
+    "tx_hash": "ce64279ba70a98130d8efe716972b27b01efa1eb1a419314398674d92a74bd61",
+    "time": "2026-03-26 04:43:30"
+  },
+  "0xd6a4a412beaece3859acb073642fa562b6cf4503565d2e255d62400a4f1d35af": {
+    "slug": "Bitcoin Up or Down - March 26, 12:40AM-12:45AM ET",
+    "value": 0.024658,
+    "size": 0.024658,
+    "tx_hash": "baa153f1a01db9e4e31eb1e4a8bd3c6aecb6d25c26c33d91325c203c12fafafd",
+    "time": "2026-03-26 04:50:16"
+  }
+}
