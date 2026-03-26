@@ -79,6 +79,14 @@ SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))  # 空簿回退滑点（env
 P0_BASE_PROFIT = float(os.environ.get("P0_BASE_PROFIT", str(PROFIT_THRESHOLD)))
 P0_HYPERBOLIC_K = float(os.environ.get("P0_HYPERBOLIC_K", "0.15"))
 
+# v12.8: Trailing Take-Profit 追踪止盈参数
+# 利润达到 P0 阈值后激活追踪，从峰值回撤超过阈值就止盈
+TRAILING_TP_ENABLED = os.environ.get("TRAILING_TP_ENABLED", "1") == "1"
+TRAILING_TP_DRAWDOWN_HIGH = float(os.environ.get("TRAILING_TP_DRAWDOWN_HIGH", "0.30"))   # 利润>30%时回撤30%止盈
+TRAILING_TP_DRAWDOWN_MID = float(os.environ.get("TRAILING_TP_DRAWDOWN_MID", "0.35"))    # 利润>20%时回撤35%止盈
+TRAILING_TP_DRAWDOWN_LOW = float(os.environ.get("TRAILING_TP_DRAWDOWN_LOW", "0.40"))    # 利润>15%时回撤40%止盈
+TRAILING_TP_TIME_TIGHTEN = float(os.environ.get("TRAILING_TP_TIME_TIGHTEN", "0.5"))     # 剩余时间<120s时回撤容忍度×0.5
+
 # ATR 三层止损/抄底决策参数
 PRICE_DROP_TRIGGER = float(os.environ.get("PRICE_DROP_TRIGGER", "0.15"))
 PRICE_DROP_HARD_STOP = float(os.environ.get("PRICE_DROP_HARD_STOP", "0.25"))
@@ -478,11 +486,18 @@ def get_open_positions():
     return positions
 
 def _get_orderbook_bids_asks(token_id):
-    """SDK获取订单簿，返回已规范化的 (bids, asks)"""
+    """获取订单簿 — WS book snapshot 优先，REST 回退
+
+    v12.8: WS 有完整 book snapshot 时直接用（0ms），避免 REST ~300ms。
+    """
+    # WS book snapshot（含完整深度）
+    ws_book = _poly_ws.get_book_snapshot(token_id)
+    if ws_book and ws_book.get("bids") and ws_book.get("asks"):
+        return normalize_orderbook(ws_book["bids"], ws_book["asks"])
+    # REST 回退
     try:
         book = clob_client.get_orderbook(token_id)
         if book and book.bids is not None and book.asks is not None:
-            # OrderSummary有price/size属性，转为dict供normalize_orderbook使用
             raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
             raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
             return normalize_orderbook(raw_bids, raw_asks)
@@ -491,7 +506,10 @@ def _get_orderbook_bids_asks(token_id):
     return [], []
 
 def get_market_price(token_id):
-    """获取当前市场价格 — 多源融合（WS优先 → SDK回退）"""
+    """获取当前市场价格 — 多源融合（WS优先 → SDK回退）
+
+    v12.8: WS 数据新鲜(age<2s)时跳过所有 REST 调用，省 ~300ms。
+    """
     best_bid = None
     best_ask = None
     # 方案0：Polymarket WebSocket 实时推送（0ms延迟）
@@ -504,8 +522,21 @@ def get_market_price(token_id):
                 return round(mid, 4)
         best_bid = ws_bid
         best_ask = ws_ask
+        # WS 有部分数据但不完整，用单边
+        if best_bid and not best_ask:
+            return best_bid
+        if best_ask and not best_bid:
+            return best_ask
     except Exception:
         pass
+    # WS 新鲜但无有效 bid/ask → 跳过慢 REST，直接用 LTP
+    ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
+    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+        ltp = get_last_trade_price(token_id)
+        if ltp:
+            return ltp
+        return best_bid or best_ask
+    # WS 不新鲜，降级 REST
     # 方案1：SDK订单簿
     try:
         bids, asks = _get_orderbook_bids_asks(token_id)
@@ -534,12 +565,22 @@ def get_market_price(token_id):
     return None
 
 def get_best_bid_raw(token_id):
-    """获取原始最佳买价（止损专用，WS优先 → SDK回退）"""
+    """获取原始最佳买价（止损专用，WS优先 → SDK回退）
+
+    v12.8: WS 新鲜时跳过 REST orderbook 调用。
+    """
     # WS 实时推送
     ws_bid = _poly_ws.get_best_bid(token_id)
     if ws_bid is not None and ws_bid > 0.02:
         return ws_bid
-    # SDK REST 回退
+    # WS 新鲜但无 bid → 用 LTP，跳过 REST
+    ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
+    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+        ltp = get_last_trade_price(token_id)
+        if ltp:
+            return ltp
+        return None
+    # WS 不新鲜，SDK REST 回退
     try:
         bids, _ = _get_orderbook_bids_asks(token_id)
         if bids:
@@ -556,12 +597,23 @@ def get_best_bid_raw(token_id):
 
 
 def get_best_bid(token_id):
-    """获取最佳买价（用于卖出，WS优先 → SDK回退）"""
+    """获取最佳买价（用于卖出，WS优先 → SDK回退）
+
+    v12.8: WS 新鲜时跳过 REST orderbook 调用。
+    """
     # WS 实时推送
     ws_bid = _poly_ws.get_best_bid(token_id)
     if ws_bid is not None and ws_bid > 0.02:
         return ws_bid * 0.99
-    # SDK REST 回退
+    # WS 新鲜但无 bid → 用 LTP，跳过 REST
+    ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
+    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+        ltp = get_last_trade_price(token_id)
+        if ltp:
+            fallback = max(round(ltp - SLIPPAGE, 2), 0.01)
+            return fallback
+        return None
+    # WS 不新鲜，SDK REST 回退
     try:
         bids, _ = _get_orderbook_bids_asks(token_id)
         if bids:
@@ -578,12 +630,23 @@ def get_best_bid(token_id):
     return None
 
 def get_best_ask(token_id):
-    """获取最佳卖价（用于买入对冲，WS优先 → SDK回退）"""
+    """获取最佳卖价（用于买入对冲，WS优先 → SDK回退）
+
+    v12.8: WS 新鲜时跳过 REST orderbook 调用。
+    """
     # WS 实时推送
     ws_ask = _poly_ws.get_best_ask(token_id)
     if ws_ask is not None and ws_ask < 0.95:
         return ws_ask
-    # SDK REST 回退
+    # WS 新鲜但无 ask → 用 LTP，跳过 REST
+    ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
+    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+        ltp = get_last_trade_price(token_id)
+        if ltp:
+            fallback = min(round(ltp + SLIPPAGE, 2), 0.99)
+            return fallback
+        return None
+    # WS 不新鲜，SDK REST 回退
     try:
         _, asks = _get_orderbook_bids_asks(token_id)
         if asks:
@@ -1760,6 +1823,35 @@ def compute_p0_profit_threshold(remaining_seconds, base_profit, hyperbolic_k, en
         threshold = min(threshold, max_possible_profit * 0.80)
     return threshold
 
+
+def compute_trailing_drawdown(high_water_mark, remaining_seconds, direction_correct=False, diff_atr=None):
+    """根据峰值利润等级和剩余时间，计算允许的最大回撤比例。
+
+    返回值: 0.0~1.0 之间的回撤比例（从峰值利润回撤多少比例就触发止盈）
+    例: high_water_mark=0.228, 返回0.35 → 利润跌到 0.228*(1-0.35)=0.148 就止盈
+
+    v12.8: Trailing Take-Profit 核心计算
+    """
+    # 根据峰值利润等级选择基础回撤容忍度
+    if high_water_mark >= 0.30:
+        base_drawdown = TRAILING_TP_DRAWDOWN_HIGH  # 30%
+    elif high_water_mark >= 0.20:
+        base_drawdown = TRAILING_TP_DRAWDOWN_MID   # 35%
+    else:
+        base_drawdown = TRAILING_TP_DRAWDOWN_LOW   # 40%
+
+    # 时间衰减：剩余时间越少，回撤容忍度越低（收紧止盈）
+    if remaining_seconds < 120:
+        time_factor = TRAILING_TP_TIME_TIGHTEN + (1.0 - TRAILING_TP_TIME_TIGHTEN) * (remaining_seconds / 120.0)
+        base_drawdown *= time_factor
+
+    # 方向正确 + ATR 强信号时给更多空间（最多放宽 20%）
+    if direction_correct and diff_atr and diff_atr >= 2.0:
+        base_drawdown *= 1.2
+
+    return min(base_drawdown, 0.60)  # 上限 60%，不能太宽松
+
+
 def execute_dip_buy(token_id, original_size, coin, slug, pos):
     """抄底加仓：用FOK在best_ask买入原仓位的DIP_BUY_SIZE_RATIO倍
     返回: (success, bought_size, buy_price) or (False, 0, None)
@@ -2619,6 +2711,8 @@ def monitor():
     oracle_stale_watch_active = {}  # (slug, entry_time) -> 是否已进入快市场领先告警态
     ev_exit_confirm = {}  # (slug, entry_time) -> 连续EV退出确认轮数（EV-Gate用）
     bn_price_history = {}  # (slug, entry_time) -> deque of (ts, price) BN价格快照
+    high_water_mark = {}  # v12.8: (slug, entry_time) -> 持仓期间最高利润率（trailing TP用）
+    trailing_tp_active = {}  # v12.8: (slug, entry_time) -> True if trailing TP已激活
     last_wake_context = {"label": "startup", "detail": None}
     
     while True:
@@ -2649,6 +2743,8 @@ def monitor():
             oracle_stale_watch_active = {k: v for k, v in oracle_stale_watch_active.items() if k in open_keys}
             ev_exit_confirm = {k: v for k, v in ev_exit_confirm.items() if k in open_keys}
             bn_price_history = {k: v for k, v in bn_price_history.items() if k in open_keys}
+            high_water_mark = {k: v for k, v in high_water_mark.items() if k in open_keys}
+            trailing_tp_active = {k: v for k, v in trailing_tp_active.items() if k in open_keys}
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -2680,11 +2776,13 @@ def monitor():
                     clob_client.precache_token(opposite_token)
 
                 # 自动订阅 Polymarket WS（首次见到的 token_id）
+                # v12.8: subscribe + seed_from_rest 确保首轮即有WS数据，不会age=9999
                 if token_id not in _ws_subscribed:
                     sub_ids = [token_id]
                     if opposite_token:
                         sub_ids.append(opposite_token)
                     _poly_ws.subscribe(sub_ids)
+                    _poly_ws.seed_from_rest(sub_ids, clob_client)
                     _ws_subscribed.update(sub_ids)
 
                 # 获取市场剩余时间
@@ -2935,44 +3033,85 @@ def monitor():
                 market_ev = current_price - entry_price if current_price else None
                 ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
 
-                # ═══ P0: 双曲贴现止盈（首次达标+强信号→等$1结算，回调后再达标→立即卖）═══
+                # ═══ P0: 双曲贴现止盈 + v12.8 Trailing Take-Profit ═══
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K, entry_price)
+
+                # v12.8: 持续更新 high_water_mark（无论是否达标都要追踪）
+                prev_hwm = high_water_mark.get(attempt_key, 0)
+                if profit_rate > prev_hwm:
+                    high_water_mark[attempt_key] = profit_rate
+
+                # v12.8: Trailing TP 检测 — 利润曾达标后从峰值回撤触发
+                _trailing_triggered = False
+                if TRAILING_TP_ENABLED and trailing_tp_active.get(attempt_key) and remaining > 30:
+                    hwm = high_water_mark.get(attempt_key, 0)
+                    if hwm > 0:
+                        atr_val_tp = pos.get("atr_val") or get_atr_from_binance(coin)
+                        _, _, diff_atr_tp = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val_tp, entry_price)
+                        max_drawdown = compute_trailing_drawdown(hwm, remaining, direction_correct, diff_atr_tp)
+                        trailing_floor = hwm * (1.0 - max_drawdown)
+                        if profit_rate <= trailing_floor:
+                            print(
+                                f"  [Trailing TP] 触发! 峰值{hwm*100:.1f}% → 当前{profit_rate*100:.1f}% "
+                                f"| 回撤{(1-profit_rate/hwm)*100:.0f}%>{max_drawdown*100:.0f}% "
+                                f"| floor={trailing_floor*100:.1f}% | 剩余{remaining:.0f}s"
+                            )
+                            _trailing_triggered = True
+                        elif int(remaining) % 10 < 2:
+                            print(
+                                f"  [Trailing TP] 追踪中: 峰值{hwm*100:.1f}% 当前{profit_rate*100:.1f}% "
+                                f"| 回撤容忍{max_drawdown*100:.0f}% floor={trailing_floor*100:.1f}% | 剩余{remaining:.0f}s"
+                            )
 
                 # 回调检测：利润跌回阈值以下 + 之前是 FIRST_TOUCH → 标记 PULLED_BACK
                 if profit_rate < profit_threshold and tp_state.get(attempt_key) == "FIRST_TOUCH":
                     tp_state[attempt_key] = "PULLED_BACK"
                     print(f"  [P0] 回调检测: 利润{profit_rate*100:.1f}%跌破阈值{profit_threshold*100:.1f}%，标记PULLED_BACK | 剩余{remaining:.0f}s")
 
-                if profit_rate >= profit_threshold and remaining > 30:
+                # 止盈条件：P0阈值达标 OR Trailing TP 触发
+                _should_attempt_tp = (profit_rate >= profit_threshold and remaining > 30) or _trailing_triggered
+
+                if _should_attempt_tp:
+                    # v12.8: 首次达到P0阈值时激活 trailing TP
+                    if profit_rate >= profit_threshold and not trailing_tp_active.get(attempt_key):
+                        trailing_tp_active[attempt_key] = True
+                        high_water_mark[attempt_key] = max(high_water_mark.get(attempt_key, 0), profit_rate)
+                        print(f"  [Trailing TP] 激活! 利润{profit_rate*100:.1f}%达标 | HWM={high_water_mark[attempt_key]*100:.1f}%")
+
                     # 连续止盈失败3次+方向正确 → 放弃止盈，等$1结算（orderbook无买方）
-                    if tp_fail_count.get(attempt_key, 0) >= 3 and direction_correct:
+                    if tp_fail_count.get(attempt_key, 0) >= 3 and direction_correct and not _trailing_triggered:
                         print(f"  💎 止盈连续失败{tp_fail_count[attempt_key]}次，方向正确等结算 | {ev_label_global} | 剩余{remaining:.0f}s")
                         continue
 
-                    # 判断是否应该跳过本次止盈（首次达标+强信号→等结算）
+                    # 判断是否应该跳过本次止盈（首次达标+强信号→等结算，但 trailing 触发不跳）
                     cur_tp_state = tp_state.get(attempt_key)
                     should_skip_tp = False
 
-                    if cur_tp_state is None:
-                        # 首次达标：检查是否满足跳过条件
-                        atr_val_tp = pos.get("atr_val") or get_atr_from_binance(coin)
-                        _, _, diff_atr_tp = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val_tp, entry_price)
-                        if direction_correct and diff_atr_tp and diff_atr_tp >= 3.0 and remaining > 90:
-                            tp_state[attempt_key] = "FIRST_TOUCH"
-                            atr_str_tp = f"{diff_atr_tp:.1f}ATR" if diff_atr_tp else ""
-                            print(
-                                f"  [P0] 首次达标跳过: {profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% "
-                                f"| 方向✅ {atr_str_tp}≥3.0 | 等$1结算 | 剩余{remaining:.0f}s"
-                            )
+                    if not _trailing_triggered:
+                        if cur_tp_state is None:
+                            atr_val_tp = pos.get("atr_val") or get_atr_from_binance(coin)
+                            _, _, diff_atr_tp = calc_realtime_ev(direction, crypto_price, ptb_price, atr_val_tp, entry_price)
+                            if direction_correct and diff_atr_tp and diff_atr_tp >= 3.0 and remaining > 90:
+                                tp_state[attempt_key] = "FIRST_TOUCH"
+                                atr_str_tp = f"{diff_atr_tp:.1f}ATR" if diff_atr_tp else ""
+                                print(
+                                    f"  [P0] 首次达标跳过(等trailing): {profit_rate*100:.1f}% >= {profit_threshold*100:.1f}% "
+                                    f"| 方向✅ {atr_str_tp}≥3.0 | trailing已激活 | 剩余{remaining:.0f}s"
+                                )
+                                should_skip_tp = True
+                        elif cur_tp_state == "FIRST_TOUCH":
+                            print(f"  [P0] 持续持有(trailing保护): 利润{profit_rate*100:.1f}% | 剩余{remaining:.0f}s")
                             should_skip_tp = True
-                    elif cur_tp_state == "FIRST_TOUCH":
-                        # 还在首次触发区间（没回调过），继续持有
-                        print(f"  [P0] 持续持有: 利润{profit_rate*100:.1f}% | 等回调或结算 | 剩余{remaining:.0f}s")
-                        should_skip_tp = True
 
-                    # PULLED_BACK 或 首次达标但不满足跳过条件 → 执行止盈
+                    # Trailing触发 或 PULLED_BACK 或 无跳过条件 → 执行止盈
                     if not should_skip_tp:
-                        tp_label = "回调后止盈" if cur_tp_state == "PULLED_BACK" else "P0 take-profit"
+                        if _trailing_triggered:
+                            hwm_val = high_water_mark.get(attempt_key, 0)
+                            tp_label = f"Trailing止盈(峰值{hwm_val*100:.0f}%)"
+                        elif cur_tp_state == "PULLED_BACK":
+                            tp_label = "回调后止盈"
+                        else:
+                            tp_label = "P0 take-profit"
 
                         # Executable-price-first: use orderbook depth, fallback to LTP - slippage.
                         exec_price = None
@@ -3961,24 +4100,27 @@ def monitor():
         except Exception as e:
             print(f"❌ 监控错误: {e}")
 
-        # [P2] Chainlink 推送新价格时立刻唤醒，否则最多等 100ms（兜底轮询）
-        wake_info = _chainlink_stream.wait_for_update(timeout=0.1, with_details=True)
-        if wake_info.get("updated"):
-            event = wake_info.get("event") or {}
-            event_coin = event.get("coin") or "?"
-            event_age = _format_age_ms(event.get("age_ms"))
-            last_wake_context = {
-                "label": "chainlink_push",
-                "detail": f"{event_coin}/{event_age}",
-            }
-            print(f"  [P2] Chainlink推送唤醒 | coin={event_coin} | age={event_age} | wait={wake_info.get('wait_ms', 0):.0f}ms")
+        # [P2] v12.8: 双源事件驱动 — Chainlink 或 CLOB orderbook 任一推送即唤醒
+        # 先检查 CLOB WS 是否已有事件（~0ms），再等 Chainlink（最多50ms兜底）
+        _MONITOR_POLL_MS = float(os.environ.get("MONITOR_POLL_MS", "50")) / 1000.0
+        clob_woke = _poly_ws.wait_for_update(timeout=0)  # 非阻塞检查
+        if clob_woke:
+            last_wake_context = {"label": "clob_ws_push", "detail": "orderbook"}
         else:
-            wait_ms = wake_info.get("wait_ms")
-            last_wake_context = {
-                "label": "timeout_poll",
-                "detail": _format_age_ms(wait_ms),
-            }
-            print(f"  [P2] 100ms超时兜底 | wait={wait_ms:.0f}ms")
+            wake_info = _chainlink_stream.wait_for_update(timeout=_MONITOR_POLL_MS, with_details=True)
+            if wake_info.get("updated"):
+                event = wake_info.get("event") or {}
+                event_coin = event.get("coin") or "?"
+                event_age = _format_age_ms(event.get("age_ms"))
+                last_wake_context = {
+                    "label": "chainlink_push",
+                    "detail": f"{event_coin}/{event_age}",
+                }
+            else:
+                last_wake_context = {
+                    "label": "timeout_poll",
+                    "detail": _format_age_ms(wake_info.get("wait_ms")),
+                }
 
 
 def self_notify(pos, sell_price, coin, direction, size, label):

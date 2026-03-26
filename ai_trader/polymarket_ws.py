@@ -7,10 +7,13 @@ Polymarket Market Channel WebSocket — 实时 orderbook / best_bid_ask 推送
 文档: https://docs.polymarket.com/market-data/websocket/market-channel
 """
 import json
+import logging
 import threading
 import time
 
 from ai_trader.ws_ssl import get_websocket_sslopt
+
+logger = logging.getLogger(__name__)
 
 try:
     import websocket
@@ -20,7 +23,7 @@ except ImportError:
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL = 9  # 文档要求每10s发PING，留1s余量
-STALE_THRESHOLD = 15  # 超过15s无更新视为过期（5分钟市场，orderbook变动频繁）
+STALE_THRESHOLD = 15  # 超过15s无更新视为过期
 
 
 class PolymarketOrderbookStream:
@@ -50,6 +53,9 @@ class PolymarketOrderbookStream:
         self._ready = False  # start() 标记就绪，subscribe() 触发连接
         self._reconnect_delay = 2  # 指数退避: 2→4→8→...→30s
         self._connected_at = 0  # 连接建立时间（用于判断是否稳定）
+        self._price_event = threading.Event()  # v12.8: 每次收到 BBA 更新时 set，供狙击线程事件驱动
+        self._msg_count = 0  # v12.8 诊断：WS 收到的消息总数
+        self._last_msg_log = 0  # 上次打印消息计数的时间
 
     def start(self):
         """标记就绪，实际连接延迟到第一次 subscribe() 时建立
@@ -122,10 +128,10 @@ class PolymarketOrderbookStream:
         if isinstance(asset_ids, str):
             asset_ids = [asset_ids]
         for token_id in asset_ids:
-            # 已有新鲜数据则跳过
+            # 已有新鲜数据(< 2s)则跳过（WS推送正常时不浪费REST）
             with self._lock:
                 existing = self._bba.get(token_id)
-            if existing and (time.time() - existing["ts"]) < 5:
+            if existing and (time.time() - existing["ts"]) < 2:
                 continue
             try:
                 book = clob_client.get_orderbook(token_id)
@@ -142,7 +148,7 @@ class PolymarketOrderbookStream:
                 if bb <= 0 or ba <= 0 or bb >= ba:
                     continue
                 with self._lock:
-                    # 只在 WS 还没推送时写入（避免覆盖更新鲜的 WS 数据）
+                    # v12.8: 放宽写入条件 — WS 不推送时 seed 是唯一数据源
                     fresh = self._bba.get(token_id)
                     if not fresh or (time.time() - fresh["ts"]) >= 2:
                         self._bba[token_id] = {
@@ -158,6 +164,16 @@ class PolymarketOrderbookStream:
                         }
             except Exception:
                 pass
+
+    # ── 事件驱动接口 ──
+
+    def wait_for_update(self, timeout=0.05):
+        """阻塞等待 WS 推送新的 BBA 更新，或到 timeout 秒后返回。
+        返回 True 表示收到新数据（age ~0ms），False 表示超时（兜底轮询）。
+        狙击线程用这个替代固定 sleep，实现事件驱动扫描。"""
+        updated = self._price_event.wait(timeout=timeout)
+        self._price_event.clear()
+        return updated
 
     # ── 数据读取（零延迟） ──
 
@@ -256,9 +272,9 @@ class PolymarketOrderbookStream:
         # 连接成功，重置退避延迟
         self._reconnect_delay = 2
         print("  ✅ Polymarket WS 已连接 (实时orderbook)")
-        # 发送初始订阅
+        # 发送初始订阅（连接时用 type=market + initial_dump）
         if self._subscribed_ids:
-            self._send_subscribe(list(self._subscribed_ids))
+            self._send_subscribe(list(self._subscribed_ids), initial=True)
         # 启动 PING 心跳线程
         if self._ping_thread is None or not self._ping_thread.is_alive():
             self._ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
@@ -273,18 +289,35 @@ class PolymarketOrderbookStream:
                 break
             time.sleep(PING_INTERVAL)
 
-    def _send_subscribe(self, asset_ids):
-        """发送订阅消息"""
+    def _send_subscribe(self, asset_ids, initial=False):
+        """发送订阅消息
+
+        v12.8: 区分初始订阅（on_open）和动态追加（已连接后）
+        初始: {"type": "market", "initial_dump": true} — 获取完整快照
+        动态: {"assets_ids": [...], "operation": "subscribe"} — 追加订阅
+        """
         try:
-            msg = json.dumps({
-                "assets_ids": asset_ids,
-                "type": "market",
-                "custom_feature_enabled": True,
-            })
+            if initial:
+                # 连接建立时的初始订阅
+                msg = json.dumps({
+                    "assets_ids": asset_ids,
+                    "type": "market",
+                    "initial_dump": True,
+                    "custom_feature_enabled": True,
+                })
+            else:
+                # 动态追加订阅（已连接状态）
+                msg = json.dumps({
+                    "assets_ids": asset_ids,
+                    "operation": "subscribe",
+                    "custom_feature_enabled": True,
+                })
             self._ws.send(msg)
-            print(f"  📡 Polymarket WS 订阅 {len(asset_ids)} 个 asset")
+            id_preview = [aid[:12] + ".." for aid in asset_ids[:4]]
+            mode = "initial" if initial else "dynamic"
+            logger.info(f"  📡 Polymarket WS 订阅({mode}) {len(asset_ids)} 个 asset: {id_preview}")
         except Exception as e:
-            print(f"  ⚠️ Polymarket WS 订阅失败: {e}")
+            logger.warning(f"  ⚠️ Polymarket WS 订阅失败: {e}")
 
     def _on_message(self, ws, message):
         if message == "PONG":
@@ -296,6 +329,17 @@ class PolymarketOrderbookStream:
 
         # 可能是单条或数组
         events = data if isinstance(data, list) else [data]
+
+        # v12.8 诊断：每10秒打印一次WS消息统计，确认连接是否活跃
+        self._msg_count += len(events)
+        now_t = time.time()
+        if now_t - self._last_msg_log >= 10:
+            bba_keys = list(self._bba.keys())
+            bba_preview = [k[:12] + ".." for k in bba_keys]
+            sub_preview = [k[:12] + ".." for k in list(self._subscribed_ids)[:8]]
+            logger.info(f"  [WS诊断] 总消息={self._msg_count} | _bba={len(bba_keys)}个 {bba_preview} | _sub={len(self._subscribed_ids)}个 {sub_preview}")
+            self._last_msg_log = now_t
+
         for event in events:
             event_type = event.get("event_type", "")
             if event_type == "best_bid_ask":
@@ -320,6 +364,7 @@ class PolymarketOrderbookStream:
                 "spread": _safe_float(event.get("spread")),
                 "ts": time.time(),
             }
+        self._price_event.set()
 
     def _handle_book(self, event):
         asset_id = event.get("asset_id", "")
@@ -346,10 +391,12 @@ class PolymarketOrderbookStream:
                     "spread": round(ba - bb, 4) if bb and ba else None,
                     "ts": time.time(),
                 }
+        self._price_event.set()
 
     def _handle_price_change(self, event):
         """price_change 事件包含 best_bid/best_ask 增量更新"""
         changes = event.get("price_changes", [])
+        _signaled = False
         for change in changes:
             asset_id = change.get("asset_id", "")
             if not asset_id:
@@ -365,6 +412,9 @@ class PolymarketOrderbookStream:
                         "spread": None,
                         "ts": time.time(),
                     }
+                _signaled = True
+        if _signaled:
+            self._price_event.set()
 
     def _handle_last_trade(self, event):
         # 暂不使用，预留扩展

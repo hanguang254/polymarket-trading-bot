@@ -390,7 +390,16 @@ def get_realtime_odds(up_token, down_token):
                 result[f"{prefix}_mid"] = round((ws_bid + ws_ask) / 2, 4)
             continue
 
-        # WS 无数据，回退 REST
+        # WS 无数据，回退 REST（initial_dump修复后应很少触发）
+        # v12.8 诊断：打印查询key vs _bba实际key，排查不匹配
+        _bba_keys = list(poly_ws._bba.keys())
+        _query_key = token_id
+        _match = token_id in poly_ws._bba
+        logger.info(
+            f"  ⚠️ get_realtime_odds: {label} WS无BBA，降级REST | "
+            f"query={_query_key[:16]}.. match={_match} | "
+            f"bba_keys={[k[:16]+'..' for k in _bba_keys[:4]]}"
+        )
         try:
             book = clob_client.get_orderbook(token_id)
             if book:
@@ -636,16 +645,24 @@ class MarketTracker:
         self._sniper_running = False
 
     def _sniper_loop(self):
-        """狙击线程主循环 — 高频轮询所有活跃市场"""
-        POLL_MS = int(os.environ.get("SNIPER_POLL_MS", "50"))  # v12.7.2: 100→50ms
+        """狙击线程主循环 — 事件驱动 + 兜底轮询
+
+        v12.8: 优先等待 WS 推送事件(~0ms age)，超时后兜底轮询(50ms)。
+        WS 活跃时 age < 1ms，比固定 sleep(50ms) 快 50 倍。
+        """
+        from ai_trader.polymarket_ws import poly_ws
+        POLL_MS = int(os.environ.get("SNIPER_POLL_MS", "50"))  # 兜底轮询间隔
         poll_interval = POLL_MS / 1000.0
 
         while self._sniper_running:
             try:
+                # 事件驱动：等 WS 推送，最多等 poll_interval 毫秒
+                # 收到推送 → 立即扫描(age ~0ms)  超时 → 兜底扫描
+                poly_ws.wait_for_update(timeout=poll_interval)
                 self._sniper_scan()
             except Exception as e:
                 logger.debug(f"  🔇 狙击线程异常: {e}")
-            time.sleep(poll_interval)
+                time.sleep(poll_interval)
 
     def _sniper_scan(self):
         """单次狙击扫描 — 遍历所有活跃市场检测狙击机会
@@ -665,8 +682,7 @@ class MarketTracker:
         SNIPER_P_WIN_SHRINKAGE = float(os.environ.get("SNIPER_P_WIN_SHRINKAGE", "0.60"))  # v12.7: 独立shrinkage(实盘p_win高估27pp)
         SNIPER_MIN_UPDATES = int(os.environ.get("SNIPER_MIN_UPDATES", "4"))     # v12.7: 2→4 多观察200ms减噪
         SNIPER_MAX_PER_EPOCH = int(os.environ.get("SNIPER_MAX_PER_EPOCH", "1")) # v12.7: 同epoch最多狙击N个市场
-        _sniper_early = int(os.environ.get("SNIPER_EARLY", "5"))
-        _sniper_late = strategy_cfg.get("late_bet_end", 220)
+        _sniper_end_buffer = int(os.environ.get("SNIPER_END_BUFFER", "5"))   # v12.8: 结束前N秒停止狙击
 
         for slug, market in list(self.tracked.items()):
             # ── 快速跳过：已分析/已持仓/正在狙击中 ──
@@ -695,16 +711,36 @@ class MarketTracker:
                 continue
             tokens = self.token_cache.get(slug)
             if not tokens:
+                # v12.8: 狙击线程主动获取token，不等预热
+                try:
+                    up_t, down_t = get_token_ids(slug)
+                    if up_t and down_t:
+                        self.token_cache[slug] = (up_t, down_t)
+                        tokens = (up_t, down_t)
+                        logger.info(f"  [狙] 狙击线程主动获取token: {coin} {up_t[:12]}../{down_t[:12]}..")
+                except Exception:
+                    pass
+            if not tokens:
                 _log_skip("no_token", f"  [狙] 狙击线程: {coin} 无token缓存")
                 continue
 
+            # v12.8: 确保两个 token 在 WS _bba 中有数据
+            from ai_trader.polymarket_ws import poly_ws
+            _has_up = poly_ws._bba.get(tokens[0]) is not None
+            _has_down = poly_ws._bba.get(tokens[1]) is not None
+            if not _has_up or not _has_down:
+                poly_ws.subscribe(list(tokens))
+                poly_ws.seed_from_rest(list(tokens), clob_client)
+
             # ── 时间窗口检查 ──
+            # v12.8: PTB就绪即可开始狙击，到结束前_sniper_end_buffer秒停止
             end_dt = datetime.fromisoformat(market["end_time"].replace("Z", "+00:00"))
-            start_dt = end_dt - timedelta(minutes=5)
-            elapsed = (now - start_dt).total_seconds()
             remaining = (end_dt - now).total_seconds()
-            if not (_sniper_early <= elapsed <= _sniper_late):
-                _log_skip("time_window", f"  [狙] 狙击线程: {coin} 不在时间窗口(elapsed={elapsed:.0f}s, 需{_sniper_early}-{_sniper_late}s)")
+            if remaining <= _sniper_end_buffer:
+                _log_skip("time_late", f"  [狙] 狙击线程: {coin} 即将结束(remaining={remaining:.0f}s<{_sniper_end_buffer}s)")
+                continue
+            if remaining > 300:
+                # 还没进入5分钟窗口
                 continue
 
             # ── v12.7: 同epoch去重 — BTC/ETH同一5分钟高度相关，只狙1个 ──
@@ -774,21 +810,32 @@ class MarketTracker:
             clob = get_realtime_odds(tokens[0], tokens[1])
             real_ask = clob.get("up_ask") if gap_dir == "UP" else clob.get("down_ask")
 
-            # v12.6: WS→REST 价格校正
+            # v12.6→v12.8: WS→REST 价格校正 — 仅在 WS 数据不新鲜时触发
+            # WS age < 2s 时直接信任（WS 比 REST 更实时），省 ~300ms HTTP
             if real_ask and 0.01 < real_ask < 0.99:
                 _target_token = tokens[0] if gap_dir == "UP" else tokens[1]
-                try:
-                    from ai_analyze_v2 import _get_execution_quote
-                    _rest_q = _get_execution_quote(_target_token, force_fresh=True)
-                    _rest_ask = _rest_q.get("best_ask") if _rest_q else None
-                    if _rest_ask and 0.01 < _rest_ask < 0.99:
-                        if abs(_rest_ask - real_ask) > 0.03:
-                            logger.info(
-                                f"  [狙] WS→REST校正: {coin} {gap_dir} "
-                                f"WS=${real_ask:.2f}→REST=${_rest_ask:.2f}")
-                            real_ask = _rest_ask
-                except Exception:
-                    pass
+                from ai_trader.polymarket_ws import poly_ws
+                _ws_snap = poly_ws.get_best_bid_ask_snapshot(_target_token)
+                _ws_age_ms = _ws_snap.get("age_ms", 9999) if _ws_snap else 9999
+                _WS_FRESH_MS = float(os.environ.get("SNIPER_WS_FRESH_MS", "50"))
+                if _ws_age_ms >= _WS_FRESH_MS:
+                    # WS 数据超过阈值(默认50ms)不新鲜，降级 REST 校正
+                    try:
+                        from ai_analyze_v2 import _get_execution_quote
+                        _rest_q = _get_execution_quote(_target_token, force_fresh=True)
+                        _rest_ask = _rest_q.get("best_ask") if _rest_q else None
+                        if _rest_ask and 0.01 < _rest_ask < 0.99:
+                            if abs(_rest_ask - real_ask) > 0.03:
+                                logger.info(
+                                    f"  [狙] WS→REST校正: {coin} {gap_dir} "
+                                    f"WS=${real_ask:.2f}→REST=${_rest_ask:.2f} (WS age={_ws_age_ms:.0f}ms)")
+                                real_ask = _rest_ask
+                    except Exception:
+                        pass
+                else:
+                    logger.debug(
+                        f"  [狙] WS新鲜跳过REST校正: {coin} {gap_dir} "
+                        f"ask=${real_ask:.2f} age={_ws_age_ms:.0f}ms")
             _t_ws = time.time()
 
             if not real_ask or real_ask <= 0.01 or real_ask >= 0.99:
@@ -1083,13 +1130,13 @@ class MarketTracker:
                             SNIPER_MIN_ATR = float(os.environ.get("SNIPER_MIN_ATR", "0.5"))   # 0.5起步（日志验证2笔成交都是0.5ATR）
                             SNIPER_MAX_PRICE = float(os.environ.get("SNIPER_MAX_PRICE", "0.65"))  # 0.58→0.65: 放宽入场上限，EV正就进
                             SNIPER_MIN_SAMPLES = 2     # 2个样本够了（gap方向是主信号，贝叶斯只确认）
-                            _sniper_early = int(os.environ.get("SNIPER_EARLY", "5"))  # 5s起步（抢在做市商定价前）
-                            _sniper_late = strategy_cfg.get("late_bet_end", 220)
+                            _sniper_end_buf = int(os.environ.get("SNIPER_END_BUFFER", "5"))
                             if (updater and updater.atr_val and updater.atr_val > 0
                                     and slug not in self.analyzed
                                     and slug not in self.positions
                                     and slug not in self._sniper_processing  # 狙击线程正在处理时跳过
-                                    and _sniper_early <= elapsed <= _sniper_late
+                                    and remaining > _sniper_end_buf  # v12.8: 结束前N秒停止
+                                    and ptb_now is not None  # PTB就绪才狙击
                                     and len(samples) >= SNIPER_MIN_SAMPLES):
                                 diff_atr = abs(gap) / updater.atr_val
                                 # 方向: 以 gap 为准（price > PTB → UP, price < PTB → DOWN）
@@ -1131,21 +1178,24 @@ class MarketTracker:
                                         else:
                                             real_ask = clob.get("down_ask")
 
-                                        # v12.7.3: WS→REST价格校正（和狙击线程对齐）
-                                        # WS价格可能严重失真(如$0.53 vs REST$0.73)，必须校正后再做决策
+                                        # v12.8: WS→REST价格校正 — 仅在 WS 数据不新鲜时触发
                                         if real_ask and 0.01 < real_ask < 0.99:
-                                            try:
-                                                from ai_analyze_v2 import _get_execution_quote
-                                                _rest_q = _get_execution_quote(sniper_token, force_fresh=True)
-                                                _rest_ask = _rest_q.get("best_ask") if _rest_q else None
-                                                if _rest_ask and 0.01 < _rest_ask < 0.99:
-                                                    if abs(_rest_ask - real_ask) > 0.03:
-                                                        logger.info(
-                                                            f"  [动量狙击] WS→REST校正: {coin} {sniper_dir} "
-                                                            f"WS=${real_ask:.2f}→REST=${_rest_ask:.2f}")
-                                                        real_ask = _rest_ask
-                                            except Exception:
-                                                pass
+                                            _ws_snap = poly_ws.get_best_bid_ask_snapshot(sniper_token)
+                                            _ws_age_ms = _ws_snap.get("age_ms", 9999) if _ws_snap else 9999
+                                            _WS_FRESH = float(os.environ.get("SNIPER_WS_FRESH_MS", "50"))
+                                            if _ws_age_ms >= _WS_FRESH:
+                                                try:
+                                                    from ai_analyze_v2 import _get_execution_quote
+                                                    _rest_q = _get_execution_quote(sniper_token, force_fresh=True)
+                                                    _rest_ask = _rest_q.get("best_ask") if _rest_q else None
+                                                    if _rest_ask and 0.01 < _rest_ask < 0.99:
+                                                        if abs(_rest_ask - real_ask) > 0.03:
+                                                            logger.info(
+                                                                f"  [动量狙击] WS→REST校正: {coin} {sniper_dir} "
+                                                                f"WS=${real_ask:.2f}→REST=${_rest_ask:.2f} (age={_ws_age_ms:.0f}ms)")
+                                                            real_ask = _rest_ask
+                                                except Exception:
+                                                    pass
 
                                         _t_ws = time.time()
                                         if not real_ask or real_ask <= 0.01 or real_ask >= 0.99:
