@@ -23,7 +23,7 @@ except ImportError:
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL = 9  # 文档要求每10s发PING，留1s余量
-STALE_THRESHOLD = 15  # 超过15s无更新视为过期
+STALE_THRESHOLD = 1  # v12.8: 1s过期，WS不推送时快速降级REST拿最新价
 
 
 class PolymarketOrderbookStream:
