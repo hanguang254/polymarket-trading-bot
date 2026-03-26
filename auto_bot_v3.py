@@ -565,6 +565,7 @@ class MarketTracker:
         self._sniper_processing = set()            # 狙击线程正在处理的slug
         self._sniper_last_reason = {}              # slug -> last_reason, 去重日志用
         self._sniper_updaters = {}                 # slug -> 独立BayesianUpdater（100ms自更新）
+        self._sniper_epoch_used = set()            # v12.7: 已狙击的epoch(如"1774490400")，同epoch只狙1次
         self._restore_recent_market_state()
 
     def _restore_recent_market_state(self):
@@ -650,7 +651,10 @@ class MarketTracker:
         SNIPER_MIN_ATR = float(os.environ.get("SNIPER_MIN_ATR", "0.5"))
         SNIPER_MAX_PRICE = float(os.environ.get("SNIPER_MAX_PRICE", "0.65"))
         SNIPER_MIN_CONF = float(os.environ.get("SNIPER_MIN_CONF", "0.25"))
-        SNIPER_MIN_EV = float(os.environ.get("SNIPER_MIN_EV", "0.01"))
+        SNIPER_MIN_EV = float(os.environ.get("SNIPER_MIN_EV", "0.05"))          # v12.7: 0.01→0.05 配合费用扣除
+        SNIPER_P_WIN_SHRINKAGE = float(os.environ.get("SNIPER_P_WIN_SHRINKAGE", "0.60"))  # v12.7: 独立shrinkage(实盘p_win高估27pp)
+        SNIPER_MIN_UPDATES = int(os.environ.get("SNIPER_MIN_UPDATES", "4"))     # v12.7: 2→4 多观察200ms减噪
+        SNIPER_MAX_PER_EPOCH = int(os.environ.get("SNIPER_MAX_PER_EPOCH", "1")) # v12.7: 同epoch最多狙击N个市场
         _sniper_early = int(os.environ.get("SNIPER_EARLY", "5"))
         _sniper_late = strategy_cfg.get("late_bet_end", 220)
 
@@ -693,6 +697,14 @@ class MarketTracker:
                 _log_skip("time_window", f"  [狙] 狙击线程: {coin} 不在时间窗口(elapsed={elapsed:.0f}s, 需{_sniper_early}-{_sniper_late}s)")
                 continue
 
+            # ── v12.7: 同epoch去重 — BTC/ETH同一5分钟高度相关，只狙1个 ──
+            epoch = slug.rsplit("-", 1)[-1] if "-" in slug else slug  # e.g. "1774490400"
+            epoch_count = sum(1 for e in self._sniper_epoch_used if e == epoch)
+            if epoch_count >= SNIPER_MAX_PER_EPOCH:
+                _log_skip("epoch_limit",
+                    f"  [狙] 狙击线程: {coin} epoch={epoch} 已有{epoch_count}笔狙击，跳过(limit={SNIPER_MAX_PER_EPOCH})")
+                continue
+
             # ── 获取实时价格：Binance WS（更快）→ Chainlink WS fallback ──
             price = binance_stream.get_price(coin)
             _price_src = "Binance"
@@ -711,8 +723,8 @@ class MarketTracker:
             updater = self._sniper_updaters[slug]
             updater.update(price, ptb)
 
-            if updater.n_updates < 2:
-                _log_skip("low_updates", f"  [狙] 狙击线程: {coin} 独立贝叶斯更新中({updater.n_updates}/2)")
+            if updater.n_updates < SNIPER_MIN_UPDATES:
+                _log_skip("low_updates", f"  [狙] 狙击线程: {coin} 独立贝叶斯更新中({updater.n_updates}/{SNIPER_MIN_UPDATES})")
                 continue
 
             # ── 核心计算：gap → ATR偏离 → 方向 ──
@@ -779,18 +791,27 @@ class MarketTracker:
                     f"价格过高 ${real_ask:.2f}>${SNIPER_MAX_PRICE}")
                 continue
 
-            # ── EV 计算 ──
+            # ── EV 计算（v12.7: 独立shrinkage + 扣除手续费/spread） ──
             from ai_analyze_v2 import _random_walk_p_win
             rw_pw = _random_walk_p_win(abs(gap), updater.atr_val, remaining)
-            P_WIN_SHRINKAGE = float(os.environ.get("P_WIN_SHRINKAGE", "0.80"))
-            p_win = 0.5 + (max(rw_pw, signal["p_hat"]) - 0.5) * P_WIN_SHRINKAGE
-            ev_est = round(p_win - real_ask, 4)
+            p_win = 0.5 + (max(rw_pw, signal["p_hat"]) - 0.5) * SNIPER_P_WIN_SHRINKAGE
+            # 扣除隐含成本（和正常流程对齐）
+            try:
+                from ai_trader.fees import effective_fee_rate
+                _fee_rate = effective_fee_rate(real_ask, 1000)
+                _entry_fee = real_ask / max(1.0 - _fee_rate, 1e-9) - real_ask
+                _spread_cost = 0.04 * 0.3  # 估算spread×提前退出概率
+                _exit_fee = (real_ask - 0.04) * effective_fee_rate(max(real_ask - 0.04, 0.01), 1000) * 0.3
+                _total_cost = _entry_fee + _spread_cost + _exit_fee
+            except Exception:
+                _total_cost = 0.016  # fallback: 典型值
+            ev_est = round(p_win - real_ask - _total_cost, 4)
             _t_calc = time.time()
 
             if ev_est <= SNIPER_MIN_EV:
                 _log_skip("ev_low",
                     f"  [狙] 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
-                    f"EV不足 {ev_est:+.4f}<={SNIPER_MIN_EV} | CLOB=${real_ask:.2f} p_win={p_win:.3f}")
+                    f"EV不足 {ev_est:+.4f}<={SNIPER_MIN_EV} | CLOB=${real_ask:.2f} p_win={p_win:.3f} cost={_total_cost:.3f}")
                 continue
 
             # 条件全通过，清除跳过记录
@@ -868,6 +889,7 @@ class MarketTracker:
                         f"总耗时={total_ms}ms (WS={ws_ms}ms 计算={calc_ms}ms FOK={fok_ms}ms)"
                     )
                     self.analyzed.add(slug)
+                    self._sniper_epoch_used.add(epoch)  # v12.7: 记录epoch防重复
                     cost = round(entry_price * bet_size, 4)
                     record_bet_cost(slug, cost)
                     self.positions[slug] = Position(
