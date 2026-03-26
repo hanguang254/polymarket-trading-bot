@@ -90,6 +90,8 @@ TRAILING_TP_TIME_TIGHTEN = float(os.environ.get("TRAILING_TP_TIME_TIGHTEN", "0.5
 # ATR 三层止损/抄底决策参数
 PRICE_DROP_TRIGGER = float(os.environ.get("PRICE_DROP_TRIGGER", "0.15"))
 PRICE_DROP_HARD_STOP = float(os.environ.get("PRICE_DROP_HARD_STOP", "0.25"))
+# v12.8: 无条件绝对硬止损 — 不看方向、不看EV、不看ATR，跌到就走
+ABSOLUTE_HARD_STOP = float(os.environ.get("ABSOLUTE_HARD_STOP", "0.40"))
 ATR_SAFE_THRESHOLD = float(os.environ.get("ATR_SAFE_THRESHOLD", "2.0"))
 ATR_DANGER_THRESHOLD = float(os.environ.get("ATR_DANGER_THRESHOLD", "1.0"))
 DIP_BUY_SIZE_RATIO = float(os.environ.get("DIP_BUY_SIZE_RATIO", "0.50"))
@@ -2684,7 +2686,7 @@ def monitor():
     _ws_subscribed = set()  # 已订阅的 token_ids
     _src_label = "Chainlink优先" if PRICE_SOURCE == 1 else "Pyth优先"
     print(f"🔍 持仓监控 v9.8 启动（ATR三层决策 + {_src_label}止损优化 + Proximity衰减streak + 尾盘Oracle确认）...")
-    print("   Exit Protocol: P0双曲止盈 | ATR衰减止损 | ATR加速下降 | -25%硬止损 | 方向翻转 | ATR≥2抄底 | ATR<1止损 | 尾盘Oracle状态机")
+    print(f"   Exit Protocol: P0双曲止盈+TrailingTP | 绝对硬止损-{ABSOLUTE_HARD_STOP*100:.0f}% | ATR衰减止损 | -{PRICE_DROP_HARD_STOP*100:.0f}%硬止损 | 方向翻转 | ATR≥2抄底 | ATR<1止损 | 尾盘Oracle状态机")
     print(f"   参数: 触发线-{PRICE_DROP_TRIGGER*100:.0f}% | 硬止损-{PRICE_DROP_HARD_STOP*100:.0f}% | ATR安全≥{ATR_SAFE_THRESHOLD} | ATR危险<{ATR_DANGER_THRESHOLD}")
     print(f"   Proximity Buffer: {PTB_PROXIMITY_ATR}ATR | 极端安全阀-{PTB_PROXIMITY_EXTREME_STOP*100:.0f}%(时间衰减) | streak衰减+8轮滑动窗口")
     if ENABLE_ORACLE_STALE_WATCH:
@@ -3032,6 +3034,27 @@ def monitor():
                 # 这是最直接最准确的EV，不依赖理论模型
                 market_ev = current_price - entry_price if current_price else None
                 ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
+
+                # ═══ v12.8: 绝对硬止损 — 不看方向/EV/ATR，跌到就走 ═══
+                if profit_rate <= -ABSOLUTE_HARD_STOP and remaining > 10:
+                    print(
+                        f"  💀 绝对硬止损: {profit_rate*100:+.1f}% 超过-{ABSOLUTE_HARD_STOP*100:.0f}% | "
+                        f"方向{'✅' if direction_correct else '❌'} | {ev_label_global} | 剩余{remaining:.0f}s"
+                    )
+                    attempted_stop_loss = True
+                    cancel_all_orders(token_id)
+                    ok, actual_price = market_sell_immediate(token_id, size, position=pos)
+                    if actual_price == "NO_BALANCE":
+                        print(f"  ⚠️ 绝对硬止损: 余额为零，等结算")
+                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, f"绝对硬止损(-{ABSOLUTE_HARD_STOP*100:.0f}%)(余额已清)")
+                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                        continue
+                    if ok:
+                        sold = True
+                        sold_price = actual_price
+                        self_notify(pos, sold_price, coin, direction, size, f"绝对硬止损(-{ABSOLUTE_HARD_STOP*100:.0f}%)")
+                        close_position(pos, sold_price)
+                        continue
 
                 # ═══ P0: 双曲贴现止盈 + v12.8 Trailing Take-Profit ═══
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K, entry_price)
