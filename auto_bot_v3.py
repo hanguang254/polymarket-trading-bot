@@ -708,8 +708,48 @@ class MarketTracker:
                 cost = round(entry_price * filled_size, 4)
                 _dir = ambush["direction"]
                 _opp = ambush["opposite_token"]
-                _entry_ts = datetime.now(timezone.utc).isoformat()
 
+                # ── v12.9.4: 成交后方向校验 — 方向翻转或信号消失则立即卖出 ──
+                AMBUSH_FILL_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_FILL_MIN_CONF", "0.15"))
+                _updater = self._sniper_updaters.get(slug)
+                _dir_ok = True
+                _fill_conf = 0
+                if _updater and _updater.n_updates >= 3:
+                    _fill_sig = _get_bayesian_signal(_updater, remaining_seconds=remaining)
+                    if _fill_sig:
+                        _fill_dir = _fill_sig.get("direction")
+                        _fill_conf = _fill_sig.get("confidence", 0)
+                        if _fill_dir != _dir:
+                            _dir_ok = False  # 方向翻转
+                        elif _fill_conf < AMBUSH_FILL_MIN_CONF:
+                            _dir_ok = False  # 信号消失
+
+                if not _dir_ok:
+                    # 方向翻转/信号消失 → 立即 FOK 卖出，不建仓
+                    logger.info(
+                        f"\n⚠️ 伏击成交但方向失效! {coin} {_dir} "
+                        f"conf={_fill_conf:.0%} → 立即卖出 {filled_size:.1f}份")
+                    try:
+                        clob_client.update_token_allowance(_token)
+                        from py_clob_client.order_builder.constants import SELL
+                        _sell_result = clob_client.place_fok_order(
+                            _token, SELL, 0.01, filled_size)
+                        _sell_price = _sell_result.get("making", 0) or _sell_result.get("taking", 0)
+                        if _sell_result.get("matched"):
+                            _loss = round(cost - _sell_price * filled_size, 2)
+                            logger.info(f"  ⚡ 即时卖出成功: ${_sell_price:.3f}×{filled_size:.1f} 亏${_loss:.2f}")
+                            send_notification(coin, _dir, _fill_conf, 0,
+                                              _sell_price, filled_size, ambush=True)
+                        else:
+                            logger.warning(f"  ⚡ 即时卖出未成交: {_sell_result.get('status')}")
+                    except Exception as _e:
+                        logger.warning(f"  ⚡ 即时卖出异常: {_e}")
+                    self.analyzed.add(slug)
+                    self._ambush_orders.pop(slug, None)
+                    return
+
+                # 方向确认OK → 正常建仓
+                _entry_ts = datetime.now(timezone.utc).isoformat()
                 self.positions[slug] = Position(slug, _token, _dir, entry_price, filled_size, _entry_ts)
                 self.positions[slug].details = {
                     "sniper": True, "ambush": True,
@@ -744,8 +784,11 @@ class MarketTracker:
                 except Exception:
                     pass
 
-                logger.info(f"\n🎯 伏击成交! {coin} {_dir} ${entry_price:.2f}×{filled_size:.1f}份 cost=${cost:.2f}")
-                send_notification(coin, _dir, ambush.get("confidence", 0.5), 0, entry_price, filled_size, ambush=True)
+                logger.info(
+                    f"\n🎯 伏击成交! {coin} {_dir} ${entry_price:.2f}×{filled_size:.1f}份 "
+                    f"cost=${cost:.2f} (方向✅ conf={_fill_conf:.0%})")
+                send_notification(coin, _dir, max(_fill_conf, ambush.get("confidence", 0.5)),
+                                  0, entry_price, filled_size, ambush=True)
                 self._ambush_orders.pop(slug, None)
             elif _should_cleanup:
                 try:
