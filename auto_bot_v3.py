@@ -678,77 +678,53 @@ class MarketTracker:
                 time.sleep(poll_interval)
 
     def _manage_ambush(self, slug, coin, tokens, ptb, atr_val, remaining, end_buffer):
-        """v12.9: 限价伏击单 — 提前在好价格埋单，等做市商来不及调价时吃到
+        """v12.9.1: 方向确认型伏击 — 管理已有伏击单的成交检测和清理
 
-        策略：PTB就绪后在UP/DOWN双方向各挂一个GTC限价BUY，
-        价格设在 SNIPER_AMBUSH_PRICE（默认0.55），当BTC大幅波动时
-        订单簿瞬间匹配到我们的限价单，比追市价快得多。
+        放置逻辑在 _place_directional_ambush()，由 _sniper_scan 的 ask>MAX_PRICE 路径触发。
         """
-        AMBUSH_PRICE = float(os.environ.get("SNIPER_AMBUSH_PRICE", "0.55"))
-        AMBUSH_USD = float(os.environ.get("SNIPER_AMBUSH_SIZE", "3.0"))
-        AMBUSH_WINDOW_START = float(os.environ.get("SNIPER_AMBUSH_START", "240"))  # 剩余<240s开始
-        AMBUSH_WINDOW_END = float(os.environ.get("SNIPER_AMBUSH_END", "30"))      # 剩余<30s取消
-        AMBUSH_CHECK_INTERVAL = 2.0  # 每2秒检查一次成交
+        AMBUSH_WINDOW_END = float(os.environ.get("SNIPER_AMBUSH_END", "30"))
+        AMBUSH_CHECK_INTERVAL = 2.0
 
         ambush = self._ambush_orders.get(slug)
 
         if ambush:
-            # ── ★ 撤单前必须先查成交（防止已成交但bot不知道） ──
+            # ── 撤单前先查成交 ──
             _should_cleanup = (remaining <= AMBUSH_WINDOW_END or slug in self.positions or slug in self.analyzed)
             _should_check = _should_cleanup or (time.time() - ambush.get("last_check", 0) >= AMBUSH_CHECK_INTERVAL)
-
             if not _should_check:
                 return
+
             ambush["last_check"] = time.time()
+            _token = ambush["token"]
+            _bal = clob_client.get_token_balance(_token) or 0
+            _filled = _bal - ambush["bal_before"]
 
-            up_bal = clob_client.get_token_balance(ambush["up_token"])
-            down_bal = clob_client.get_token_balance(ambush["down_token"])
-            up_filled = (up_bal or 0) - ambush["up_bal_before"]
-            down_filled = (down_bal or 0) - ambush["down_bal_before"]
-
-            filled_dir = None
-            filled_token = None
-            cancel_token = None
-            filled_size = 0
-
-            if up_filled > 0.5:
-                filled_dir, filled_token, cancel_token = "UP", ambush["up_token"], ambush["down_token"]
-                filled_size = round(up_filled, 4)
-            elif down_filled > 0.5:
-                filled_dir, filled_token, cancel_token = "DOWN", ambush["down_token"], ambush["up_token"]
-                filled_size = round(down_filled, 4)
-
-            if filled_dir:
-                # 成交！取消反方向单，建仓
-                try:
-                    clob_client.cancel_all(cancel_token)
-                except Exception:
-                    pass
+            if _filled > 0.5:
+                filled_size = round(_filled, 4)
                 entry_price = ambush["price"]
                 cost = round(entry_price * filled_size, 4)
-
-                opposite_token = ambush["down_token"] if filled_dir == "UP" else ambush["up_token"]
+                _dir = ambush["direction"]
+                _opp = ambush["opposite_token"]
                 _entry_ts = datetime.now(timezone.utc).isoformat()
-                self.positions[slug] = Position(
-                    slug, filled_token, filled_dir, entry_price, filled_size, _entry_ts
-                )
+
+                self.positions[slug] = Position(slug, _token, _dir, entry_price, filled_size, _entry_ts)
                 self.positions[slug].details = {
                     "sniper": True, "ambush": True,
-                    "opposite_token_id": opposite_token,
+                    "opposite_token_id": _opp,
                     "atr_val": atr_val, "ptb": ptb,
                 }
                 self.analyzed.add(slug)
                 record_bet_cost(slug, cost)
 
-                # ★ 写 positions.jsonl（position_monitor 依赖此文件检测持仓）
+                # 写 positions.jsonl
                 import fcntl
                 _pos_record = {
-                    "token_id": filled_token, "slug": slug,
-                    "direction": filled_dir, "entry_price": entry_price,
+                    "token_id": _token, "slug": slug,
+                    "direction": _dir, "entry_price": entry_price,
                     "size": filled_size, "entry_cost": cost,
                     "entry_time": _entry_ts,
                     "price_to_beat": ptb, "atr": atr_val,
-                    "opposite_token_id": opposite_token,
+                    "opposite_token_id": _opp,
                     "sniper_thread": True, "ambush": True,
                 }
                 try:
@@ -761,86 +737,70 @@ class MarketTracker:
                 except Exception as _e:
                     logger.warning(f"  [伏] 写入positions.jsonl失败: {_e}")
                 try:
-                    clob_client.update_token_allowance(filled_token)
+                    clob_client.update_token_allowance(_token)
                 except Exception:
                     pass
 
-                logger.info(
-                    f"\n🎯 伏击成交! {coin} {filled_dir} "
-                    f"${entry_price:.2f}×{filled_size:.1f}份 cost=${cost:.2f}"
-                )
-                send_notification(coin, filled_dir, 0.5, 0, entry_price, filled_size,
-                                  ambush=True)
+                logger.info(f"\n🎯 伏击成交! {coin} {_dir} ${entry_price:.2f}×{filled_size:.1f}份 cost=${cost:.2f}")
+                send_notification(coin, _dir, ambush.get("confidence", 0.5), 0, entry_price, filled_size, ambush=True)
                 self._ambush_orders.pop(slug, None)
             elif _should_cleanup:
-                # 没成交，但需要清理（到期/已有仓位）→ 撤单
                 try:
-                    if ambush.get("up_order_id"):
-                        clob_client.cancel_all(ambush["up_token"])
-                    if ambush.get("down_order_id"):
-                        clob_client.cancel_all(ambush["down_token"])
+                    clob_client.cancel_all(_token)
                 except Exception:
                     pass
                 self._ambush_orders.pop(slug, None)
-                logger.info(f"  [伏] 撤销伏击单: {coin} (剩余{remaining:.0f}s)")
+                logger.info(f"  [伏] 撤销伏击单: {coin} {ambush['direction']} (剩余{remaining:.0f}s)")
             return
 
-        # ── 放置伏击单（条件：PTB/tokens就绪 + 时间窗口 + 无持仓） ──
-        if slug in self.positions or slug in self.analyzed:
-            return
-        if not tokens or not ptb or not atr_val or atr_val <= 0:
-            return
-        if not (AMBUSH_WINDOW_END < remaining < AMBUSH_WINDOW_START):
+        # 注意：放置逻辑已移到 _sniper_scan 的 "ask太贵" 路径，不在这里盲挂
+
+    def _place_directional_ambush(self, slug, coin, tokens, gap_dir, confidence,
+                                  diff_atr, ptb, atr_val, remaining):
+        """在确认方向上放置伏击限价单（由 _sniper_scan 的 ask>MAX_PRICE 路径调用）"""
+        if slug in self._ambush_orders or slug in self.positions or slug in self.analyzed:
             return
 
-        up_token, down_token = tokens
+        AMBUSH_PRICE = float(os.environ.get("SNIPER_AMBUSH_PRICE", "0.55"))
+        AMBUSH_USD = float(os.environ.get("SNIPER_AMBUSH_SIZE", "3.0"))
+        AMBUSH_MIN_ATR = float(os.environ.get("SNIPER_AMBUSH_MIN_ATR", "0.8"))
+        AMBUSH_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_MIN_CONF", "0.30"))
 
-        # ★ 安全检查：读取当前 CLOB 价格，只在低于 ask 时才埋单（不给做市商送钱）
-        clob = get_realtime_odds(up_token, down_token)
-        up_ask = clob.get("up_ask")
-        down_ask = clob.get("down_ask")
-        if not up_ask or not down_ask:
+        # 方向信号够强才埋单
+        if diff_atr < AMBUSH_MIN_ATR or confidence < AMBUSH_MIN_CONF:
             return
 
-        # ★ 核心逻辑：只对 ask > ambush_price 的方向埋单（我们的限价低于市价，等待成交）
-        # ask < ambush_price 的方向绝不碰（那是在高于市价买入 = 送钱）
+        token = tokens[0] if gap_dir == "UP" else tokens[1]
+        opposite = tokens[1] if gap_dir == "UP" else tokens[0]
+        ambush_size = round(AMBUSH_USD / AMBUSH_PRICE, 2)
+
+        bal_before = clob_client.get_token_balance(token) or 0
+
         from py_clob_client.order_builder.constants import BUY
-        placed_any = False
-        up_oid, down_oid = None, None
-        up_bal_before = 0
-        down_bal_before = 0
+        result = clob_client.place_order(token, BUY, AMBUSH_PRICE, ambush_size)
+        oid = result.get("order_id")
 
-        if up_ask > AMBUSH_PRICE + 0.03:
-            # UP ask 远高于伏击价，可以埋 UP 买单
-            up_bal_before = clob_client.get_token_balance(up_token) or 0
-            ambush_size = round(AMBUSH_USD / AMBUSH_PRICE, 2)
-            up_result = clob_client.place_order(up_token, BUY, AMBUSH_PRICE, ambush_size)
-            up_oid = up_result.get("order_id")
-            if up_oid:
-                placed_any = True
-                logger.info(f"  🎯 伏击挂单: {coin} UP @${AMBUSH_PRICE} ×{ambush_size}份 (当前ask=${up_ask:.2f})")
-
-        if down_ask > AMBUSH_PRICE + 0.03:
-            # DOWN ask 远高于伏击价，可以埋 DOWN 买单
-            down_bal_before = clob_client.get_token_balance(down_token) or 0
-            ambush_size = round(AMBUSH_USD / AMBUSH_PRICE, 2)
-            down_result = clob_client.place_order(down_token, BUY, AMBUSH_PRICE, ambush_size)
-            down_oid = down_result.get("order_id")
-            if down_oid:
-                placed_any = True
-                logger.info(f"  🎯 伏击挂单: {coin} DOWN @${AMBUSH_PRICE} ×{ambush_size}份 (当前ask=${down_ask:.2f})")
-
-        if placed_any:
-            ambush_size = round(AMBUSH_USD / AMBUSH_PRICE, 2)
+        if oid:
             self._ambush_orders[slug] = {
-                "up_token": up_token, "down_token": down_token,
-                "up_order_id": up_oid, "down_order_id": down_oid,
-                "price": AMBUSH_PRICE, "size": ambush_size,
+                "token": token, "opposite_token": opposite,
+                "up_token": tokens[0], "down_token": tokens[1],
+                "direction": gap_dir, "confidence": confidence,
+                "order_id": oid, "price": AMBUSH_PRICE, "size": ambush_size,
+                "bal_before": bal_before,
                 "placed_at": time.time(), "last_check": time.time(),
-                "up_bal_before": up_bal_before, "down_bal_before": down_bal_before,
             }
-        else:
-            logger.debug(f"  [伏] 跳过伏击: {coin} UP ask=${up_ask:.2f} DOWN ask=${down_ask:.2f} 均不够高")
+            logger.info(
+                f"  🎯 伏击挂单: {coin} {gap_dir} @${AMBUSH_PRICE} ×{ambush_size}份 "
+                f"(ATR={diff_atr:.2f} conf={confidence:.0%} 方向确认后)"
+            )
+
+            # 立即成交检查
+            if result.get("matched"):
+                filled_size = result.get("taking", ambush_size)
+                logger.info(f"  🎯 伏击立即成交! {coin} {gap_dir} ${AMBUSH_PRICE}×{filled_size}")
+                # 触发下一轮 _manage_ambush 的成交检测流程
+        elif result.get("error"):
+            logger.debug(f"  [伏] 挂单失败: {coin} {gap_dir} {str(result.get('error',''))[:50]}")
 
     def _sniper_scan(self):
         """单次狙击扫描 — 遍历所有活跃市场检测狙击机会
@@ -1052,6 +1012,12 @@ class MarketTracker:
                     f"无可执行价(up={clob.get('up_ask')} down={clob.get('down_ask')})")
                 continue
             if real_ask > SNIPER_MAX_PRICE:
+                # v12.9.1: ask太贵不FOK → 改为方向确认伏击（限价等好价）
+                AMBUSH_ENABLED = os.environ.get("SNIPER_AMBUSH", "0") == "1"
+                if AMBUSH_ENABLED and bayesian_conf >= 0.25:
+                    self._place_directional_ambush(
+                        slug, coin, tokens, gap_dir, bayesian_conf,
+                        diff_atr, ptb, atr_val, remaining)
                 _log_skip("price_high",
                     f"  [狙] 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
                     f"价格过高 ${real_ask:.2f}>${SNIPER_MAX_PRICE}")
