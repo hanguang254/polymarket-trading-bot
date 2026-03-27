@@ -590,7 +590,8 @@ class MarketTracker:
         self._sniper_epoch_used = set()            # v12.7: 已狙击的epoch(如"1774490400")，同epoch只狙1次
         self._sniper_rest_cache = {}               # v12.7.2: token_id -> (ask, ts) REST校正缓存，500ms内不重复请求
         self._cached_balance = None               # v12.9: 预缓存余额，狙击线程Kelly用（每周期刷新）
-        self._ambush_orders = {}                   # v12.9: slug -> {up/down_token, order_ids, price, size, bal_before, ...}
+        self._ambush_orders = {}                   # v12.9: slug -> {token, direction, order_id, price, size, bal_before, ...}
+        self._ambush_cancelled_at = {}             # v12.9.1: slug -> timestamp, 撤单冷却防循环
         self._restore_recent_market_state()
 
     def _restore_recent_market_state(self):
@@ -750,6 +751,7 @@ class MarketTracker:
                 except Exception:
                     pass
                 self._ambush_orders.pop(slug, None)
+                self._ambush_cancelled_at[slug] = time.time()  # 冷却记录
                 logger.info(f"  [伏] 撤销伏击单: {coin} {ambush['direction']} (剩余{remaining:.0f}s)")
             return
 
@@ -759,6 +761,14 @@ class MarketTracker:
                                   diff_atr, ptb, atr_val, remaining):
         """在确认方向上放置伏击限价单（由 _sniper_scan 的 ask>MAX_PRICE 路径调用）"""
         if slug in self._ambush_orders or slug in self.positions or slug in self.analyzed:
+            return
+        # ★ 防止在即将撤单的时间窗口内下单（否则下→撤→下循环）
+        AMBUSH_WINDOW_END = float(os.environ.get("SNIPER_AMBUSH_END", "30"))
+        if remaining <= AMBUSH_WINDOW_END + 5:  # +5s安全余量
+            return
+        # ★ 冷却：刚撤过的slug短期不再下单
+        _last_cancel = self._ambush_cancelled_at.get(slug, 0)
+        if time.time() - _last_cancel < 30:
             return
 
         AMBUSH_PRICE = float(os.environ.get("SNIPER_AMBUSH_PRICE", "0.55"))
@@ -967,7 +977,14 @@ class MarketTracker:
             _ws_health = _poly_ws_check.get_best_bid_ask_snapshot(_target_token)
             _ws_health_age = _ws_health.get("age_ms", 9999) if _ws_health else 9999
             SNIPER_WS_MAX_AGE = float(os.environ.get("SNIPER_WS_MAX_AGE", "5000"))
-            if _ws_health_age >= SNIPER_WS_MAX_AGE:
+            _ws_stale = _ws_health_age >= SNIPER_WS_MAX_AGE
+            if _ws_stale:
+                # WS失效：禁止FOK（价格不可信），但允许伏击限价单（不依赖实时价）
+                AMBUSH_ENABLED_WS = os.environ.get("SNIPER_AMBUSH", "0") == "1"
+                if AMBUSH_ENABLED_WS and slug not in self._ambush_orders and bayesian_conf >= 0.30 and diff_atr >= 0.8:
+                    self._place_directional_ambush(
+                        slug, coin, tokens, gap_dir, bayesian_conf,
+                        diff_atr, ptb, atr_val, remaining)
                 _log_skip("ws_stale",
                     f"  [狙] 狙击线程: {coin} {gap_dir} ATR={diff_atr:.2f} | "
                     f"WS失效(age={_ws_health_age:.0f}ms>{SNIPER_WS_MAX_AGE:.0f}ms) 价格不可信")
@@ -1330,14 +1347,17 @@ class MarketTracker:
                             else:
                                 logger.info(f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap}")
                             # ═══ v12: 动量狙击 — 检测到大波动时跳过完整分析直接下单 ═══
-                            # 从检测到下单 <500ms（vs 正常路径 3-5s），抢在CLOB做市商定价前入场
-                            # 注意：独立狙击线程 (_sniper_scan) 200ms轮询已覆盖此逻辑，
-                            #       这里作为fallback保留，防止线程异常时漏单
+                            # v12.9.1: 主线程动量狙击已禁用 — 狙击线程有完整安全防护
+                            # （WS健康检查/gap动量/FOK二次校验/时间衰减shrinkage），
+                            # 主线程fallback没有这些检查，会被噪音尖峰误导入仓。
+                            # 保留代码但不执行，狙击线程异常时由伏击限价单兜底。
+                            _INLINE_SNIPER_DISABLED = True  # v12.9.1: 禁用主线程动量狙击
                             SNIPER_MIN_ATR = float(os.environ.get("SNIPER_MIN_ATR", "0.5"))   # 0.5起步（日志验证2笔成交都是0.5ATR）
                             SNIPER_MAX_PRICE = float(os.environ.get("SNIPER_MAX_PRICE", "0.65"))  # 0.58→0.65: 放宽入场上限，EV正就进
                             SNIPER_MIN_SAMPLES = 2     # 2个样本够了（gap方向是主信号，贝叶斯只确认）
                             _sniper_end_buf = int(os.environ.get("SNIPER_END_BUFFER", "5"))
-                            if (updater and updater.atr_val and updater.atr_val > 0
+                            if (not _INLINE_SNIPER_DISABLED  # v12.9.1: 主线程动量狙击已禁用
+                                    and updater and updater.atr_val and updater.atr_val > 0
                                     and slug not in self.analyzed
                                     and slug not in self.positions
                                     and slug not in self._sniper_processing  # 狙击线程正在处理时跳过
