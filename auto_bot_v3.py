@@ -701,7 +701,9 @@ class MarketTracker:
             _filled = _bal - ambush["bal_before"]
 
             if _filled > 0.5:
-                filled_size = round(_filled, 4)
+                # ★ cap 成交量不超过下单量（余额可能包含其他来源的 token）
+                _ordered = ambush.get("size", 999)
+                filled_size = round(min(_filled, _ordered * 1.05), 4)  # 5%容差(fee)
                 entry_price = ambush["price"]
                 cost = round(entry_price * filled_size, 4)
                 _dir = ambush["direction"]
