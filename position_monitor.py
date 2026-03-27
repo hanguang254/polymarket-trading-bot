@@ -3466,6 +3466,42 @@ def monitor():
                             ev_exit_confirm.pop(attempt_key, None)
                             continue
 
+                    # --- v12.9.2: CL-BN skew 过大时暂停 EV 止损 ---
+                    # CL 滞后 BN > 1ATR 时，CL 的方向判断不可信，EV 的 P(win) 被严重低估
+                    # 直接从 crypto_debug 快照读取（不依赖 oracle_watch 开关）
+                    if _ev_should_exit and isinstance(crypto_debug, dict) and atr_val and atr_val > 0:
+                        _cl_snap = crypto_debug.get("chainlink")
+                        _bn_snap = crypto_debug.get("binance")
+                        if isinstance(_cl_snap, dict) and isinstance(_bn_snap, dict):
+                            _cl_p = _cl_snap.get("price")
+                            _bn_p = _bn_snap.get("price")
+                            if _cl_p and _bn_p:
+                                _cl_bn_skew_atr = abs(_cl_p - _bn_p) / atr_val
+                                _EV_SKEW_BLOCK = float(os.environ.get("EV_SKEW_BLOCK_ATR", "1.0"))
+                                if _cl_bn_skew_atr >= _EV_SKEW_BLOCK:
+                                    print(
+                                        f"  🛡️ CL-BN偏差暂停EV止损: |skew|={_cl_bn_skew_atr:.2f}ATR"
+                                        f"≥{_EV_SKEW_BLOCK}ATR | CL=${_cl_p:.2f} BN=${_bn_p:.2f} 差${abs(_cl_p-_bn_p):.0f}")
+                                    ev_exit_confirm.pop(attempt_key, None)
+                                    continue
+
+                    # --- P1: 方向正确+CL滞后时，用BN重算P(win)二次确认 ---
+                    if _ev_should_exit and direction_correct and isinstance(crypto_debug, dict) and atr_val and atr_val > 0:
+                        _bn_snap_p1 = crypto_debug.get("binance")
+                        if isinstance(_bn_snap_p1, dict) and _bn_snap_p1.get("price") and ptb_price:
+                            _bn_price_p1 = _bn_snap_p1["price"]
+                            _bn_gap = _bn_price_p1 - ptb_price
+                            # BN说方向正确（gap和持仓方向一致）→ 不信CL的EV止损
+                            _bn_dir_correct = (_bn_gap > 0 and direction == "UP") or (_bn_gap < 0 and direction == "DOWN")
+                            if _bn_dir_correct:
+                                _bn_gap_atr = abs(_bn_gap) / atr_val
+                                if _bn_gap_atr >= 0.3:  # BN显示有实质性gap
+                                    print(
+                                        f"  🛡️ BN方向确认暂停EV: 方向✅ BN gap={_bn_gap:+.0f}({_bn_gap_atr:.2f}ATR) "
+                                        f"| CL说卖但BN说方向对，跳过")
+                                    ev_exit_confirm.pop(attempt_key, None)
+                                    continue
+
                     # --- EV-Gated 退出 ---
                     if _ev_should_exit:
                         ev_exit_confirm[attempt_key] = ev_exit_confirm.get(attempt_key, 0) + 1

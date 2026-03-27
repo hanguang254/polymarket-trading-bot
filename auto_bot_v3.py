@@ -772,7 +772,6 @@ class MarketTracker:
             return
 
         AMBUSH_PRICE = float(os.environ.get("SNIPER_AMBUSH_PRICE", "0.55"))
-        AMBUSH_USD = float(os.environ.get("SNIPER_AMBUSH_SIZE", "3.0"))
         AMBUSH_MIN_ATR = float(os.environ.get("SNIPER_AMBUSH_MIN_ATR", "0.8"))
         AMBUSH_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_MIN_CONF", "0.30"))
 
@@ -782,7 +781,26 @@ class MarketTracker:
 
         token = tokens[0] if gap_dir == "UP" else tokens[1]
         opposite = tokens[1] if gap_dir == "UP" else tokens[0]
-        ambush_size = round(AMBUSH_USD / AMBUSH_PRICE, 2)
+
+        # Kelly 仓位计算（和 FOK 狙击对齐）
+        from ai_analyze_v2 import _random_walk_p_win
+        from ai_trader.base_rate import get_base_rate
+        _rw = _random_walk_p_win(diff_atr * atr_val, atr_val, remaining)
+        _p_win = 0.5 + (max(_rw, confidence * 0.5 + 0.5) - 0.5) * 0.60  # 保守 shrinkage
+        _br = get_base_rate(diff_atr)
+        _kr = 0.5 if _br < 0.55 else 1.0
+        _bal = self._cached_balance if self._cached_balance and self._cached_balance > 0 else 20.0
+        _f_star = (_p_win - AMBUSH_PRICE) / (1.0 - AMBUSH_PRICE) if _p_win > AMBUSH_PRICE else 0
+        _f_quarter = _f_star / 4.0 * _kr
+        _dollar_amount = _bal * _f_quarter
+        MIN_BET = float(os.environ.get("MIN_BET_SIZE", "2"))
+        MAX_BET = float(os.environ.get("MAX_BET_SIZE", "3"))
+        _net_size = round(_dollar_amount / AMBUSH_PRICE, 1)
+        _net_size = max(MIN_BET, min(MAX_BET, _net_size))
+        ambush_size = round(_net_size / 0.975, 2)  # gross = net / (1-fee)
+
+        if _f_star <= 0:
+            return  # Kelly 说不值得
 
         bal_before = clob_client.get_token_balance(token) or 0
 
@@ -2167,6 +2185,15 @@ class MarketTracker:
                 self.analyzed.discard(slug)
                 self.early_analyzed.discard(slug)
                 self.restored_slugs.discard(slug)
+                # v12.9: 清理伏击挂单（GTC不会自动过期）
+                ambush = self._ambush_orders.pop(slug, None)
+                if ambush:
+                    try:
+                        clob_client.cancel_all(ambush["token"])
+                    except Exception:
+                        pass
+                    logger.info(f"  [伏] 市场结束清理伏击单: {slug}")
+                self._ambush_cancelled_at.pop(slug, None)
 
 
 def main():
