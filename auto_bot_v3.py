@@ -810,13 +810,59 @@ class MarketTracker:
                                   0, entry_price, filled_size, ambush=True)
                 self._ambush_orders.pop(slug, None)
             elif _should_cleanup:
-                try:
-                    clob_client.cancel_all(_token)
-                except Exception:
-                    pass
+                # 批量撤全部历史挂单（1次API）+ cancel_all兜底
+                clob_client.cancel_orders_batch(ambush.get("all_order_ids", []))
+                clob_client.cancel_all(_token)  # 兜底：撤该token所有残留
                 self._ambush_orders.pop(slug, None)
-                self._ambush_cancelled_at[slug] = time.time()  # 冷却记录
+                self._ambush_cancelled_at[slug] = time.time()
                 logger.info(f"  [伏] 撤销伏击单: {coin} {ambush['direction']} (剩余{remaining:.0f}s)")
+            else:
+                # ── v12.9.5: 动态追价 — 市场变化时重新挂最优价 ──
+                AMBUSH_REPRICE_MAX = int(os.environ.get("SNIPER_AMBUSH_REPRICE_MAX", "5"))
+                _reprice_count = ambush.get("reprice_count", 0)
+                if _reprice_count < AMBUSH_REPRICE_MAX:
+                    _updater_rp = self._sniper_updaters.get(slug)
+                    if _updater_rp and _updater_rp.n_updates >= 3 and atr_val and atr_val > 0:
+                        from ai_analyze_v2 import _random_walk_p_win
+                        _cur_price_rp = _updater_rp.current_price
+                        if _cur_price_rp and ptb:
+                            _gap_rp = abs(_cur_price_rp - ptb)
+                            _diff_atr_rp = _gap_rp / atr_val
+                            _rw_rp = _random_walk_p_win(_gap_rp, atr_val, remaining)
+                            _sig_rp = _get_bayesian_signal(_updater_rp, remaining_seconds=remaining)
+                            _conf_rp = _sig_rp.get("confidence", 0) if _sig_rp else 0
+                            _p_win_rp = 0.5 + (max(_rw_rp, _conf_rp * 0.5 + 0.5) - 0.5) * 0.60
+                            AMBUSH_EDGE = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))
+                            AMBUSH_MIN_P = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
+                            AMBUSH_MAX_P = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.65"))
+                            _new_price = round((_p_win_rp - AMBUSH_EDGE) / 0.01) * 0.01
+                            _new_price = max(AMBUSH_MIN_P, min(AMBUSH_MAX_P, _new_price))
+                            _old_price = ambush["price"]
+                            _old_oid = ambush.get("order_id")
+
+                            if abs(_new_price - _old_price) >= 0.02:
+                                # 先撤全部旧单（批量1次API），再挂新单
+                                _old_oids = ambush.get("all_order_ids", [])
+                                if _old_oid and _old_oid not in _old_oids:
+                                    _old_oids.append(_old_oid)
+                                clob_client.cancel_orders_batch(_old_oids)
+
+                                from py_clob_client.order_builder.constants import BUY
+                                _new_result = clob_client.place_order(_token, BUY, _new_price, ambush["size"])
+                                _new_oid = _new_result.get("order_id")
+                                if _new_oid or _new_result.get("matched"):
+                                    ambush["order_id"] = _new_oid
+                                    ambush["all_order_ids"] = [_new_oid] if _new_oid else []
+                                    ambush["price"] = _new_price
+                                    ambush["reprice_count"] = _reprice_count + 1
+                                    if _new_result.get("matched"):
+                                        logger.info(f"  [伏] 追价即时成交: ${_new_price} (撤{len(_old_oids)}旧单)")
+                                    else:
+                                        logger.info(
+                                            f"  [伏] 追价: {coin} {ambush['direction']} "
+                                            f"${_old_price:.2f}→${_new_price:.2f} "
+                                            f"(p_win={_p_win_rp:.3f} ATR={_diff_atr_rp:.2f} "
+                                            f"撤{len(_old_oids)}旧单 第{_reprice_count+1}/{AMBUSH_REPRICE_MAX}次)")
             return
 
         # 注意：放置逻辑已移到 _sniper_scan 的 "ask太贵" 路径，不在这里盲挂
@@ -883,7 +929,8 @@ class MarketTracker:
                 "token": token, "opposite_token": opposite,
                 "up_token": tokens[0], "down_token": tokens[1],
                 "direction": gap_dir, "confidence": confidence,
-                "order_id": oid, "price": AMBUSH_PRICE, "size": ambush_size,
+                "order_id": oid, "all_order_ids": [oid],
+                "price": AMBUSH_PRICE, "size": ambush_size,
                 "bal_before": bal_before,
                 "placed_at": time.time(), "last_check": time.time(),
             }
@@ -1197,8 +1244,9 @@ class MarketTracker:
                         self._sniper_processing.discard(slug)
                     continue
 
-            # ── 持仓检查 + 下单 ──
+            # ── v12.9.5: FOK入场前清掉该token所有伏击残留挂单 ──
             sniper_token = tokens[0] if gap_dir == "UP" else tokens[1]
+            clob_client.cancel_all(sniper_token)
             _did_sniper_inc = False
             global _pending_bets
             try:

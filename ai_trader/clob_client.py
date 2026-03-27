@@ -334,11 +334,39 @@ def place_fok_order(token_id, side, price, size):
 
 # ── 取消 ──
 
+def cancel_order(order_id):
+    """Cancel a single order by order_id"""
+    try:
+        with _client_lock:
+            resp = _client.cancel(order_id=str(order_id))
+        return True
+    except Exception as e:
+        logger.warning(f"Cancel order failed ({str(order_id)[:12]}): {e}")
+        return False
+
+
+def cancel_orders_batch(order_ids):
+    """Cancel multiple orders in one API call (max 3000). Returns (canceled, not_canceled)."""
+    if not order_ids:
+        return [], {}
+    ids = [str(oid) for oid in order_ids if oid]
+    if not ids:
+        return [], {}
+    try:
+        with _client_lock:
+            resp = _client.cancel_orders(ids)
+        canceled = resp.get("canceled", []) if isinstance(resp, dict) else []
+        not_canceled = resp.get("not_canceled", {}) if isinstance(resp, dict) else {}
+        if not_canceled:
+            logger.warning(f"Batch cancel: {len(canceled)} ok, {len(not_canceled)} failed: {list(not_canceled.keys())[:3]}")
+        return canceled, not_canceled
+    except Exception as e:
+        logger.warning(f"Batch cancel failed ({len(ids)} orders): {e}")
+        return [], {}
+
+
 def cancel_all(token_id=None):
-    """取消订单
-    token_id=None: 取消所有订单
-    token_id指定: 取消该token的所有订单
-    """
+    """Cancel all orders, optionally filtered by token_id"""
     try:
         with _client_lock:
             if token_id:
@@ -347,7 +375,7 @@ def cancel_all(token_id=None):
                 resp = _client.cancel_all()
         return True
     except Exception as e:
-        logger.warning(f"取消订单失败: {e}")
+        logger.warning(f"Cancel orders failed: {e}")
         return False
 
 
