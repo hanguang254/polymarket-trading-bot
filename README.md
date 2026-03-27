@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v12.8
+# Polymarket Trading Bot v12.9
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, momentum sniper fast-path, trailing take-profit, event-driven WebSocket orderbook, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -51,8 +51,11 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Base Rate Calibration**: Conservative ATR-band priors (0.50-0.85), auto-calibrates with empirical data after 30+ samples per band. Weak edge (base_rate < 0.55) halves Kelly.
 - **Strict Binary EV**: `EV = p_win - price` (replaces discount/odds ratio). Minimum edge required (configurable via `MIN_EV`).
 - **Early Bet Window (35-99s)**: Enters before CLOB fully prices in, with lower thresholds (`EARLY_MIN_EV`, `EARLY_MIN_CONFIDENCE`). Captures mispricing before market makers adjust.
-- **Momentum Sniper (v12)**: 动量狙击快速通道 — 预热采样中检测到大波动（ATR≥1.0 + gap方向=贝叶斯方向 + CLOB token≤$0.55）时，跳过完整分析流程（省掉 get_klines/LMSR/CLOB刷新 共 ~1.5s），直接用 Bayesian p_hat + random walk 计算 p_win → execute_bet。从检测到下单 ~300ms（仅 FOK 网络延迟），抢在 CLOB 做市商定价前入场。15 秒起可触发（独立于早期窗口），覆盖早期+晚期全时段。v12.7.3: 主线程动量狙击新增 WS→REST 价格校正（和狙击线程对齐），修复 WS 虚假低价绕过 MAX_PRICE 检查导致高价成交的问题。Telegram 通知三路区分：`🔫狙击线程成交(独立)` / `⚡动量狙击成交(主线程)` / `🎯正常下注`。日志含分步耗时（WS读取/计算/FOK）。
-- **p_win Shrinkage Calibration (v12)**: `P_WIN_SHRINKAGE` 参数将 p_win 向 0.5 收缩（默认 0.80），纠正 Random Walk + Bayesian 融合的系统性过度自信。`p_win = 0.5 + (raw - 0.5) × shrinkage`。日志输出 `p_win_raw` 用于对比校准效果。
+- **Momentum Sniper (v12)**: 动量狙击快速通道 — 预热采样中检测到大波动（ATR≥1.0 + gap方向=贝叶斯方向 + CLOB token≤$0.55）时，跳过完整分析流程（省掉 get_klines/LMSR/CLOB刷新 共 ~1.5s），直接用 Bayesian p_hat + random walk 计算 p_win → execute_bet。从检测到下单 ~300ms（仅 FOK 网络延迟），抢在 CLOB 做市商定价前入场。15 秒起可触发（独立于早期窗口），覆盖早期+晚期全时段。v12.7.3: 主线程动量狙击新增 WS→REST 价格校正（和狙击线程对齐），修复 WS 虚假低价绕过 MAX_PRICE 检查导致高价成交的问题。Telegram 通知四路区分：`🔫狙击线程成交(独立)` / `⚡动量狙击成交(主线程)` / `🎯伏击挂单成交(限价)` / `🎯正常下注`。日志含分步耗时（WS读取/计算/FOK）。
+- **狙击安全防护 (v12.9)**: 四层防线防止虚假信号入场：(1) **WS 健康检查** — WS BBA age > `SNIPER_WS_MAX_AGE`（默认5s）时禁止狙击，避免 REST 降级下的滞后/残留价格误导（实盘复现：WS age=9999ms 导致 REST $0.61→$0.50 瞬跳入场）。(2) **Gap 动量检查** — 当前 gap < 近期峰值 × `SNIPER_GAP_DECAY_RATIO`（默认0.75）时跳过，识别死猫弹跳/均值回归。(3) **时间衰减 Shrinkage** — `remaining > SNIPER_SHRINK_FULL_AT`（默认120s）时 p_win shrinkage 按比例收缩，避免早期噪音高信心入场。(4) **FOK 前二次校验** — 下单前再读一次 Chainlink 价格，ATR 跌破阈值或方向反转则放弃（解决条件通过→FOK执行的1-2秒内价格剧变问题）。
+- **双入仓防护 (v12.9)**: `analyze_and_trade()` 入口和 `execute_bet` 前增加 `self.positions` + `_sniper_processing` 双重检查，堵住狙击线程与正常分析路径的竞态双入仓（实盘复现：同一 slug 在 0.5s 内被两条路径各入仓一次，$10.91 暴露在同方向）。
+- **限价伏击单 (v12.9)**: GTC 限价预埋单策略 — PTB/tokens就绪后，在 ask > `SNIPER_AMBUSH_PRICE` + 0.03 的方向挂 GTC BUY 限价单（低于市价），等做市商来不及调价时被动成交。每2秒查余额变化检测成交，成交后取消反向单并建仓写入 `positions.jsonl`。到期/已有持仓时先查成交再撤单（防止丢失已成交记录）。安全检查：绝不在 ask < ambush_price 的方向挂单（二元市场反向 token 廉价，高于市价买入=送钱）。默认关闭（`SNIPER_AMBUSH=0`）。
+- **p_win Shrinkage Calibration (v12)**: `P_WIN_SHRINKAGE` 参数将 p_win 向 0.5 收缩（默认 0.80），纠正 Random Walk + Bayesian 融合的系统性过度自信。`p_win = 0.5 + (raw - 0.5) × shrinkage`。日志输出 `p_win_raw` 用于对比校准效果。v12.9: 狙击线程新增时间衰减（`SNIPER_SHRINK_FULL_AT`），剩余时间越长 shrinkage 越保守。
 - **Continuous estimated_value (v12)**: ATR→token估值从离散 if-elif 表改为线性插值（`_interpolate_estimated_value`），消除 1.01 ATR 和 1.49 ATR 估值相同的阶梯跳变。
 - **Bidirectional Bayesian Fusion (v12)**: `p_win = max(p_win, fused_p)` 单向阀门改为 `p_win = fused_p` 双向融合，允许 Bayesian 拉低过高的 Random Walk p_win。
 - **5-min K-line Trend Filter**: Checks Binance 5-min candle trend (same timeframe as market) to avoid counter-trend trades. Replaces 15-min filter which was too slow for 5-minute markets.
@@ -81,7 +84,7 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 
 ### Exit (P0-P1 + P4)
 - **PTB Proximity Buffer**: When `abs(crypto_price - ptb_price) / ATR < dynamic_threshold`, crypto is in the "noise zone" near PTB — direction signal is unreliable. Freezes `direction_correct = True` (trusts original bet), suppressing all direction-based stop-losses. Threshold decays with time: 0.7 ATR (first 2min) → 0.3 ATR (mid) → 0.15 ATR (last 1min). Extreme safety valve: token drop ≥50% (`PTB_PROXIMITY_EXTREME_STOP`) forces exit regardless. Configurable via `PTB_PROXIMITY_ATR`.
-- **-20% Hard Stop (v12)**: When token drops ≥20% from entry price, market sell when direction is not confirmed correct. In proximity zone, direction is frozen True so hard stop only fires via extreme safety valve (-25%). **v12: 从 -25%/-50% 收紧到 -20%/-25%，实盘验证减少灾难性亏损（$2.08→$0.49）。**
+- **-20% Hard Stop (v12)**: When token drops ≥20% from entry price, market sell when direction is not confirmed correct. In proximity zone, direction is frozen True so hard stop only fires via extreme safety valve (-25%). **v12: 从 -25%/-50% 收紧到 -20%/-25%，实盘验证减少灾难性亏损（$2.08→$0.49）。** **v12.9: 绝对硬止损最后60秒放宽** — `remaining ≤ 60s` 时阈值从 `-ABSOLUTE_HARD_STOP`（默认40%）放宽到 -70%，避免结算前噪音洗出赢单（实盘复现：方向正确但临时冲高触发-55%止损，最终DOWN赢了但已被洗出，损失$1.54→本应盈利$1.90）。
 - **Force-Close Escalation (v12)**: 平仓意图锁定后连续 5 次 FOK 失败，自动以地板价 $0.01 强制清仓，防止持仓永远挂死。
 - **Direction Flip Exit (Consecutive Confirmation)**: Tracks `direction_correct` across cycles. True→False flip now requires **consecutive confirmation** (2 rounds for ATR<1.5, 1 round for ATR≥1.5) before liquidation — prevents single-poll noise from triggering premature exits. `direction_wrong_streak` counter resets when direction returns to True.
 - **ATR 3-Layer Decision Matrix**: When token drops ≥15% (`PRICE_DROP_TRIGGER`), action depends on ATR deviation (crypto distance from PTB in ATR units):
@@ -370,6 +373,14 @@ See `.env.example` for all configurable parameters:
 | `ATR_DECAY_CONFIRMATIONS` | No | ATR衰减止损连续确认轮数 (default: 3) |
 | `ENABLE_DIRECTION_DOWNGRADE` | No | 方向降级开关，0=关闭 1=开启 (default: 0) |
 | `ATR_DOWNGRADE_THRESHOLD` | No | 方向降级 ATR 阈值，仅降级开启时生效 (default: 0.15) |
+| `SNIPER_SHRINK_FULL_AT` | No | 剩余≤此秒数时狙击shrinkage全量生效，超出按比例衰减 (default: 120) |
+| `SNIPER_GAP_DECAY_RATIO` | No | 当前gap < 峰值×此比例时跳过狙击（动量衰减） (default: 0.75) |
+| `SNIPER_WS_MAX_AGE` | No | WS BBA age超过此毫秒数时禁止狙击 (default: 5000) |
+| `SNIPER_AMBUSH` | No | 限价伏击单开关，1=开启 0=关闭 (default: 0) |
+| `SNIPER_AMBUSH_PRICE` | No | 伏击限价 (default: 0.55) |
+| `SNIPER_AMBUSH_SIZE` | No | 每方向伏击金额USD (default: 3.0) |
+| `SNIPER_AMBUSH_START` | No | 伏击时间窗口开始，剩余<此秒数 (default: 240) |
+| `SNIPER_AMBUSH_END` | No | 伏击时间窗口结束，剩余<此秒数取消 (default: 30) |
 
 ### Running
 
@@ -417,6 +428,8 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 | `logs/monitor_YYYY-MM-DD.log` | Monitor daily log (auto-rotated) |
 
 ## Version History
+
+- **v12.9.0**: 狙击安全防护 + 限价伏击 + 止损优化 — **狙击四层安全防线**：(1) WS 健康检查（age>5s 禁止狙击，防 REST 降级虚假价格）；(2) Gap 动量检查（gap缩小>25% 跳过，识别死猫弹跳）；(3) 时间衰减 Shrinkage（remaining>120s p_win 更保守）；(4) FOK 前二次校验（下单前再验 Chainlink，ATR/方向变了就放弃）。**双入仓防护**：`analyze_and_trade()` 入口+execute_bet前双重检查 positions/_sniper_processing，堵住正常分析路径与狙击线程的竞态双入仓。**限价伏击单**：GTC 限价预埋单，ask > ambush_price+0.03 的方向挂单，2s 查余额检测成交，成交写 positions.jsonl。安全检查：绝不在 ask < ambush_price 方向挂单（防止给做市商送钱）。撤单前先查成交（防丢失记录）。默认关闭。**硬止损最后60秒放宽**：remaining≤60s 时阈值从-40%放宽到-70%，避免噪音洗出赢单。**通知四路区分**：🔫狙击线程 / ⚡动量狙击 / 🎯伏击挂单 / 🎯正常下注。删除死配置 `SNIPER_PROTECTION_SECONDS`。新增 env：`SNIPER_SHRINK_FULL_AT`、`SNIPER_GAP_DECAY_RATIO`、`SNIPER_WS_MAX_AGE`、`SNIPER_AMBUSH`（+PRICE/SIZE/START/END）。
 
 - **v10.0**: PTB并行获取 + 失败计数按币种独立 — PTB fetch for multiple coins now runs in parallel using `ThreadPoolExecutor` (one Chromium subprocess per coin, all launched simultaneously). On 4H4G servers, 3 coins fetch in ~10s instead of ~30s serial. PTB requests are collected during warmup phase (2-40s) and batch-launched before analysis. `_playwright_failures` changed from global integer to per-coin dict — BTC timeout no longer blocks ETH/BNB. Counter resets on each new 5-minute market cycle. `analyze_and_trade` fallback PTB fetch uses `_playwright_lock` to serialize (prevents parallel threads from launching extra Chromium). Requires 4GB+ RAM for 3 concurrent Chromium processes.
 

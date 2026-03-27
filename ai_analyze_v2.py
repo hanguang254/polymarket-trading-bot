@@ -7,6 +7,7 @@ AI 分析和下注决策 v2
 import sys
 import os
 import json
+import fcntl
 import math
 import time
 import logging
@@ -1364,8 +1365,15 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         # allowance刷新异步执行（不阻塞主流程，省~270ms）
         _bet_executor.submit(clob_client.update_token_allowance, token_id)
 
-        with open("logs/positions.jsonl", "a") as f:
-            f.write(json.dumps(position) + "\n")
+        _pos_lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl.lock")
+        _pos_lock_fd = open(_pos_lock_path, "w")
+        try:
+            fcntl.flock(_pos_lock_fd, fcntl.LOCK_EX)
+            with open("logs/positions.jsonl", "a") as f:
+                f.write(json.dumps(position) + "\n")
+        finally:
+            fcntl.flock(_pos_lock_fd, fcntl.LOCK_UN)
+            _pos_lock_fd.close()
 
     if pending:
         pending_msg = f"PENDING_GHOST:{pending_id}" if pending_id else f"PENDING_LIVE:{info.get('order_id')}" if info.get("order_id") else "PENDING_LIVE"

@@ -3,6 +3,7 @@
 持仓止盈监控 - 5分钟市场专用
 在市场关闭前的80-100秒窗口内监控价格，达到+15%即止盈
 """
+import fcntl
 import json
 import math
 import os
@@ -72,6 +73,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl")
+POSITIONS_LOCK = POSITIONS_FILE + ".lock"
 PROFIT_THRESHOLD = float(os.environ.get("PROFIT_THRESHOLD", "0.15"))
 SLIPPAGE = float(os.environ.get("SLIPPAGE", "0.01"))  # 空簿回退滑点（env可配置）
 
@@ -766,6 +768,19 @@ def _check_and_adjust_size(token_id, size, position=None):
             _balance_cache[token_id] = (real_balance, time.time())
     if real_balance is not None:
         if real_balance <= 0:
+            # Fix: 持仓刚创建时 CLOB balance API 可能有延迟，不要立即判定为0
+            if position is not None:
+                entry_time = position.get("entry_time")
+                if entry_time:
+                    try:
+                        et = datetime.fromisoformat(entry_time.replace("Z", "+00:00"))
+                        age_sec = (datetime.now(timezone.utc) - et).total_seconds()
+                        if age_sec < 30:
+                            print(f"    ⚠️ 链上余额为0但持仓仅{age_sec:.0f}s，可能API延迟，等下一轮重试")
+                            _balance_cache.pop(token_id, None)  # 清缓存，下轮重新查
+                            return -1  # -1 = 余额疑似延迟，调用方应跳过本轮不关仓
+                    except Exception:
+                        pass
             print(f"    ⚠️ 链上余额为0，跳过卖出")
             return 0
         if real_balance < size:
@@ -1270,6 +1285,14 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
 
     # 校验链上真实余额（传入position以同步更新持仓记录）
     adjusted = _check_and_adjust_size(token_id, size, position=position)
+    if adjusted == -1:
+        # 新持仓余额可能未到账，等3秒后重试一次
+        print("    ⏳ 等待3s后重新查询余额...")
+        time.sleep(3)
+        _balance_cache.pop(token_id, None)
+        adjusted = _check_and_adjust_size(token_id, size, position=position)
+        if adjusted == -1:
+            adjusted = 0  # 二次确认仍为0，视为真正无余额
     if adjusted == 0:
         return False, "NO_BALANCE"
     if adjusted is not None:
@@ -1415,24 +1438,34 @@ def close_position(position, exit_price):
     position["exit_price"] = exit_price
     position["exit_time"] = datetime.now(timezone.utc).isoformat()
 
-    all_positions = []
-    if os.path.exists(POSITIONS_FILE):
-        with open(POSITIONS_FILE, "r") as f:
-            for line in f:
-                if line.strip():
-                    try:
-                        pos = json.loads(line)
-                        if isinstance(pos, dict):
-                            if pos.get("token_id") == position["token_id"] and pos.get("entry_time") == position["entry_time"]:
-                                all_positions.append(position)
-                            else:
-                                all_positions.append(pos)
-                    except:
-                        pass
+    # 跨进程文件锁: 防止 bot append 和 monitor rewrite 竞争导致持仓丢失
+    lock_fd = None
+    try:
+        lock_fd = open(POSITIONS_LOCK, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-    with open(POSITIONS_FILE, "w") as f:
-        for pos in all_positions:
-            f.write(json.dumps(pos) + "\n")
+        all_positions = []
+        if os.path.exists(POSITIONS_FILE):
+            with open(POSITIONS_FILE, "r") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            pos = json.loads(line)
+                            if isinstance(pos, dict):
+                                if pos.get("token_id") == position["token_id"] and pos.get("entry_time") == position["entry_time"]:
+                                    all_positions.append(position)
+                                else:
+                                    all_positions.append(pos)
+                        except:
+                            pass
+
+        with open(POSITIONS_FILE, "w") as f:
+            for pos in all_positions:
+                f.write(json.dumps(pos) + "\n")
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     # P0: 记录交易结果，供 base_rate 校准
     try:
@@ -1479,44 +1512,53 @@ def close_position(position, exit_price):
 
 def update_position(position, new_size=None, partial_exit=None):
     """更新持仓（如分批卖出后的剩余仓位）"""
-    updated = False
-    all_positions = []
-    if os.path.exists(POSITIONS_FILE):
-        with open(POSITIONS_FILE, "r") as f:
-            for line in f:
-                if line.strip():
-                    try:
-                        pos = json.loads(line)
-                        if isinstance(pos, dict):
-                            if pos.get("token_id") == position["token_id"] and pos.get("entry_time") == position["entry_time"]:
-                                if new_size is not None:
-                                    pos["size"] = new_size
-                                    pos["token_balance"] = new_size
-                                if partial_exit:
-                                    history = pos.get("partial_exits", [])
-                                    history.append(partial_exit)
-                                    pos["partial_exits"] = history
-                                    pos["last_partial_exit"] = partial_exit
-                                # 同步调用方修改的字段（如抄底后的entry_price/original_size等）
-                                for sync_key in ("entry_price", "original_entry_price", "original_size",
-                                                 "dip_buy_price", "dip_buy_size", "dip_buy_gross_size",
-                                                 "dip_buy_fee_shares", "dip_buy_fee_usdc", "dip_buy_cost",
-                                                 "entry_cost",
-                                                 "close_crypto_price", "close_crypto_time",
-                                                 "close_intent_active", "close_intent_reason", "close_intent_at"):
-                                    if sync_key in position:
-                                        pos[sync_key] = position[sync_key]
-                                pos["updated_time"] = datetime.now(timezone.utc).isoformat()
-                                updated = True
-                            all_positions.append(pos)
-                    except:
-                        pass
+    lock_fd = None
+    try:
+        lock_fd = open(POSITIONS_LOCK, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-    if updated:
-        with open(POSITIONS_FILE, "w") as f:
-            for pos in all_positions:
-                f.write(json.dumps(pos) + "\n")
-    return updated
+        updated = False
+        all_positions = []
+        if os.path.exists(POSITIONS_FILE):
+            with open(POSITIONS_FILE, "r") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            pos = json.loads(line)
+                            if isinstance(pos, dict):
+                                if pos.get("token_id") == position["token_id"] and pos.get("entry_time") == position["entry_time"]:
+                                    if new_size is not None:
+                                        pos["size"] = new_size
+                                        pos["token_balance"] = new_size
+                                    if partial_exit:
+                                        history = pos.get("partial_exits", [])
+                                        history.append(partial_exit)
+                                        pos["partial_exits"] = history
+                                        pos["last_partial_exit"] = partial_exit
+                                    # 同步调用方修改的字段（如抄底后的entry_price/original_size等）
+                                    for sync_key in ("entry_price", "original_entry_price", "original_size",
+                                                     "dip_buy_price", "dip_buy_size", "dip_buy_gross_size",
+                                                     "dip_buy_fee_shares", "dip_buy_fee_usdc", "dip_buy_cost",
+                                                     "entry_cost",
+                                                     "close_crypto_price", "close_crypto_time",
+                                                     "close_intent_active", "close_intent_reason", "close_intent_at"):
+                                        if sync_key in position:
+                                            pos[sync_key] = position[sync_key]
+                                    pos["updated_time"] = datetime.now(timezone.utc).isoformat()
+                                    updated = True
+                                all_positions.append(pos)
+                        except:
+                            pass
+
+        if updated:
+            with open(POSITIONS_FILE, "w") as f:
+                for pos in all_positions:
+                    f.write(json.dumps(pos) + "\n")
+        return updated
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
 
 def _arm_close_intent(position, reason):
@@ -2413,8 +2455,14 @@ def reconcile_pending_orders():
                     print(f"  ⚠️ reconcile: 补记入场成本失败: {e}")
 
             os.makedirs("logs", exist_ok=True)
-            with open("logs/positions.jsonl", "a") as f:
-                f.write(json.dumps(position) + "\n")
+            _recon_lock = open(POSITIONS_LOCK, "w")
+            try:
+                fcntl.flock(_recon_lock, fcntl.LOCK_EX)
+                with open("logs/positions.jsonl", "a") as f:
+                    f.write(json.dumps(position) + "\n")
+            finally:
+                fcntl.flock(_recon_lock, fcntl.LOCK_UN)
+                _recon_lock.close()
 
             cancel_all_orders(token_id)
 
@@ -2548,6 +2596,12 @@ def sell_and_confirm(token_id, size, price, timeout_sec=5, position=None):
     """
     # 校验链上真实余额（传入position以同步更新持仓记录）
     adjusted = _check_and_adjust_size(token_id, size, position=position)
+    if adjusted == -1:
+        time.sleep(3)
+        _balance_cache.pop(token_id, None)
+        adjusted = _check_and_adjust_size(token_id, size, position=position)
+        if adjusted == -1:
+            adjusted = 0
     if adjusted == 0:
         return False, "NO_BALANCE"
     if adjusted is not None:
@@ -3036,9 +3090,12 @@ def monitor():
                 ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
 
                 # ═══ v12.8: 绝对硬止损 — 不看方向/EV/ATR，跌到就走 ═══
-                if profit_rate <= -ABSOLUTE_HARD_STOP and remaining > 10:
+                # v12.9: 最后60秒放宽到-70%（噪音洗出去比亏损更贵，让结算自然完成）
+                _hard_stop_threshold = ABSOLUTE_HARD_STOP if remaining > 60 else 0.70
+                if profit_rate <= -_hard_stop_threshold and remaining > 10:
+                    _hard_label = f"-{_hard_stop_threshold*100:.0f}%" + ("(宽松)" if remaining <= 60 else "")
                     print(
-                        f"  💀 绝对硬止损: {profit_rate*100:+.1f}% 超过-{ABSOLUTE_HARD_STOP*100:.0f}% | "
+                        f"  💀 绝对硬止损: {profit_rate*100:+.1f}% 超过{_hard_label} | "
                         f"方向{'✅' if direction_correct else '❌'} | {ev_label_global} | 剩余{remaining:.0f}s"
                     )
                     attempted_stop_loss = True
