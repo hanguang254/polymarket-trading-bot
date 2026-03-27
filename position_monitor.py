@@ -3114,6 +3114,11 @@ def monitor():
                         continue
 
                 # ═══ P0: 双曲贴现止盈 + v12.8 Trailing Take-Profit ═══
+                # v12.9.4: 伏击仓位跳过P0/Trailing TP，持有到结算拿$1.00
+                _is_ambush_pos = pos.get("ambush", False)
+                if _is_ambush_pos and profit_rate > 0:
+                    print(f"  💎 伏击持有到结算: +{profit_rate*100:.1f}% | 剩余{remaining:.0f}s (跳过P0止盈)")
+                    continue
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K, entry_price)
 
                 # v12.8: 持续更新 high_water_mark（无论是否达标都要追踪）

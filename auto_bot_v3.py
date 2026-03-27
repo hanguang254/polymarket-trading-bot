@@ -714,6 +714,7 @@ class MarketTracker:
                 _updater = self._sniper_updaters.get(slug)
                 _dir_ok = True
                 _fill_conf = 0
+                _fill_dir = _dir
                 if _updater and _updater.n_updates >= 3:
                     _fill_sig = _get_bayesian_signal(_updater, remaining_seconds=remaining)
                     if _fill_sig:
@@ -721,8 +722,24 @@ class MarketTracker:
                         _fill_conf = _fill_sig.get("confidence", 0)
                         if _fill_dir != _dir:
                             _dir_ok = False  # 方向翻转
+                            logger.info(
+                                f"  [伏] 方向校验: {coin} 挂单={_dir} 当前={_fill_dir} "
+                                f"conf={_fill_conf:.0%} → ❌ 方向翻转")
                         elif _fill_conf < AMBUSH_FILL_MIN_CONF:
                             _dir_ok = False  # 信号消失
+                            logger.info(
+                                f"  [伏] 方向校验: {coin} 方向={_dir}✅ "
+                                f"conf={_fill_conf:.0%}<{AMBUSH_FILL_MIN_CONF:.0%} → ❌ 信号消失")
+                        else:
+                            logger.info(
+                                f"  [伏] 方向校验: {coin} 方向={_dir}✅ "
+                                f"conf={_fill_conf:.0%}≥{AMBUSH_FILL_MIN_CONF:.0%} → ✅ 建仓")
+                    else:
+                        logger.info(f"  [伏] 方向校验: {coin} 无贝叶斯信号 → ✅ 默认建仓")
+                else:
+                    logger.info(
+                        f"  [伏] 方向校验: {coin} updater不足("
+                        f"{'无' if not _updater else f'n={_updater.n_updates}'}) → ✅ 默认建仓")
 
                 if not _dir_ok:
                     # 方向翻转/信号消失 → 立即 FOK 卖出，不建仓
@@ -734,12 +751,14 @@ class MarketTracker:
                         from py_clob_client.order_builder.constants import SELL
                         _sell_result = clob_client.place_fok_order(
                             _token, SELL, 0.01, filled_size)
-                        _sell_price = _sell_result.get("making", 0) or _sell_result.get("taking", 0)
+                        # making=maker成交额(USDC), taking=taker成交额(USDC)
+                        _sell_usdc = (_sell_result.get("making", 0) or 0) + (_sell_result.get("taking", 0) or 0)
+                        _sell_price_avg = round(_sell_usdc / filled_size, 4) if filled_size > 0 else 0
                         if _sell_result.get("matched"):
-                            _loss = round(cost - _sell_price * filled_size, 2)
-                            logger.info(f"  ⚡ 即时卖出成功: ${_sell_price:.3f}×{filled_size:.1f} 亏${_loss:.2f}")
+                            _loss = round(cost - _sell_usdc, 2)
+                            logger.info(f"  ⚡ 即时卖出成功: ${_sell_price_avg:.3f}×{filled_size:.1f}=${_sell_usdc:.2f} 亏${_loss:.2f}")
                             send_notification(coin, _dir, _fill_conf, 0,
-                                              _sell_price, filled_size, ambush=True)
+                                              _sell_price_avg, filled_size, ambush=True)
                         else:
                             logger.warning(f"  ⚡ 即时卖出未成交: {_sell_result.get('status')}")
                     except Exception as _e:
@@ -816,9 +835,11 @@ class MarketTracker:
         if time.time() - _last_cancel < 30:
             return
 
-        AMBUSH_PRICE = float(os.environ.get("SNIPER_AMBUSH_PRICE", "0.55"))
         AMBUSH_MIN_ATR = float(os.environ.get("SNIPER_AMBUSH_MIN_ATR", "0.8"))
-        AMBUSH_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_MIN_CONF", "0.30"))
+        AMBUSH_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_MIN_CONF", "0.35"))
+        AMBUSH_MIN_PRICE = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
+        AMBUSH_MAX_PRICE = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.65"))
+        AMBUSH_EDGE = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))  # min edge + fees
 
         # 方向信号够强才埋单
         if diff_atr < AMBUSH_MIN_ATR or confidence < AMBUSH_MIN_CONF:
@@ -827,11 +848,15 @@ class MarketTracker:
         token = tokens[0] if gap_dir == "UP" else tokens[1]
         opposite = tokens[1] if gap_dir == "UP" else tokens[0]
 
-        # Kelly 仓位计算（和 FOK 狙击对齐）
+        # v12.9.4: 动态定价 — fair_value 减去利润空间
         from ai_analyze_v2 import _random_walk_p_win
         from ai_trader.base_rate import get_base_rate
         _rw = _random_walk_p_win(diff_atr * atr_val, atr_val, remaining)
         _p_win = 0.5 + (max(_rw, confidence * 0.5 + 0.5) - 0.5) * 0.60  # 保守 shrinkage
+        AMBUSH_PRICE = round((_p_win - AMBUSH_EDGE) / 0.01) * 0.01  # tick 对齐
+        AMBUSH_PRICE = max(AMBUSH_MIN_PRICE, min(AMBUSH_MAX_PRICE, AMBUSH_PRICE))
+
+        # Kelly 仓位计算
         _br = get_base_rate(diff_atr)
         _kr = 0.5 if _br < 0.55 else 1.0
         _bal = self._cached_balance if self._cached_balance and self._cached_balance > 0 else 20.0
@@ -840,7 +865,7 @@ class MarketTracker:
         _dollar_amount = _bal * _f_quarter
         MIN_BET = float(os.environ.get("MIN_BET_SIZE", "2"))
         MAX_BET = float(os.environ.get("MAX_BET_SIZE", "3"))
-        _net_size = round(_dollar_amount / AMBUSH_PRICE, 1)
+        _net_size = round(_dollar_amount / AMBUSH_PRICE, 1) if AMBUSH_PRICE > 0 else 0
         _net_size = max(MIN_BET, min(MAX_BET, _net_size))
         ambush_size = round(_net_size / 0.975, 2)  # gross = net / (1-fee)
 
@@ -864,7 +889,8 @@ class MarketTracker:
             }
             logger.info(
                 f"  🎯 伏击挂单: {coin} {gap_dir} @${AMBUSH_PRICE} ×{ambush_size}份 "
-                f"(ATR={diff_atr:.2f} conf={confidence:.0%} 方向确认后)"
+                f"| ATR={diff_atr:.2f} conf={confidence:.0%} p_win={_p_win:.3f} "
+                f"f*={_f_star:.3f} kelly={_kr} bal=${_bal:.0f} remaining={remaining:.0f}s"
             )
 
             # 立即成交检查
