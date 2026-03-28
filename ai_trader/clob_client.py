@@ -49,6 +49,13 @@ def init_client():
     _client.set_api_creds(creds)
     logger.info(f"✅ CLOB SDK 初始化完成 | funder={funder[:10]}...")
 
+    # Initialize User WS with same credentials
+    try:
+        from ai_trader.user_ws import user_trade_stream
+        user_trade_stream.init(creds.api_key, creds.api_secret, creds.api_passphrase)
+    except Exception as e:
+        logger.warning(f"User WS init skipped: {e}")
+
     # 缩短 httpx 超时（默认5s太长，止损时每秒都在亏钱）
     import httpx
     from py_clob_client.http_helpers import helpers as _h
@@ -217,11 +224,13 @@ def _warmup():
 
 # ── 下单 ──
 
-def place_order(token_id, side, price, size, order_type=OrderType.GTC):
-    """GTC 限价单 — 用于入场
+def place_order(token_id, side, price, size, order_type=OrderType.GTC, expiration=0):
+    """GTC/GTD limit order
 
-    拆分 create_order（本地签名）+ post_order（网络），签名不加锁。
-
+    Args:
+        expiration: Unix timestamp for GTD orders (0 = no expiration / GTC).
+                    Note: Polymarket has a 60s security threshold, so set
+                    expiration = now + 60 + desired_lifetime_seconds.
     Returns:
         dict: {success, matched, order_id, status, making, taking, raw}
     """
@@ -237,6 +246,7 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
                 price=float(price),
                 size=float(size),
                 side=side,
+                expiration=int(expiration),
             ),
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
         )
@@ -246,14 +256,14 @@ def place_order(token_id, side, price, size, order_type=OrderType.GTC):
         for attempt in range(3):
             try:
                 with _client_lock:
-                    resp = _client.post_order(order)
-                break  # 成功则跳出
+                    resp = _client.post_order(order, order_type)
+                break
             except Exception as ex:
                 if "425" in str(ex) or "not ready" in str(ex).lower():
                     logger.warning(f"⏳ 425 Too Early，{0.5*(attempt+1):.1f}s后重试 ({attempt+1}/3)")
-                    time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s, 1.5s
+                    time.sleep(0.5 * (attempt + 1))
                     continue
-                raise  # 非425异常直接抛出
+                raise
         if resp is None:
             raise Exception("425 Too Early: 重试3次仍未就绪")
         elapsed = (time.time() - t0) * 1000
@@ -333,6 +343,62 @@ def place_fok_order(token_id, side, price, size):
 
 
 # ── 取消 ──
+
+def place_fak_order(token_id, side, price, size):
+    """FAK (Fill-And-Kill) — partial fill OK, remainder cancelled.
+
+    Better than FOK for stop-loss: at least sells what's available
+    instead of all-or-nothing rejection.
+    """
+    t0 = time.time()
+    token_id = str(token_id)
+    cached = _token_cache.get(token_id, {})
+    neg_risk = cached.get("neg_risk", None)
+    try:
+        amount = float(price) * float(size) if side == BUY else float(size)
+        order = _client.create_market_order(
+            MarketOrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=side,
+                price=float(price),
+                fee_rate_bps=0,
+                nonce=0,
+                taker="0x0000000000000000000000000000000000000000",
+                order_type=OrderType.FAK,
+            ),
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
+        )
+        t_sign = time.time()
+        resp = None
+        for attempt in range(3):
+            try:
+                with _client_lock:
+                    resp = _client.post_order(order, OrderType.FAK)
+                break
+            except Exception as ex:
+                if "425" in str(ex) or "not ready" in str(ex).lower():
+                    logger.warning(f"⏳ FAK 425 Too Early ({attempt+1}/3)")
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        if resp is None:
+            raise Exception("425 Too Early: FAK retries exhausted")
+        elapsed = (time.time() - t0) * 1000
+        sign_ms = (t_sign - t0) * 1000
+        net_ms = elapsed - sign_ms
+        invalidate_book_cache(token_id)
+        result = _parse_response(resp)
+        result["elapsed_ms"] = round(elapsed, 1)
+        logger.info(f"⚡ FAK {side} {size}@{price} | {result['status']} | sign={sign_ms:.0f}ms net={net_ms:.0f}ms total={elapsed:.0f}ms")
+        return result
+    except Exception as e:
+        elapsed = (time.time() - t0) * 1000
+        logger.error(f"❌ FAK error: {e} | {elapsed:.0f}ms")
+        return {"success": False, "matched": False, "status": "ERROR",
+                "error": str(e), "elapsed_ms": round(elapsed, 1),
+                "making": 0, "taking": 0, "order_id": None, "raw": str(e)}
+
 
 def cancel_order(order_id):
     """Cancel a single order by order_id"""

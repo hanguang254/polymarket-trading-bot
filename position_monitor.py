@@ -1315,13 +1315,19 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
         depth_label = f"{bid_depth:.2f}" if bid_depth is not None else "N/A"
         age_label = f"{age_ms:.0f}ms" if age_ms is not None else "N/A"
         bid_label = f"${best_bid:.3f}" if best_bid is not None else "N/A"
+        # v12.9.7: FAK (Fill-And-Kill) — partial fill OK, then sell remainder
+        _use_fak = os.environ.get("STOP_LOSS_USE_FAK", "1") == "1"
+        _order_type_label = "FAK" if _use_fak else "FOK"
         print(
-            f"    ⚡ FOK止损[{attempt}/{max_retries}]: limit=${sell_price:.2f} "
+            f"    ⚡ {_order_type_label}止损[{attempt}/{max_retries}]: limit=${sell_price:.2f} "
             f"| best_bid={bid_label} | depth={depth_label} | src={source} | age={age_label}"
         )
 
         try:
-            info = clob_client.place_fok_order(token_id, SELL, sell_price, size)
+            if _use_fak:
+                info = clob_client.place_fak_order(token_id, SELL, sell_price, size)
+            else:
+                info = clob_client.place_fok_order(token_id, SELL, sell_price, size)
         except Exception as e:
             info = {
                 "matched": False,
@@ -1333,19 +1339,37 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
             }
 
         if info["matched"]:
-            gross_price = round(info["taking"] / size, 4) if size > 0 and info["taking"] > 0 else sell_price
-            fill_summary = _sell_fill_summary(token_id, size, info.get("taking", 0), gross_price)
+            _taking = info.get("taking", 0) or 0
+            gross_price = round(_taking / size, 4) if size > 0 and _taking > 0 else sell_price
+            fill_summary = _sell_fill_summary(token_id, size, _taking, gross_price)
             actual_price = round(fill_summary["net_price"], 4)
             print(
                 f"    ⚡ 市价成交: gross=${gross_price:.4f} | net=${actual_price:.4f} "
                 f"| fee=${fill_summary['fee_usdc']:.4f} | {info.get('elapsed_ms', 0):.0f}ms"
             )
+
+            # FAK 部分成交检查：查剩余余额
+            if _use_fak:
+                _balance_cache.pop(token_id, None)
+                _remain = _check_and_adjust_size(token_id, size, position=position)
+                if _remain and _remain > 0.5:
+                    print(f"    ⚡ FAK部分成交: 剩余{_remain:.2f}份，继续卖出")
+                    size = _remain
+                    continue  # 下一轮降价卖剩余
+                elif _remain and 0 < _remain <= 0.5:
+                    # 零头用地板价清
+                    try:
+                        clob_client.place_fok_order(token_id, SELL, 0.01, _remain)
+                        print(f"    ⚡ 零头清除: {_remain:.2f}份@$0.01")
+                    except Exception:
+                        pass
+
             return True, actual_price
 
         err = info.get("error", "") or info.get("raw", "")
         last_bucket = _bucket_exit_error(err)
         print(
-            f"    ❌ FOK未成交: Status={info.get('status')} | bucket={last_bucket} "
+            f"    ❌ {_order_type_label}未成交: Status={info.get('status')} | bucket={last_bucket} "
             f"| {info.get('elapsed_ms', 0):.0f}ms"
         )
 
@@ -2771,9 +2795,68 @@ def monitor():
     trailing_tp_active = {}  # v12.8: (slug, entry_time) -> True if trailing TP已激活
     last_wake_context = {"label": "startup", "detail": None}
     
+    _orphan_last_scan = 0
+
     while True:
         try:
             reconcile_pending_orders()
+
+            # v12.9.7: 孤儿 token 扫描 — 每30秒查 data-api 持仓，发现未记录的 token 自动纳入管理
+            _now_orphan = time.time()
+            if _now_orphan - _orphan_last_scan >= 30:
+                _orphan_last_scan = _now_orphan
+                try:
+                    _proxy = os.environ.get("PROXY_WALLET", "")
+                    if _proxy:
+                        _api_positions = requests.get(
+                            "https://data-api.polymarket.com/positions",
+                            params={"user": _proxy, "limit": 50, "sizeThreshold": 0.5},
+                            timeout=10,
+                        ).json()
+                        if isinstance(_api_positions, list) and _api_positions:
+                            _known_tokens = set()
+                            if os.path.exists(POSITIONS_FILE):
+                                with open(POSITIONS_FILE) as _of:
+                                    for _ol in _of:
+                                        try:
+                                            _op = json.loads(_ol.strip())
+                                            if not _op.get("closed"):
+                                                _known_tokens.add(_op.get("token_id", ""))
+                                        except Exception:
+                                            pass
+                            for _ap in _api_positions:
+                                _ap_asset = _ap.get("asset", "")
+                                _ap_size = _ap.get("size", 0)
+                                if _ap_asset and _ap_size > 0.5 and _ap_asset not in _known_tokens:
+                                    # 孤儿 token — 写入 positions.jsonl 让 monitor 管理
+                                    _orphan_record = {
+                                        "token_id": _ap_asset,
+                                        "slug": _ap.get("eventSlug", _ap.get("slug", "orphan")),
+                                        "direction": _ap.get("outcome", "UP"),
+                                        "entry_price": _ap.get("avgPrice", 0.5),
+                                        "size": _ap_size,
+                                        "entry_cost": round(_ap.get("avgPrice", 0.5) * _ap_size, 4),
+                                        "entry_time": datetime.now(timezone.utc).isoformat(),
+                                        "orphan_detected": True,
+                                        "ambush": True,
+                                    }
+                                    import fcntl
+                                    try:
+                                        _lfd = open(POSITIONS_LOCK, "w")
+                                        fcntl.flock(_lfd, fcntl.LOCK_EX)
+                                        with open(POSITIONS_FILE, "a") as _pf:
+                                            _pf.write(json.dumps(_orphan_record) + "\n")
+                                        fcntl.flock(_lfd, fcntl.LOCK_UN)
+                                        _lfd.close()
+                                        print(
+                                            f"  🔍 孤儿token检测: {_ap.get('outcome','?')} "
+                                            f"{_ap_size:.1f}份 @${_ap.get('avgPrice',0):.2f} "
+                                            f"| {_ap.get('title','')[:30]} → 纳入管理")
+                                    except Exception as _we:
+                                        print(f"  ⚠️ 孤儿token写入失败: {_we}")
+                except Exception as _oe:
+                    pass  # 扫描失败不影响主循环
+
             positions = get_open_positions()
             
             if not positions:
