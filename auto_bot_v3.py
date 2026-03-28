@@ -1076,6 +1076,13 @@ class MarketTracker:
             ptb = self.ptb_cache.get(slug)
             shared_updater = self.bayesian_updaters.get(slug)
             atr_val = shared_updater.atr_val if shared_updater else None
+            # v12.9.8: 实时ATR — 用sniper updater样本估算，取max(静态, 实时)
+            _sniper_upd = self._sniper_updaters.get(slug)
+            if _sniper_upd and len(_sniper_upd.samples) >= 5 and atr_val:
+                _recent_gaps = [abs(s.get("gap", 0)) for s in _sniper_upd.samples[-10:]]
+                _live_atr = sum(_recent_gaps) / len(_recent_gaps) * 1.5 if _recent_gaps else 0
+                if _live_atr > atr_val:
+                    atr_val = round(_live_atr, 2)
             if not ptb or not atr_val or atr_val <= 0:
                 _log_skip("no_data", f"  [狙] 狙击线程: {coin} 等待数据(ptb={'✓' if ptb else '✗'} atr={'✓' if atr_val else '✗'})")
                 continue

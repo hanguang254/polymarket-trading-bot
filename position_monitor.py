@@ -1534,6 +1534,137 @@ def close_position(position, exit_price):
     except Exception:
         pass
 
+_reverse_entry_done = set()  # slug已反向入场过，防重复
+
+
+def try_reverse_entry(position, remaining, crypto_debug=None, atr_val=None, ptb_price=None):
+    """止损后尝试反向入场 — 方向明确反转时买入反方向token"""
+    if os.environ.get("STOP_LOSS_REVERSE_ENTRY", "1") != "1":
+        return
+    slug = position.get("slug", "")
+    if slug in _reverse_entry_done:
+        return  # 同一市场只反向一次
+    if remaining is None or remaining < 60:
+        return  # 剩余时间不够
+    opposite_token = position.get("opposite_token_id")
+    if not opposite_token:
+        return  # 没有反向token_id
+
+    # 检查反向信号
+    try:
+        from ai_trader.polymarket_rtds import chainlink_stream
+        from ai_trader.binance_api import price_stream
+        from ai_trader.coins import coin_from_slug
+
+        coin = coin_from_slug(slug)
+        cl_price = chainlink_stream.get_price(coin)
+        bn_price = price_stream.get_price(coin)
+        if not cl_price or not ptb_price or not atr_val or atr_val <= 0:
+            return
+
+        gap = cl_price - ptb_price
+        diff_atr = abs(gap) / atr_val
+        old_dir = position.get("direction", "UP")
+        new_dir = "UP" if gap > 0 else "DOWN"
+
+        # 必须反转（新方向和旧方向相反）
+        if new_dir == old_dir:
+            return
+
+        # BN 也要确认反转
+        if bn_price:
+            bn_gap = bn_price - ptb_price
+            bn_dir = "UP" if bn_gap > 0 else "DOWN"
+            if bn_dir != new_dir:
+                return  # BN不确认
+
+        REVERSE_MIN_CONF = float(os.environ.get("REVERSE_MIN_CONF", "0.35"))
+        REVERSE_MIN_ATR = float(os.environ.get("REVERSE_MIN_ATR", "0.5"))
+
+        if diff_atr < REVERSE_MIN_ATR:
+            return
+
+        # 简单信心估算（不依赖Bayesian updater，用random walk）
+        from ai_analyze_v2 import _random_walk_p_win
+        rw_pw = _random_walk_p_win(abs(gap), atr_val, remaining)
+        p_win = 0.5 + (rw_pw - 0.5) * 0.60
+        if p_win < 0.5 + REVERSE_MIN_CONF * 0.5:
+            return  # 信心不够
+
+        # 动态定价
+        EDGE = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))
+        MIN_P = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.50"))
+        MAX_P = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.75"))
+        buy_price = round((p_win - EDGE) / 0.01) * 0.01
+        buy_price = max(MIN_P, min(MAX_P, buy_price))
+
+        # Kelly 仓位
+        MIN_BET = float(os.environ.get("MIN_BET_SIZE", "5"))
+        MAX_BET = float(os.environ.get("MAX_BET_SIZE", "8"))
+        f_star = (p_win - buy_price) / (1.0 - buy_price) if p_win > buy_price else 0
+        if f_star <= 0:
+            return
+        bal = clob_client.get_balance() or 20
+        net_size = round(bal * f_star / 4.0 / buy_price, 1)
+        net_size = max(MIN_BET, min(MAX_BET, net_size))
+        gross_size = round(net_size / 0.975, 2)
+
+        # FOK 买入反方向
+        from py_clob_client.order_builder.constants import BUY
+        clob_client.update_token_allowance(opposite_token)
+        info = clob_client.place_fok_order(opposite_token, BUY, buy_price, gross_size)
+
+        if info.get("matched"):
+            actual_price = info.get("taking", 0)
+            if actual_price and gross_size > 0:
+                actual_price = round(actual_price / gross_size, 4)
+            else:
+                actual_price = buy_price
+
+            # 写入 positions.jsonl
+            _entry_ts = datetime.now(timezone.utc).isoformat()
+            _rev_record = {
+                "token_id": opposite_token,
+                "slug": slug,
+                "direction": new_dir,
+                "entry_price": actual_price,
+                "size": gross_size,
+                "entry_cost": round(actual_price * gross_size, 4),
+                "entry_time": _entry_ts,
+                "price_to_beat": ptb_price,
+                "atr": atr_val,
+                "opposite_token_id": position.get("token_id"),
+                "ambush": True,
+                "reverse_entry": True,
+            }
+            try:
+                lock_fd = open(POSITIONS_LOCK, "w")
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                with open(POSITIONS_FILE, "a") as pf:
+                    pf.write(json.dumps(_rev_record) + "\n")
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
+
+            _reverse_entry_done.add(slug)
+            print(
+                f"  🔄 反向入场! {new_dir} @${actual_price:.2f}×{gross_size:.1f}份 "
+                f"(止损{old_dir}后反转, p_win={p_win:.3f} ATR={diff_atr:.2f})")
+
+            # 通知
+            try:
+                from auto_bot_v3 import send_notification
+                send_notification(coin, new_dir, p_win - 0.5, 0, actual_price, gross_size, ambush=True)
+            except Exception:
+                pass
+        else:
+            print(f"  🔄 反向入场未成交: {new_dir} @${buy_price:.2f} | {info.get('status')}")
+
+    except Exception as e:
+        print(f"  ⚠️ 反向入场异常: {e}")
+
+
 def update_position(position, new_size=None, partial_exit=None):
     """更新持仓（如分批卖出后的剩余仓位）"""
     lock_fd = None
@@ -3197,6 +3328,8 @@ def monitor():
                         sold_price = actual_price
                         self_notify(pos, sold_price, coin, direction, size, f"绝对硬止损(-{ABSOLUTE_HARD_STOP*100:.0f}%)")
                         close_position(pos, sold_price)
+                        # v12.9.8: 止损后反向入场
+                        try_reverse_entry(pos, remaining, atr_val=atr_val, ptb_price=ptb_price)
                         continue
 
                 # ═══ P0: 双曲贴现止盈 + v12.8 Trailing Take-Profit ═══
@@ -3616,6 +3749,7 @@ def monitor():
                             self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, f"{_ev_reason}(余额已清)")
                             _clear_close_intent(pos)
                             close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            try_reverse_entry(pos, remaining, atr_val=atr_val, ptb_price=ptb_price)
                             close_attempts.pop(attempt_key, None)
                             close_intents.pop(attempt_key, None)
                             ev_exit_confirm.pop(attempt_key, None)
@@ -3624,6 +3758,8 @@ def monitor():
                         if sold:
                             _clear_close_intent(pos)
                             close_position(pos, sold_price)
+                            # v12.9.8: EV止损后反向入场
+                            try_reverse_entry(pos, remaining, atr_val=atr_val, ptb_price=ptb_price)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
