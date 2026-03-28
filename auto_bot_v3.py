@@ -894,11 +894,12 @@ class MarketTracker:
                                     f"(差${abs(_new_price-_old_price):.2f}<$0.02 不追价)")
 
                             if abs(_new_price - _old_price) >= 0.02:
-                                # GTD追价：旧单会自动过期（4s），不需要手动撤
+                                # GTD追价：旧单会自动过期（由 SNIPER_AMBUSH_GTD_REPRICE_SEC 控制），不需要手动撤
                                 # 仍然尝试批量撤加速（但不依赖它成功）
-                                _old_oids = ambush.get("all_order_ids", [])
+                                _old_oids = [oid for oid in dict.fromkeys(ambush.get("all_order_ids", [])) if oid]
                                 if _old_oid and _old_oid not in _old_oids:
                                     _old_oids.append(_old_oid)
+                                ambush["all_order_ids"] = _old_oids[:]
                                 clob_client.cancel_orders_batch(_old_oids)
 
                                 from py_clob_client.order_builder.constants import BUY
@@ -910,8 +911,11 @@ class MarketTracker:
                                     order_type=_OT.GTD, expiration=_gtd_exp_rp)
                                 _new_oid = _new_result.get("order_id")
                                 if _new_oid or _new_result.get("matched"):
+                                    _tracked_oids = [oid for oid in dict.fromkeys(_old_oids) if oid]
+                                    if _new_oid and _new_oid not in _tracked_oids:
+                                        _tracked_oids.append(_new_oid)
                                     ambush["order_id"] = _new_oid
-                                    ambush["all_order_ids"] = [_new_oid] if _new_oid else []
+                                    ambush["all_order_ids"] = _tracked_oids
                                     ambush["price"] = _new_price
                                     ambush["reprice_count"] = _reprice_count + 1
                                     if _new_result.get("matched"):
@@ -924,7 +928,8 @@ class MarketTracker:
                                             f"  [伏] 追价: {coin} {ambush['direction']} "
                                             f"${_old_price:.2f}→${_new_price:.2f} "
                                             f"(p_win={_p_win_rp:.3f} ATR={_diff_atr_rp:.2f} "
-                                            f"撤{len(_old_oids)}旧单 第{_reprice_count+1}/{AMBUSH_REPRICE_MAX}次)")
+                                            f"撤{len(_old_oids)}旧单 TTL={GTD_REPRICE_SEC}s "
+                                            f"跟踪{len(_tracked_oids)}单 第{_reprice_count+1}/{AMBUSH_REPRICE_MAX}次)")
             return
 
         # 注意：放置逻辑已移到 _sniper_scan 的 "ask太贵" 路径，不在这里盲挂

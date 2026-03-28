@@ -560,6 +560,60 @@ class TestSniperDownDirection(unittest.TestCase):
         self.assertEqual(call_args[0][2], "down_token")  # token
 
 
+class TestAmbushRepriceTracking(unittest.TestCase):
+    @patch.dict(os.environ, {
+        "SNIPER_AMBUSH_BAL_INTERVAL": "999",
+        "SNIPER_AMBUSH_REPRICE_INTERVAL": "0",
+        "SNIPER_AMBUSH_REPRICE_MAX": "5",
+        "SNIPER_AMBUSH_GTD_REPRICE_SEC": "8",
+    }, clear=False)
+    def test_reprice_keeps_old_order_ids_when_new_gtd_order_is_posted(self):
+        tracker = bot.MarketTracker()
+        slug = "btc-updown-5m-1700000000"
+        tracker._sniper_updaters[slug] = FakeUpdater(direction="UP", confidence=0.60)
+        tracker._sniper_updaters[slug].current_price = 69850
+        tracker._ambush_orders[slug] = {
+            "token": "up_token",
+            "opposite_token": "down_token",
+            "direction": "UP",
+            "confidence": 0.60,
+            "price": 0.55,
+            "size": 5.2,
+            "bal_before": 0.0,
+            "order_id": "oid-old",
+            "all_order_ids": ["oid-old"],
+            "placed_at": 1000.0,
+            "last_bal_check": 1000.0,
+            "last_reprice": 1000.0,
+            "reprice_count": 0,
+        }
+
+        sys.modules["ai_analyze_v2"]._random_walk_p_win = MagicMock(return_value=0.80)
+
+        with patch.dict(sys.modules, {"py_clob_client.clob_types": MagicMock()}), \
+             patch("auto_bot_v3.time.time", return_value=1001.0), \
+             patch("auto_bot_v3._get_bayesian_signal", return_value={"confidence": 0.60}), \
+             patch.object(bot.clob_client, "get_token_balance", return_value=0.0), \
+             patch.object(bot.clob_client, "cancel_orders_batch", return_value=([], ["oid-old"])) as cancel_mock, \
+             patch.object(bot.clob_client, "place_order", return_value={"order_id": "oid-new", "matched": False}):
+            tracker._manage_ambush(
+                slug=slug,
+                coin="BTC",
+                tokens=("up_token", "down_token"),
+                ptb=69612,
+                atr_val=113,
+                remaining=120,
+                end_buffer=0,
+            )
+
+        cancel_mock.assert_called_once_with(["oid-old"])
+        ambush = tracker._ambush_orders[slug]
+        self.assertEqual(ambush["order_id"], "oid-new")
+        self.assertEqual(ambush["price"], 0.64)
+        self.assertEqual(ambush["reprice_count"], 1)
+        self.assertEqual(ambush["all_order_ids"], ["oid-old", "oid-new"])
+
+
 # ═══════════════════════════════════════════════════════════
 # 6. EV计算和env配置测试
 # ═══════════════════════════════════════════════════════════

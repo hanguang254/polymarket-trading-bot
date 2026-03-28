@@ -333,7 +333,110 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
 
         self.assertEqual(pending["slug"], "btc-updown-5m-ghost")
         self.assertEqual(pending["status"], "PENDING")
-        self.assertEqual(pending["limit_price"], 0.54)
+        self.assertEqual(pending["limit_price"], 0.77)
+
+    def test_execute_bet_keeps_success_but_queues_earlier_uncertain_fill_for_reconcile(self):
+        initial_quote = {
+            "best_bid": 0.54,
+            "best_ask": 0.55,
+            "bids": [{"price": "0.54", "size": "100"}],
+            "asks": [{"price": "0.55", "size": "20"}],
+            "bid_depth": 100.0,
+            "source": "rest_book",
+            "age_ms": 0.0,
+        }
+        retry_quote = {
+            "best_bid": 0.55,
+            "best_ask": 0.56,
+            "bids": [{"price": "0.55", "size": "100"}],
+            "asks": [{"price": "0.56", "size": "20"}],
+            "bid_depth": 100.0,
+            "source": "rest_book",
+            "age_ms": 0.0,
+        }
+        request_exception = {
+            "matched": False,
+            "status": "ERROR",
+            "elapsed_ms": 1800,
+            "error": "PolyApiException[status_code=None, error_message=Request exception!]",
+            "raw": "PolyApiException[status_code=None, error_message=Request exception!]",
+            "making": 0,
+            "taking": 0,
+            "order_id": None,
+        }
+        matched_retry = {
+            "matched": True,
+            "status": "matched",
+            "elapsed_ms": 320,
+            "error": "",
+            "raw": "{'status': 'matched'}",
+            "making": 2.756,
+            "taking": 5.2,
+            "order_id": "oid-retry",
+        }
+
+        with patch.dict(os.environ, {
+            "MIN_BALANCE": "5",
+            "MIN_BET_SIZE": "5",
+            "MAX_BUY_PRICE": "0.99",
+            "MAX_BUY_PRICE_UP": "0.99",
+            "MAX_BUY_PRICE_DOWN": "0.99",
+            "ENTRY_WS_MAX_AGE_MS": "400",
+            "GHOST_FILL_RECHECKS": "1",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "_bet_executor", _ImmediateExecutor()):
+                with patch.object(ai_analyze_v2, "_get_execution_quote", side_effect=[initial_quote, retry_quote]):
+                    with patch.object(ai_analyze_v2, "calculate_kelly_size", return_value={
+                        "gross_order_size": 5.2,
+                        "min_gross_size": 5.0,
+                        "raw_net_size": 5.0,
+                        "target_net_size": 5.0,
+                        "expected_net_size": 5.0,
+                        "forced_to_min": False,
+                        "entry_fee_rate": 0.0,
+                        "skip_reason": None,
+                    }):
+                        with patch.object(ai_analyze_v2, "PENDING_ORDERS_FILE", os.path.join("logs", "pending_orders.jsonl")):
+                            with patch.object(ai_analyze_v2.clob_client, "get_orderbook", return_value=None):
+                                with patch.object(ai_analyze_v2.clob_client, "place_fok_order", side_effect=[request_exception, matched_retry]):
+                                    with patch.object(ai_analyze_v2, "_detect_ghost_fill", return_value=None):
+                                        with patch.object(ai_analyze_v2.clob_client, "get_token_balance", return_value=5.2):
+                                            with patch.object(ai_analyze_v2.clob_client, "update_token_allowance", return_value=True):
+                                                success, actual_price, actual_size, output = ai_analyze_v2.execute_bet(
+                                                    slug="btc-updown-5m-dup",
+                                                    direction="UP",
+                                                    token_id="token-dup",
+                                                    confidence=0.80,
+                                                    ev=0.025,
+                                                    p_hat=0.90,
+                                                    entry_details={"p_win_final": 0.90},
+                                                    pre_balance=100.0,
+                                                )
+
+        self.assertTrue(success)
+        self.assertAlmostEqual(actual_price, 2.756 / 5.2, places=6)
+        self.assertEqual(actual_size, 5.2)
+        self.assertEqual(output, "{'status': 'matched'}")
+
+        with open("logs/bets.jsonl") as f:
+            record = json.loads(f.readline())
+
+        self.assertTrue(record["success"])
+        self.assertFalse(record["pending"])
+        self.assertTrue(record["ghost_pending_id"])
+
+        with open("logs/pending_orders.jsonl") as f:
+            pending = json.loads(f.readline())
+
+        self.assertEqual(pending["slug"], "btc-updown-5m-dup")
+        self.assertEqual(pending["status"], "PENDING")
+        self.assertEqual(pending["limit_price"], 0.56)
+
+        with open("logs/positions.jsonl") as f:
+            position = json.loads(f.readline())
+
+        self.assertEqual(position["slug"], "btc-updown-5m-dup")
+        self.assertEqual(position["ghost_pending_id"], record["ghost_pending_id"])
 
 
 class TestGhostFillDetection(unittest.TestCase):

@@ -1350,6 +1350,67 @@ class TestPendingOrderReconcile(unittest.TestCase):
         self.assertEqual(position["pending_order_id"], "pending-1")
         self.assertTrue(mock_pending_update.called)
 
+    @patch.object(pm, "_append_pending_update")
+    @patch.object(pm, "get_token_balance", return_value=10.2)
+    @patch.object(pm.clob_client, "get_order", return_value={
+        "status": "MATCHED",
+        "size_matched": 5.2,
+        "original_size": 5.2,
+        "price": 0.55,
+    })
+    def test_reconcile_pending_adds_extra_fill_into_existing_position(
+        self,
+        _mock_get_order,
+        _mock_balance,
+        mock_pending_update,
+    ):
+        existing_position = {
+            "token_id": "token-1",
+            "slug": "btc-updown-5m-1774344600",
+            "direction": "UP",
+            "entry_price": 0.50,
+            "size": 5.0,
+            "entry_cost": 2.5,
+            "entry_time": "2026-03-24T09:33:30.000000+00:00",
+            "closed": False,
+        }
+        pending_entry = {
+            "pending_id": "pending-2",
+            "order_id": "oid-ghost",
+            "created_at": "2026-03-24T09:33:41.000000+00:00",
+            "slug": "btc-updown-5m-1774344600",
+            "direction": "UP",
+            "token_id": "token-1",
+            "status": "PENDING",
+            "limit_price": 0.55,
+            "requested_size": 5.2,
+            "confidence": 0.79,
+            "ev": 0.021,
+            "cost_recorded": False,
+        }
+        with open(self.positions_file, "a") as f:
+            f.write(json.dumps(existing_position) + "\n")
+        with open(self.pending_file, "a") as f:
+            f.write(json.dumps(pending_entry) + "\n")
+
+        with patch.object(pm, "PENDING_ORDERS_FILE", self.pending_file), \
+             patch.object(pm, "POSITIONS_FILE", self.positions_file), \
+             patch("trading_state.record_bet_cost") as mock_record_cost:
+            pm.reconcile_pending_orders()
+
+        mock_record_cost.assert_called_once_with("btc-updown-5m-1774344600", 2.86)
+        with open(self.positions_file) as f:
+            position = json.loads(f.readline())
+
+        self.assertAlmostEqual(position["size"], 10.2, places=6)
+        self.assertAlmostEqual(position["token_balance"], 10.2, places=6)
+        self.assertAlmostEqual(position["entry_cost"], 5.36, places=6)
+        self.assertAlmostEqual(position["entry_price"], 5.36 / 10.2, places=6)
+
+        update = mock_pending_update.call_args[0][0]
+        self.assertEqual(update["status"], "FILLED_ADDON")
+        self.assertAlmostEqual(update["filled_size"], 5.2, places=6)
+
 
 class TestSelfNotify(unittest.TestCase):
     """self_notify: 通知格式化"""

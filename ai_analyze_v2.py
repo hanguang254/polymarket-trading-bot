@@ -1122,9 +1122,20 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
     success = info.get("matched", False)
     pending = False
     pending_id = None
+    ghost_pending_id = None
     saw_uncertain_fill = False
+    resolved_uncertain_fill = False
+    uncertain_order = None
 
     executed_limit_price = fok_price
+
+    def _remember_uncertain_fill(candidate_info, candidate_limit_price):
+        nonlocal uncertain_order
+        if uncertain_order is None:
+            uncertain_order = {
+                "info": dict(candidate_info),
+                "limit_price": candidate_limit_price,
+            }
 
     # FOK 失败重试：刷新盘口，按价格漂移 / 深度不足分流处理
     if not success:
@@ -1133,11 +1144,15 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         if explicit_fok_kill:
             print("  ↻ 明确 FOK kill，跳过链上余额回查")
         else:
-            saw_uncertain_fill = saw_uncertain_fill or _is_transport_uncertain_fill(info)
+            transport_uncertain = _is_transport_uncertain_fill(info)
+            saw_uncertain_fill = saw_uncertain_fill or transport_uncertain
+            if transport_uncertain:
+                _remember_uncertain_fill(info, executed_limit_price)
             ghost_balance = _detect_ghost_fill(token_id, expected_size=requested_net_size or size)
             if ghost_balance:
                 success = True
                 size = ghost_balance
+                resolved_uncertain_fill = True
 
         retry_size = size
         retry_limit = fok_price
@@ -1215,22 +1230,29 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                     print("  ↻ 明确 FOK kill，继续刷新盘口")
                     continue
 
-                saw_uncertain_fill = saw_uncertain_fill or _is_transport_uncertain_fill(info_retry)
+                transport_uncertain = _is_transport_uncertain_fill(info_retry)
+                saw_uncertain_fill = saw_uncertain_fill or transport_uncertain
+                if transport_uncertain:
+                    _remember_uncertain_fill(info_retry, next_limit)
                 ghost_balance = _detect_ghost_fill(token_id, expected_size=retry_size)
                 if ghost_balance:
                     success = True
                     size = ghost_balance
+                    resolved_uncertain_fill = True
                     break
 
-        if not success and saw_uncertain_fill:
-            pending = True
-            pending_id = _queue_pending_order(
+        if saw_uncertain_fill and not resolved_uncertain_fill:
+            pending_candidate = uncertain_order or {
+                "info": dict(info),
+                "limit_price": executed_limit_price,
+            }
+            ghost_pending_id = _queue_pending_order(
                 slug=slug,
                 direction=direction,
                 token_id=token_id,
-                info=info,
+                info=pending_candidate["info"],
                 quoted_price=quoted_price,
-                limit_price=executed_limit_price,
+                limit_price=pending_candidate["limit_price"],
                 price_source=price_source,
                 snapshot_age_ms=snapshot_age_ms,
                 requested_size=requested_size,
@@ -1240,10 +1262,15 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
                 ev=ev,
                 entry_details=entry_details,
             )
-            output = f"PENDING_GHOST:{pending_id}"
-            info = dict(info)
-            info["status"] = "PENDING"
-            print(f"  ⏳ 请求异常后成交状态未确认，已写入 pending_orders 待对账: {pending_id}")
+            if success:
+                print(f"  ⏳ 早先请求异常仍可能已成交，已额外写入 pending_orders 待补仓对账: {ghost_pending_id}")
+            else:
+                pending = True
+                pending_id = ghost_pending_id
+                output = f"PENDING_GHOST:{pending_id}"
+                info = dict(info)
+                info["status"] = "PENDING"
+                print(f"  ⏳ 请求异常后成交状态未确认，已写入 pending_orders 待对账: {pending_id}")
 
     # 计算实际成交价和实际份数
     actual_size = size
@@ -1316,6 +1343,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         "buy_fee_usdc": buy_fee_usdc,
         "success": success,
         "pending": pending,
+        "ghost_pending_id": ghost_pending_id,
         "order_id": info.get("order_id"),
         "status": info.get("status"),
         "output": output[:200],  # 截断输出
@@ -1345,6 +1373,8 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
             "entry_time": datetime.now(timezone.utc).isoformat(),
             "closed": False,
         }
+        if ghost_pending_id:
+            position["ghost_pending_id"] = ghost_pending_id
         # 从 entry_details 提取关键字段（供 monitor 的 EV 计算使用）
         if entry_details:
             for key in ("price_to_beat", "atr", "estimated_value", "diff_in_atr",

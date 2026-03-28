@@ -1716,6 +1716,35 @@ def update_position(position, new_size=None, partial_exit=None):
             lock_fd.close()
 
 
+def _merge_fill_into_existing_position(position, new_total_size, fill_price=None):
+    """把额外成交并回已有持仓，避免同 token 的幽灵加仓失管。"""
+    recorded_size = _position_size(position)
+    total_size = round(_safe_float(new_total_size) or 0.0, 6)
+    if total_size <= recorded_size + 1e-9:
+        return 0.0, 0.0
+
+    added_size = round(total_size - recorded_size, 6)
+    fill_price_val = _safe_float(fill_price)
+
+    prev_entry_price = _safe_float(position.get("entry_price")) or 0.0
+    prev_entry_cost = _safe_float(position.get("entry_cost"))
+    if prev_entry_cost is None:
+        prev_entry_cost = round(prev_entry_price * recorded_size, 6)
+
+    added_cost = 0.0
+    if fill_price_val and fill_price_val > 0:
+        added_cost = round(fill_price_val * added_size, 6)
+        total_cost = round(prev_entry_cost + added_cost, 6)
+        position["entry_cost"] = total_cost
+        if total_size > 0:
+            position["entry_price"] = round(total_cost / total_size, 6)
+
+    position["size"] = total_size
+    position["token_balance"] = total_size
+    update_position(position, new_size=total_size)
+    return added_size, added_cost
+
+
 def _arm_close_intent(position, reason):
     if position is None:
         return
@@ -2451,7 +2480,7 @@ def reconcile_pending_orders():
     print(f"  🔄 reconcile: 检查 {len(active)} 笔挂单...")
 
     open_positions = get_open_positions()
-    open_keys = {(p.get("slug"), p.get("token_id")) for p in open_positions}
+    open_by_key = {(p.get("slug"), p.get("token_id")): p for p in open_positions}
 
     now = datetime.now(timezone.utc)
 
@@ -2460,19 +2489,7 @@ def reconcile_pending_orders():
         token_id = order.get("token_id")
         if not slug or not token_id:
             continue
-
-        # 已经在 positions.jsonl 中有记录，跳过
-        if (slug, token_id) in open_keys:
-            print(f"  ✅ reconcile: {slug} 已在持仓中，标记 RESOLVED_ALREADY")
-            _append_pending_update({
-                "order_id": order.get("order_id"),
-                "pending_id": order.get("pending_id"),
-                "slug": slug,
-                "token_id": token_id,
-                "status": "RESOLVED_ALREADY",
-                "resolved_at": now.isoformat(),
-            })
-            continue
+        existing_position = open_by_key.get((slug, token_id))
 
         created_at = order.get("created_at") or order.get("entry_time")
         age = None
@@ -2486,6 +2503,8 @@ def reconcile_pending_orders():
         filled_size = None
         avg_price = None  # SDK get_order may populate this
         order_id = order.get("order_id")
+        order_status = None
+        balance = None
 
         # 方法1：SDK get_order — 直接查订单状态，最准确
         if order_id:
@@ -2500,7 +2519,7 @@ def reconcile_pending_orders():
                         filled_size = size_matched if size_matched > 0 else original_size
                         avg_price = float(order_info.get("price", 0) or 0)
                         print(f"  📡 reconcile: SDK订单状态=MATCHED size={filled_size} price={avg_price}")
-                    elif order_status in ("CANCELLED", "CANCELED"):
+                    elif order_status in ("CANCELLED", "CANCELED") and not existing_position:
                         print(f"  ❌ reconcile: 订单已取消 {slug}")
                         _append_pending_update({
                             "order_id": order_id, "slug": slug, "token_id": token_id,
@@ -2513,14 +2532,76 @@ def reconcile_pending_orders():
                 print(f"  ⚠️ reconcile: SDK get_order 失败: {e}")
 
         # 方法2：fallback — 查 token 余额
-        if not filled_size:
+        if not filled_size or existing_position:
             try:
                 balance = get_token_balance(token_id)
                 print(f"  📊 reconcile: {slug} token balance={balance}")
-                if balance is not None and balance > 0:
+                if not filled_size and balance is not None and balance > 0:
                     filled_size = balance
             except Exception as e:
                 print(f"  ⚠️ reconcile: get_token_balance 失败: {e}")
+
+        if existing_position:
+            recorded_size = _position_size(existing_position)
+            actual_balance = balance if balance is not None else None
+            if filled_size and filled_size > 0:
+                inferred_total = round(recorded_size + filled_size, 6)
+                actual_balance = max(actual_balance or 0.0, inferred_total)
+
+            if actual_balance and actual_balance >= recorded_size + PENDING_MIN_FILL:
+                addon_price = None
+                addon_source = "unknown"
+                if avg_price and 0.01 < avg_price < 0.99:
+                    addon_price = avg_price
+                    addon_source = "positions_avg"
+                elif order.get("limit_price"):
+                    addon_price = order.get("limit_price")
+                    addon_source = "limit_price"
+
+                added_size, added_cost = _merge_fill_into_existing_position(
+                    existing_position, actual_balance, addon_price
+                )
+                if added_size >= PENDING_MIN_FILL:
+                    print(
+                        f"  ✅ reconcile 补并持仓: {slug} 原{recorded_size:.4f} → 现{actual_balance:.4f} "
+                        f"(补{added_size:.4f} @ {addon_source})"
+                    )
+                    cost_recorded = False
+                    if added_cost > 0 and not order.get("cost_recorded"):
+                        try:
+                            from trading_state import record_bet_cost
+                            record_bet_cost(slug, round(added_cost, 4))
+                            cost_recorded = True
+                            print(f"  📉 reconcile: 补记幽灵加仓成本 ${added_cost:.2f}")
+                        except Exception as e:
+                            print(f"  ⚠️ reconcile: 补记幽灵加仓成本失败: {e}")
+
+                    _append_pending_update({
+                        "order_id": order.get("order_id"),
+                        "pending_id": order.get("pending_id"),
+                        "slug": slug,
+                        "token_id": token_id,
+                        "status": "FILLED_ADDON",
+                        "filled_size": added_size,
+                        "new_total_size": actual_balance,
+                        "entry_price": existing_position.get("entry_price"),
+                        "entry_price_source": addon_source,
+                        "cost_recorded": cost_recorded,
+                        "resolved_at": now.isoformat(),
+                    })
+                    continue
+
+            resolved_status = "CANCELLED" if order_status in ("CANCELLED", "CANCELED") else "RESOLVED_ALREADY"
+            print(f"  ✅ reconcile: {slug} 已在持仓中，无额外余额，标记 {resolved_status}")
+            _append_pending_update({
+                "order_id": order.get("order_id"),
+                "pending_id": order.get("pending_id"),
+                "slug": slug,
+                "token_id": token_id,
+                "status": resolved_status,
+                "resolved_at": now.isoformat(),
+            })
+            continue
 
         if filled_size and filled_size >= PENDING_MIN_FILL:
             print(f"  ✅ reconcile 成交入仓: {slug} token={str(token_id)[:10]}... size={filled_size}")

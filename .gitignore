@@ -51,3 +51,5 @@ Thumbs.db
 node_modules/
 wallet_backup.txt
 .env.systemd
+AGENTS.md
+logs/*.lock
