@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v12.9.9
+# Polymarket Trading Bot v12.9.10
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, momentum sniper fast-path, trailing take-profit, event-driven WebSocket orderbook, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -149,9 +149,10 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Outcome Learning Loop**: Every close records outcome → auto-calibrates base rates every 50 trades
 - **Telegram Notifications**: Entry (🎯 direct / ⏰ pending fill), exits, settlements, errors, balance. Pending order expiry (⌛) also notified.
 - **Overnight Position PnL Isolation**: `pending_costs` stores `{cost, session_date}`, cross-day settlement position costs are not credited back to new trading day daily_pnl, preventing overnight positions from polluting daily risk limits. Old format auto-migrated for compatibility.
-- **Auto Redeem + PnL Matching**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`), After settlement matches `positions.jsonl` to compute real cost basis and net profit, shows USDC balance + PnL stats after each round. Multi-wallet balance display (EOA + Proxy + Total). `find_redeemable()` groups by condition_id and iterates all tokens checking on-chain balance, fixing missed tokens in same-condition multi-token scenarios.
+- **Auto Redeem + PnL Matching**: Claim settled positions (configurable interval via `REDEEM_INTERVAL`), After settlement matches `positions.jsonl` to compute real cost basis and net profit, shows USDC balance + PnL stats after each round. Multi-wallet balance display (EOA + Proxy + Total). `find_redeemable()` uses data-api REST (`/positions?redeemable=true`) for zero-RPC position discovery.
+- **Relayer Free-Gas Redeem (v12.9.10)**: Uses Polymarket Relayer API (`relayer-v2.polymarket.com/submit`) with official `py-builder-relayer-client` SDK for EIP-712 signed gasless transactions. Requires `RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS` in `.env`. Automatic fallback to self-paid gas if Relayer fails. Normal redeem flow is fully RPC-free: data-api discovery → Relayer submit → confirmed.
 - **Proxy Safe Redeem**: When `CLOB_SIGNATURE_TYPE=2` (GNOSIS_SAFE) and position is in proxy wallet, automatically executes on-chain redeem via 1/1 Safe `execTransaction` on behalf of proxy, no manual extraction to EOA needed. On-chain verification: Safe threshold=1 and EOA is owner. Parallel redeem also supports Safe routing (gas limit 600k).
-- **Stale Mark Auto-Cleanup**: `clear_stale_redeemed_marks()` checks each scan for conditions marked as redeemed but with on-chain balance still > 0, removes mark and immediately re-redeems.
+- **Stale Mark Auto-Cleanup**: `cleanup_false_redeemed()` checks each startup via data-api (`redeemable=true` query) for conditions marked as redeemed but still redeemable, removes mark and re-redeems. Zero RPC calls.
 - **Watchdog**: `watchdog_v3.sh` monitors all 3 services and auto-restarts on failure
 - **systemd Management**: Auto-restart on crash, boot-start
 
@@ -320,7 +321,9 @@ See `.env.example` for all configurable parameters:
 | `PROXY_WALLET` | Yes | Polymarket proxy wallet (holds positions, see Settings on polymarket.com) |
 | `CLOB_SIGNATURE_TYPE` | No | `0` = EOA direct, `1` = POLY_PROXY (Magic/email), `2` = GNOSIS_SAFE (browser wallet / most Polymarket.com proxy wallets) |
 | `PRIVATE_KEY` | Yes | Private key for SDK signing + on-chain settlement |
-| `POLYGON_RPC_URL` | No | Polygon RPC endpoint (default: public) |
+| `POLYGON_RPC_URL` | No | Polygon RPC endpoint (default: public, only used for self-pay gas fallback) |
+| `RELAYER_API_KEY` | No | Polymarket Relayer API key for gasless redeem (get from polymarket.com Settings → Relayer API Keys) |
+| `RELAYER_API_KEY_ADDRESS` | No | EOA address associated with Relayer key (defaults to `EOA_WALLET`) |
 | `TELEGRAM_BOT_TOKEN` | No | Telegram bot token for notifications |
 | `TELEGRAM_CHAT_ID` | No | Telegram chat ID for notifications |
 | `REDEEM_INTERVAL` | No | Auto redeem polling interval in seconds (default: 600) |
@@ -479,6 +482,7 @@ tail -20 logs/outcomes.jsonl | python -m json.tool
 - **v3.9**: EV-driven diamond hands — direction correct + ≤120s no longer blindly holds; calculates real-time EV (base_rate lookup) and releases weak signals (EV 0~0.03) to Stage 3/4 fine-grained exit. P1 hedge extended to Stage 1 (120-180s) — bid < $0.05 now triggers opposite token hedge instead of doing nothing. Direction-correct hold blocks (>60s) now log EV/ATR for signal quality observation. Removed dead EV computation in Stage 1 entry.
 - **v3.8**: Document-inspired enhancements — #7: LMSR inefficiency signal (realtime best_ask vs p_win mispricing → lower entry threshold). #1: Hyperbolic discounting profit-take (dynamic threshold scales with time to settlement, configurable via env). #6: Adaptive Bayesian sampling (3s near bet window). #4: Base Rate validation script (`scripts/validate_base_rate.py`).
 - **v3.7**: 4-layer quantitative defense — P0: early profit-taking (≥20% profit + >90s → sell immediately, don't risk boundary reversal). P1: opposite token hedge (bid < $0.05 → buy opposite token to form $1.00 pair at settlement). P2: exit liquidity gate (bid_depth < 5 → skip entry). P3: liquidity-capped sizing (Kelly ≤ 50% of exit bid depth). Opposite token_id recorded at entry for hedge execution.
+- **v12.9.10**: Relayer free-gas redeem + zero-RPC settlement — `auto_redeem_v2.py` rewritten: (1) `find_redeemable()` uses data-api REST (`/positions?redeemable=true`) instead of on-chain `payoutDenominator`/`balanceOf` calls (eliminates RPC timeout hangs). (2) `parallel_redeem()` sends via Polymarket Relayer API (EIP-712 signed, `py-builder-relayer-client` SDK) for gasless transactions, with automatic self-paid gas fallback. (3) `cleanup_false_redeemed()` uses data-api instead of chain calls. (4) Post-redeem verification is best-effort (non-blocking). Normal redeem flow: data-api → Relayer → confirmed, zero RPC, zero gas. Requires `RELAYER_API_KEY` in `.env` (from polymarket.com Settings).
 - **v3.6**: Direction-based exit — uses crypto price vs PTB (not token orderbook) to determine win/loss. Winning positions hold to settlement ($1.00) instead of being sold at misleading prices. Wide bid-ask spread detection prevents false losses. Post-close safety prevents trades after market ends. Auto redeem now shows USDC balance.
 - **v3.5**: Fill price fix — parse CLI output (Taking/Size) for actual fill price instead of limit price. MATCHED status check prevents recording unfilled LIVE orders. Fixes inflated entry_price in notifications, logs, and PnL calculations.
 - **v3.4**: Trading Desk Protocol implementation — Base Rate calibration (P0), EV-driven exit (P1), strict binary EV formula (P2), correlated exposure control (P3), EV pricing protection for stages 3-4 (P4), outcome learning loop, cross-validation guard

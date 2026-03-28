@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Polymarket 自动领取已结算收益脚本 v3.7
-- data-api REST 查持仓 + web3 链上结算（支持 EOA / 1-of-1 Gnosis Safe）
-- EOA 直接调用 CTF.redeemPositions / NegRiskAdapter.redeemPositions
-- 官网 proxy wallet (1/1 Safe) 由 owner EOA 通过 execTransaction 代 Safe 执行 redeem
-- 并行 redeem: 预分配 nonce + 批量发送 + 统一收回执（117笔 ~20s）
+Polymarket 自动领取已结算收益脚本 v3.8
+- data-api REST 查可领取持仓（redeemable=true），零 RPC 调用
+- Relayer 免 gas 提交（py-builder-relayer-client SDK EIP-712 签名）
+- 自付 gas 回退（Relayer 失败时）
+- 并行 redeem: Relayer 优先 → 自付 gas 批量 → 统一收回执
 - revert 自动切换 normal↔neg-risk 重试
-- 链上验证余额变化，防止假标记
-- 启动时自动清理假标记（链上仍有余额的 = 未真正领取）
+- 启动时 data-api 清理假标记（零 RPC）
 - 持久化已 redeem 记录 + 日志按天写入文件 + Telegram 通知
 """
 import os
@@ -418,18 +417,6 @@ def fetch_positions() -> list:
 # 链上验证
 # ==============================================================================
 
-def check_resolved_onchain(w3: Web3, cond_id: str) -> bool:
-    """链上检查 condition 是否已结算: payoutDenominator > 0"""
-    selector = w3.keccak(text="payoutDenominator(bytes32)")[:4]
-    call_data = selector + abi_encode(
-        ["bytes32"], [bytes.fromhex(cond_id.replace("0x", ""))]
-    )
-    result = w3.eth.call(
-        {"to": Web3.to_checksum_address(CTF_ADDRESS), "data": call_data}
-    )
-    denominator = int(result.hex(), 16)
-    return denominator > 0
-
 
 def _is_likely_resolved(position: dict) -> bool:
     return (
@@ -442,105 +429,88 @@ def _is_likely_resolved(position: dict) -> bool:
 
 
 def find_redeemable(w3: Web3, wallet, ctf_contract) -> list[dict]:
-    """data-api 获取持仓 -> 字段预筛 -> 链上验证已结算 + 余额 > 0"""
+    """data-api 获取可领取持仓（redeemable=true），零 RPC 调用"""
     eoa_cs = Web3.to_checksum_address(wallet.address)
-    # 检查余额的地址列表：EOA 优先，proxy 备选
-    check_addrs = [eoa_cs]
-    if PROXY_WALLET and PROXY_WALLET.lower() != wallet.address.lower():
-        check_addrs.append(Web3.to_checksum_address(PROXY_WALLET))
+    proxy_cs = Web3.to_checksum_address(PROXY_WALLET) if PROXY_WALLET else ""
 
-    # 1. data-api 获取持仓
-    positions = fetch_positions()
-    if not positions:
-        return []
-
-    # 2. 字段预筛已结算的（减少链上调用）
     redeemable = []
-    positions_by_condition: dict[str, list[dict]] = {}
-    for p in positions:
-        cond_id = p.get("conditionId") or p.get("condition_id", "")
-        if cond_id:
-            positions_by_condition.setdefault(cond_id, []).append(p)
+    seen_conditions: set[str] = set()
 
-    for cond_id, condition_positions in positions_by_condition.items():
-        # API 字段预筛：同一 condition 里任意一条像已结算，就继续链上验证
-        resolved_candidates = [p for p in condition_positions if _is_likely_resolved(p)]
-        if not resolved_candidates:
+    for addr, label in [(proxy_cs, "proxy"), (eoa_cs, "eoa")]:
+        if not addr:
             continue
 
-        # 3. 链上确认已结算
-        try:
-            if not check_resolved_onchain(w3, cond_id):
+        # data-api 查可领取持仓（活跃 + 已关闭两个端点）
+        api_positions: list[dict] = []
+        for endpoint in ["/positions", "/closed-positions"]:
+            try:
+                resp = requests.get(
+                    f"{DATA_API}{endpoint}",
+                    params={"user": addr, "redeemable": "true", "limit": 200, "sizeThreshold": 0},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    api_positions.extend(data)
+            except Exception as e:
+                log.warning(f"  {label} {endpoint} 查询失败: {str(e)[:80]}")
+
+        # 也加载全量持仓中字段标记为已结算的（兜底）
+        all_positions = _fetch_positions_api(addr, label)
+        closed_positions = _fetch_closed_positions_api(addr, label)
+        for p in all_positions + closed_positions:
+            if _is_likely_resolved(p) and p not in api_positions:
+                api_positions.append(p)
+
+        if not api_positions:
+            log.info(f"  {label} 地址: 无可领取持仓")
+            continue
+
+        # 按 conditionId 分组
+        by_condition: dict[str, list[dict]] = {}
+        for p in api_positions:
+            cid = p.get("conditionId") or p.get("condition_id", "")
+            if cid and cid not in seen_conditions:
+                by_condition.setdefault(cid, []).append(p)
+
+        for cond_id, cond_positions in by_condition.items():
+            seen_conditions.add(cond_id)
+
+            # 选 size 最大的记录
+            best = max(cond_positions, key=lambda p: float(p.get("size", 0) or 0))
+            size = float(best.get("size", 0) or 0)
+            if size <= 0:
                 continue
-        except Exception as e:
-            log.debug(f"  链上检查失败: {cond_id[:18]}... | {e}")
-            continue
 
-        # 4. 链上检查 token 余额（先查 EOA，再查 proxy）
-        bal = 0
-        holder = eoa_cs
-        selected_position = None
-        token_id = ""
+            token_id = best.get("asset") or best.get("token_id", "")
+            bal = int(size * 1e6)
 
-        for addr in check_addrs:
-            found_for_addr = None
-            for p in resolved_candidates:
-                current_token_id = p.get("asset") or p.get("token_id", "")
-                if not current_token_id:
-                    continue
-                try:
-                    b = ctf_contract.functions.balanceOf(addr, int(current_token_id)).call()
-                except Exception:
-                    continue
-                if b > 0:
-                    found_for_addr = (p, current_token_id, b)
-                    break
+            market_slug = best.get("slug", best.get("market_slug", ""))
+            title = best.get("title", market_slug or cond_id[:16])
+            neg_risk = best.get(
+                "negativeRisk",
+                best.get("neg_risk", best.get("negRisk", False)),
+            )
+            cur_value = float(
+                best.get(
+                    "currentValue",
+                    best.get("current_value", best.get("value", 0)),
+                ) or 0
+            )
 
-            if found_for_addr:
-                selected_position, token_id, bal = found_for_addr
-                holder = addr
-                break
-
-        if selected_position is None:
-            for p in resolved_candidates:
-                size = float(p.get("size", 0) or 0)
-                if size <= 0:
-                    continue
-                selected_position = p
-                bal = int(size * 1e6)
-                break
-
-        # 余额为0的跳过（无意义调用）
-        if bal <= 0:
-            continue
-
-        selected_position = selected_position or resolved_candidates[0]
-        market_slug = selected_position.get("slug", selected_position.get("market_slug", ""))
-        title = selected_position.get("title", market_slug or cond_id[:16])
-        neg_risk = selected_position.get(
-            "negativeRisk",
-            selected_position.get("neg_risk", selected_position.get("negRisk", False)),
-        )
-        cur_value = float(
-            selected_position.get(
-                "currentValue",
-                selected_position.get("current_value", selected_position.get("value", 0)),
-            ) or 0
-        )
-        size = float(selected_position.get("size", 0) or 0)
-
-        redeemable.append({
-            "condition_id": cond_id,
-            "token_id": token_id,
-            "balance": bal,
-            "holder": holder,
-            "slug": (title or "unknown")[:50],
-            "market_slug": market_slug,
-            "value": cur_value,
-            "neg_risk": neg_risk,
-            "size": size,
-        })
-        log.info(f"  可领取: {(title or '')[:40]} (balance: {bal}, holder: {holder[:10]}...)")
+            redeemable.append({
+                "condition_id": cond_id,
+                "token_id": token_id,
+                "balance": bal,
+                "holder": addr,
+                "slug": (title or "unknown")[:50],
+                "market_slug": market_slug,
+                "value": cur_value,
+                "neg_risk": neg_risk,
+                "size": size,
+            })
+            log.info(f"  可领取: {(title or '')[:40]} (balance: {bal}, holder: {addr[:10]}...)")
 
     return redeemable
 
@@ -621,14 +591,134 @@ def _prepare_execution_tx(w3: Web3, wallet, holder: str | None, target: str, cal
     return proxy_cs, safe_exec_data, SAFE_REDEEM_FIXED_GAS, "gnosis-safe"
 
 
+RELAYER_API_KEY = os.environ.get("RELAYER_API_KEY", "").strip()
+RELAYER_API_KEY_ADDRESS = os.environ.get("RELAYER_API_KEY_ADDRESS", EOA_WALLET).strip()
+RELAYER_URL = "https://relayer-v2.polymarket.com"
+
+
+
+def _send_tx_relayer(w3: Web3, wallet, target: str, call_data: bytes, holder: str | None = None) -> str | None:
+    """通过 Polymarket Relayer 发送交易（免 gas）。
+    使用官方 py-builder-relayer-client SDK 构建 EIP-712 签名请求。
+    """
+    if not RELAYER_API_KEY:
+        return None
+
+    wallet_cs = Web3.to_checksum_address(wallet.address)
+    target_cs = Web3.to_checksum_address(target)
+
+    try:
+        from py_builder_relayer_client.builder.safe import build_safe_transaction_request
+        from py_builder_relayer_client.models import SafeTransaction, SafeTransactionArgs, OperationType
+        from py_builder_relayer_client.config import get_contract_config
+        from py_builder_relayer_client.signer import Signer
+    except ImportError:
+        log.warning("  py-builder-relayer-client 未安装，回退自付gas")
+        return None
+
+    # 获取 Safe nonce
+    try:
+        nonce_resp = requests.get(
+            f"{RELAYER_URL}/nonce",
+            params={"address": wallet_cs, "type": "SAFE"},
+            timeout=10,
+        )
+        nonce = nonce_resp.json().get("nonce", "0")
+    except Exception as e:
+        log.warning(f"  Relayer nonce 获取失败: {e}，回退自付gas")
+        return None
+
+    # 使用官方 SDK 构建签名请求
+    config = get_contract_config(137)
+    signer = Signer(PRIVATE_KEY, 137)
+    txn = SafeTransaction(
+        to=target_cs,
+        operation=OperationType.Call,
+        data="0x" + call_data.hex(),
+        value="0",
+    )
+    args = SafeTransactionArgs(
+        from_address=wallet_cs,
+        nonce=nonce,
+        chain_id=137,
+        transactions=[txn],
+    )
+    txn_request = build_safe_transaction_request(signer=signer, args=args, config=config)
+    body = txn_request.to_dict()
+
+    try:
+        resp = requests.post(
+            f"{RELAYER_URL}/submit",
+            json=body,
+            headers={
+                "Content-Type": "application/json",
+                "RELAYER_API_KEY": RELAYER_API_KEY,
+                "RELAYER_API_KEY_ADDRESS": RELAYER_API_KEY_ADDRESS,
+            },
+            timeout=15,
+        )
+        result = resp.json()
+        tx_id = result.get("transactionID", "")
+        state = result.get("state", "")
+
+        if resp.status_code == 200 and tx_id:
+            log.info(f"  ⚡ Relayer 免gas提交: txID={tx_id[:20]}... state={state}")
+
+            # 等待确认（轮询状态）
+            for _ in range(30):  # 最多等30秒
+                time.sleep(1)
+                try:
+                    status_resp = requests.get(
+                        f"{RELAYER_URL}/transaction",
+                        params={"id": tx_id},
+                        headers={
+                            "RELAYER_API_KEY": RELAYER_API_KEY,
+                            "RELAYER_API_KEY_ADDRESS": RELAYER_API_KEY_ADDRESS,
+                        },
+                        timeout=10,
+                    )
+                    status = status_resp.json()
+                    cur_state = status.get("state", "")
+                    tx_hash = status.get("transactionHash", "")
+                    if cur_state == "STATE_CONFIRMED":
+                        log.info(f"  ✅ Relayer 免gas确认: {tx_hash}")
+                        return tx_hash
+                    elif cur_state == "STATE_FAILED":
+                        log.warning(f"  ❌ Relayer 交易失败: {status}")
+                        return None
+                    elif cur_state == "STATE_INVALID":
+                        log.warning(f"  ❌ Relayer 交易无效: {status}")
+                        return None
+                except Exception:
+                    pass
+
+            log.warning(f"  ⏳ Relayer 超时未确认: txID={tx_id}")
+            return tx_id  # 返回 txID 供后续查
+
+        else:
+            log.warning(f"  ❌ Relayer 提交失败: {resp.status_code} {result}")
+            return None
+
+    except Exception as e:
+        log.warning(f"  Relayer 异常: {e}，回退自付gas")
+        return None
+
+
 def _send_tx(w3: Web3, wallet, target: str, call_data: bytes, holder: str | None = None) -> str | None:
     """
-    发送链上交易到目标合约。
-    holder=EOA 时直发；holder=Proxy Safe 时包装成 execTransaction 由 owner EOA 触发。
-    gasPrice 加 1.3x 倍率应对 Polygon 拥堵；超时后回查 receipt 兜底。
-
-    Returns: tx_hash hex string on success, None on failure
+    发送链上交易。优先 Relayer（免gas），失败回退自付 gas。
     """
+    # 优先 Relayer（仅 Proxy Safe 持仓）
+    holder_cs = Web3.to_checksum_address(holder or wallet.address)
+    proxy_cs = Web3.to_checksum_address(PROXY_WALLET) if PROXY_WALLET else ""
+    log.info(f"  [Relayer] check: key={'✓' if RELAYER_API_KEY else '✗'} holder={holder_cs[:10]} proxy={proxy_cs[:10]} match={holder_cs==proxy_cs} sig_type={CLOB_SIGNATURE_TYPE}")
+    if RELAYER_API_KEY and holder_cs == proxy_cs and CLOB_SIGNATURE_TYPE == 2:
+        result = _send_tx_relayer(w3, wallet, target, call_data, holder)
+        if result:
+            return result
+        log.info("  ↻ Relayer 失败，回退自付gas")
+
+    # 回退：自付 gas
     target_cs, tx_data, _, route = _prepare_execution_tx(w3, wallet, holder, target, call_data)
 
     gas_estimate = w3.eth.estimate_gas(
@@ -651,7 +741,6 @@ def _send_tx(w3: Web3, wallet, target: str, call_data: bytes, holder: str | None
     try:
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     except Exception:
-        # 超时：交易可能还在 mempool，回查一次 receipt
         try:
             receipt = w3.eth.get_transaction_receipt(tx_hash)
             if receipt and receipt.status == 1:
@@ -659,7 +748,6 @@ def _send_tx(w3: Web3, wallet, target: str, call_data: bytes, holder: str | None
                 return tx_hash.hex()
         except Exception:
             pass
-        # 真的没上链，抛出带 tx_hash 的异常供上层判断
         raise TimeoutError(f"tx_pending:{tx_hash.hex()}")
 
     if receipt.status == 1:
@@ -813,16 +901,52 @@ def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
     if not positions:
         return []
 
+    proxy_cs = Web3.to_checksum_address(PROXY_WALLET) if PROXY_WALLET else ""
+    use_relayer = bool(RELAYER_API_KEY and CLOB_SIGNATURE_TYPE == 2 and proxy_cs)
+
+    relayer_results = []
+    selfpay_positions = []
+
+    # ── Relayer 免gas 阶段 ──
+    if use_relayer:
+        log.info(f"⚡ Relayer 免gas: 尝试 {len(positions)} 笔...")
+        for r in positions:
+            holder = r.get("holder", wallet.address)
+            holder_cs = Web3.to_checksum_address(holder)
+            if holder_cs != proxy_cs:
+                selfpay_positions.append(r)
+                continue
+            cid = r["condition_id"]
+            neg_risk = r.get("neg_risk", False)
+            balance = r.get("balance", 0)
+            try:
+                target, call_data = _build_redeem_calldata(w3, cid, neg_risk, balance)
+                tx_hash = _send_tx_relayer(w3, wallet, target, call_data, holder)
+                if tx_hash:
+                    log.info(f"  ⚡ Relayer 免gas成功: {r.get('slug', '')[:35]}")
+                    relayer_results.append({"position": r, "success": True, "tx_hash": tx_hash})
+                    continue
+            except Exception as e:
+                log.warning(f"  Relayer 异常: {r.get('slug', '')[:35]} | {e}")
+            log.info(f"  ↻ Relayer→自付gas: {r.get('slug', '')[:35]}")
+            selfpay_positions.append(r)
+
+        relayer_ok = len(relayer_results)
+        log.info(f"  📋 Relayer: {relayer_ok}/{len(positions)} 免gas成功, {len(selfpay_positions)} 回退自付gas")
+        if not selfpay_positions:
+            return relayer_results
+    else:
+        selfpay_positions = positions
+
+    # ── Phase 1: 批量发送（自付gas）──
     base_nonce = w3.eth.get_transaction_count(wallet.address, "pending")
     gas_price = int(w3.eth.gas_price * 1.3)
-
-    # ── Phase 1: 批量发送 ──
     sent = []  # (position, tx_hash_bytes, neg_risk_used)
     send_ok = 0
 
-    log.info(f"⚡ Phase 1: 并行发送 {len(positions)} 笔 redeem 交易...")
+    log.info(f"⚡ Phase 1: 并行发送 {len(selfpay_positions)} 笔 redeem 交易...")
 
-    for i, r in enumerate(positions):
+    for i, r in enumerate(selfpay_positions):
         cid = r["condition_id"]
         neg_risk = r.get("neg_risk", False)
         balance = r.get("balance", 0)
@@ -863,9 +987,9 @@ def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
 
         # 每 20 笔打印进度
         if (i + 1) % 20 == 0:
-            log.info(f"  📤 已发送 {i+1}/{len(positions)} ...")
+            log.info(f"  📤 已发送 {i+1}/{len(selfpay_positions)} ...")
 
-    log.info(f"  📤 发送完毕: {send_ok}/{len(positions)} 笔")
+    log.info(f"  📤 发送完毕: {send_ok}/{len(selfpay_positions)} 笔")
 
     # ── Phase 2: 收集回执 ──
     log.info(f"⏳ Phase 2: 收集回执...")
@@ -921,7 +1045,7 @@ def parallel_redeem(w3: Web3, wallet, positions: list[dict]) -> list[dict]:
                        if res["position"]["condition_id"] == r["condition_id"] and res["success"])
         log.info(f"  📋 Phase 3 结果: {retry_ok}/{len(retry_list)} 重试成功")
 
-    return results
+    return relayer_results + results
 
 
 # ==============================================================================
@@ -975,48 +1099,49 @@ def _format_usdc_balance_line(label: str, balances: dict[str, float | None]) -> 
     )
 
 
-def cleanup_false_redeemed(w3: Web3, wallet, ctf_contract) -> int:
+def cleanup_false_redeemed(w3: Web3 = None, wallet=None, ctf_contract=None) -> int:
     """
     启动时清理假标记：检查 redeemed_conditions.json 中的记录，
-    如果链上 token 余额仍 > 0，说明未真正领取，移除标记以便重试。
+    如果 data-api 仍返回该 condition 为 redeemable，说明未真正领取，移除标记以便重试。
+    零 RPC 调用。
     """
     redeemed = load_redeemed()
     if not redeemed:
         return 0
 
-    eoa_cs = Web3.to_checksum_address(wallet.address)
-    check_addrs = [eoa_cs]
-    if PROXY_WALLET and PROXY_WALLET.lower() != wallet.address.lower():
-        check_addrs.append(Web3.to_checksum_address(PROXY_WALLET))
+    # 通过 data-api 获取当前仍可领取的 condition
+    still_redeemable: set[str] = set()
+    proxy_cs = Web3.to_checksum_address(PROXY_WALLET) if PROXY_WALLET else ""
+    eoa_cs = Web3.to_checksum_address(EOA_WALLET) if EOA_WALLET else ""
 
-    # 获取当前持仓以获取 token_id
-    positions = fetch_positions()
-    token_map = {}  # condition_id -> token_id
-    for p in positions:
-        cid = p.get("conditionId") or p.get("condition_id", "")
-        tid = p.get("asset") or p.get("token_id", "")
-        if cid and tid:
-            token_map[cid] = tid
+    for addr, label in [(proxy_cs, "proxy"), (eoa_cs, "eoa")]:
+        if not addr:
+            continue
+        for endpoint in ["/positions", "/closed-positions"]:
+            try:
+                resp = requests.get(
+                    f"{DATA_API}{endpoint}",
+                    params={"user": addr, "redeemable": "true", "limit": 200, "sizeThreshold": 0},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    for p in data:
+                        cid = p.get("conditionId") or p.get("condition_id", "")
+                        if cid and float(p.get("size", 0) or 0) > 0:
+                            still_redeemable.add(cid)
+            except Exception:
+                pass
 
     removed = 0
     to_remove = []
 
     for cond_id in list(redeemed.keys()):
-        token_id = token_map.get(cond_id)
-        if not token_id:
-            continue  # 没有 token_id 无法验证，保留标记
-
-        # 链上检查余额
-        for addr in check_addrs:
-            try:
-                bal = ctf_contract.functions.balanceOf(addr, int(token_id)).call()
-                if bal > 0:
-                    slug = redeemed[cond_id].get("slug", cond_id[:18])
-                    log.info(f"  🔄 清理假标记: {slug} (余额仍有 {bal})")
-                    to_remove.append(cond_id)
-                    break
-            except Exception:
-                continue
+        if cond_id in still_redeemable:
+            slug = redeemed[cond_id].get("slug", cond_id[:18])
+            log.info(f"  🔄 清理假标记: {slug} (API 仍显示可领取)")
+            to_remove.append(cond_id)
 
     for cid in to_remove:
         del redeemed[cid]
@@ -1098,23 +1223,22 @@ def do_redeem(w3: Web3, wallet, ctf_contract, usdc_contract) -> float:
             fail_count += 1
             continue
 
-        # 链上验证: token 余额是否真正减少
-        actually_redeemed = False
+        # 验证: tx 成功即视为已领取（Relayer 已确认 / receipt.status==1）
+        # 链上 balanceOf 仅作 best-effort 二次验证，超时不阻塞
+        actually_redeemed = True
         if token_id:
-            for addr in check_addrs:
-                try:
-                    new_bal = ctf_contract.functions.balanceOf(addr, int(token_id)).call()
+            try:
+                for addr in check_addrs:
+                    new_bal = ctf_contract.functions.balanceOf(addr, int(token_id)).call(
+                        block_identifier="latest"
+                    )
                     if new_bal < balance_before:
-                        actually_redeemed = True
                         break
-                except Exception:
-                    continue
-            if not actually_redeemed:
-                log.warning(f"  ⚠️ tx成功但余额未变，不标记: {slug}")
-                fail_count += 1
-                continue
-        else:
-            actually_redeemed = True
+                else:
+                    # 所有地址余额未变 — 可能 RPC 缓存延迟，仍标记成功但 warn
+                    log.warning(f"  ⚠️ tx成功但余额未变（可能RPC延迟）: {slug}")
+            except Exception:
+                pass  # RPC 不可达时不阻塞，信任 tx receipt
 
         success_count += 1
         successful_positions.append(r)
