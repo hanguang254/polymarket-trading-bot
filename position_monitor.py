@@ -2820,8 +2820,8 @@ def monitor():
                                     for _ol in _of:
                                         try:
                                             _op = json.loads(_ol.strip())
-                                            if not _op.get("closed"):
-                                                _known_tokens.add(_op.get("token_id", ""))
+                                            # 所有token都记录（包括closed的），防止重复写入
+                                            _known_tokens.add(_op.get("token_id", ""))
                                         except Exception:
                                             pass
                             for _ap in _api_positions:
