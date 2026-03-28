@@ -2796,6 +2796,7 @@ def monitor():
     last_wake_context = {"label": "startup", "detail": None}
     
     _orphan_last_scan = 0
+    _orphan_known_tokens = set()  # 内存去重：已处理过的token永远不再写入
 
     while True:
         try:
@@ -2814,13 +2815,13 @@ def monitor():
                             timeout=10,
                         ).json()
                         if isinstance(_api_positions, list) and _api_positions:
-                            _known_tokens = set()
+                            # 从文件+内存双重去重
+                            _known_tokens = set(_orphan_known_tokens)
                             if os.path.exists(POSITIONS_FILE):
                                 with open(POSITIONS_FILE) as _of:
                                     for _ol in _of:
                                         try:
                                             _op = json.loads(_ol.strip())
-                                            # 所有token都记录（包括closed的），防止重复写入
                                             _known_tokens.add(_op.get("token_id", ""))
                                         except Exception:
                                             pass
@@ -2848,12 +2849,14 @@ def monitor():
                                             _pf.write(json.dumps(_orphan_record) + "\n")
                                         fcntl.flock(_lfd, fcntl.LOCK_UN)
                                         _lfd.close()
+                                        _orphan_known_tokens.add(_ap_asset)  # 内存去重
                                         print(
                                             f"  🔍 孤儿token检测: {_ap.get('outcome','?')} "
                                             f"{_ap_size:.1f}份 @${_ap.get('avgPrice',0):.2f} "
                                             f"| {_ap.get('title','')[:30]} → 纳入管理")
                                     except Exception as _we:
                                         print(f"  ⚠️ 孤儿token写入失败: {_we}")
+                                    _orphan_known_tokens.add(_ap_asset)  # 即使写入失败也标记已知
                 except Exception as _oe:
                     pass  # 扫描失败不影响主循环
 
