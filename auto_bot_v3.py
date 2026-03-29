@@ -888,12 +888,16 @@ class MarketTracker:
                             _old_price = ambush["price"]
                             _old_oid = ambush.get("order_id")
 
-                            if abs(_new_price - _old_price) < 0.02:
+                            AMBUSH_REPRICE_MIN_DELTA = float(
+                                os.environ.get("SNIPER_AMBUSH_REPRICE_MIN_DELTA", "0.02")
+                            )
+                            _price_delta = abs(_new_price - _old_price)
+                            if _price_delta < AMBUSH_REPRICE_MIN_DELTA:
                                 logger.info(
                                     f"  [伏] 价格稳定: {coin} ${_old_price:.2f}→${_new_price:.2f} "
-                                    f"(差${abs(_new_price-_old_price):.2f}<$0.02 不追价)")
+                                    f"(差${_price_delta:.2f}<${AMBUSH_REPRICE_MIN_DELTA:.2f} 不追价)")
 
-                            if abs(_new_price - _old_price) >= 0.02:
+                            if _price_delta >= AMBUSH_REPRICE_MIN_DELTA:
                                 # GTD追价：旧单会自动过期（由 SNIPER_AMBUSH_GTD_REPRICE_SEC 控制），不需要手动撤
                                 # 仍然尝试批量撤加速（但不依赖它成功）
                                 _old_oids = [oid for oid in dict.fromkeys(ambush.get("all_order_ids", [])) if oid]
