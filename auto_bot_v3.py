@@ -979,6 +979,30 @@ class MarketTracker:
         AMBUSH_PRICE = round((_p_win - AMBUSH_EDGE) / 0.01) * 0.01  # tick 对齐
         AMBUSH_PRICE = max(AMBUSH_MIN_PRICE, min(AMBUSH_MAX_PRICE, AMBUSH_PRICE))
 
+        # v12.9.11: CLOB感知定价 — 当市场价远高于模型价时，参考ask下方挂单
+        AMBUSH_ASK_OFFSET = float(os.environ.get("SNIPER_AMBUSH_ASK_OFFSET", "0.05"))
+        AMBUSH_MAX_GAP = float(os.environ.get("SNIPER_AMBUSH_MAX_GAP", "0.15"))
+        from ai_trader.polymarket_ws import poly_ws as _ambush_ws
+        _, _real_ask = _ambush_ws.get_best_bid_ask(token)
+        if _real_ask and 0.01 < _real_ask < 0.99:
+            _gap_to_market = _real_ask - AMBUSH_PRICE
+            if _gap_to_market > AMBUSH_MAX_GAP:
+                # 市场比模型贵太多，放弃挂单（几乎不可能成交）
+                logger.info(
+                    f"  [伏] 市场价过远跳过: {coin} {gap_dir} "
+                    f"model=${AMBUSH_PRICE:.2f} ask=${_real_ask:.2f} "
+                    f"gap=${_gap_to_market:.2f}>${AMBUSH_MAX_GAP} → 不挂单")
+                return
+            elif _gap_to_market > AMBUSH_ASK_OFFSET:
+                # 市场略贵，提价到 ask 下方 offset 处
+                _market_price = round(_real_ask - AMBUSH_ASK_OFFSET, 2)
+                _market_price = max(AMBUSH_MIN_PRICE, min(AMBUSH_MAX_PRICE, _market_price))
+                logger.info(
+                    f"  [伏] CLOB感知提价: {coin} {gap_dir} "
+                    f"model=${AMBUSH_PRICE:.2f} ask=${_real_ask:.2f} "
+                    f"→ ${_market_price:.2f} (ask-{AMBUSH_ASK_OFFSET})")
+                AMBUSH_PRICE = _market_price
+
         # Kelly 仓位计算
         _br = get_base_rate(diff_atr)
         _kr = 0.5 if _br < 0.55 else 1.0

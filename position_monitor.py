@@ -1353,7 +1353,25 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
                 _balance_cache.pop(token_id, None)
                 _remain = _check_and_adjust_size(token_id, size, position=position)
                 if _remain and _remain > 0.5:
-                    print(f"    ⚡ FAK部分成交: 剩余{_remain:.2f}份，继续卖出")
+                    # 记录已成交部分的 PnL（size - _remain = 本轮成交量）
+                    sold_count = round(size - _remain, 6)
+                    if sold_count > 0 and position is not None:
+                        entry_price = _safe_float(position.get("entry_price")) or 0
+                        if entry_price > 0:
+                            partial = {"price": actual_price, "size": sold_count,
+                                       "time": datetime.now(timezone.utc).isoformat(),
+                                       "type": "fak_partial"}
+                            partials = position.get("partial_exits") or []
+                            partials.append(partial)
+                            position["partial_exits"] = partials
+                            from trading_state import record_partial_pnl
+                            record_partial_pnl(position.get("slug", ""), actual_price, sold_count, entry_price)
+                            update_position(position, partial_exit=partial)
+                            print(f"    ⚡ FAK部分成交: 已售{sold_count:.2f}份@${actual_price:.4f} 剩余{_remain:.2f}份，继续卖出")
+                        else:
+                            print(f"    ⚡ FAK部分成交: 剩余{_remain:.2f}份，继续卖出")
+                    else:
+                        print(f"    ⚡ FAK部分成交: 剩余{_remain:.2f}份，继续卖出")
                     size = _remain
                     continue  # 下一轮降价卖剩余
                 elif _remain and 0 < _remain <= 0.5:
@@ -2133,6 +2151,15 @@ def execute_dip_buy(token_id, original_size, coin, slug, pos):
             total_balance = None
         if total_balance is not None and total_balance > 0:
             net_added_size = max(round(total_balance - current_net_size, 6), 0.0)
+
+        # 健全性检查：net_added_size 不应小于 gross_size 的 50%
+        # (正常fee约2-5%，如果net<gross的50%说明余额查询异常，回退到公式估算)
+        if net_added_size is not None and actual_gross_size > 0:
+            if net_added_size < actual_gross_size * 0.50:
+                print(
+                    f"    ⚠️ 抄底余额异常: net_added={net_added_size:.4f} < gross×50%={actual_gross_size*0.50:.4f} "
+                    f"(bal={total_balance} cur={current_net_size})，回退公式估算")
+                net_added_size = None  # 回退让 estimate_buy_fill 用费率公式
 
         fill_summary = estimate_buy_fill(
             price=actual_gross_price,
@@ -3699,6 +3726,10 @@ def monitor():
                             new_size = _safe_float(pos.get("token_balance")) or round(size + bought_size, 6)
                             total_cost = round(entry_price * size + buy_price * bought_size, 6)
                             new_avg_price = total_cost / new_size if new_size > 0 else entry_price
+                            # 健全性检查：均价不应超过1.0（二元市场token价格范围0-1）
+                            if new_avg_price > 1.0 or new_avg_price < 0.01:
+                                print(f"    ⚠️ 均价异常 ${new_avg_price:.3f}，回退用原入场价")
+                                new_avg_price = entry_price
                             pos["original_size"] = pos.get("original_size") or size
                             pos["original_entry_price"] = pos.get("original_entry_price") or entry_price
                             pos["dip_buy_price"] = buy_price
