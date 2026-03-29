@@ -1353,8 +1353,13 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
                 _balance_cache.pop(token_id, None)
                 _remain = _check_and_adjust_size(token_id, size, position=position)
                 if _remain and _remain > 0.5:
-                    # 记录已成交部分的 PnL（size - _remain = 本轮成交量）
-                    sold_count = round(size - _remain, 6)
+                    # 记录已成交部分的 PnL
+                    # 优先用 taking/price 算成交份数（余额API可能有延迟）
+                    _taking_val = _safe_float(info.get("taking"))
+                    if _taking_val and _taking_val > 0 and actual_price > 0:
+                        sold_count = round(_taking_val / actual_price, 6)
+                    else:
+                        sold_count = round(size - _remain, 6)
                     if sold_count > 0 and position is not None:
                         entry_price = _safe_float(position.get("entry_price")) or 0
                         if entry_price > 0:
