@@ -3724,7 +3724,11 @@ def monitor():
                         if dip_ok:
                             dip_bought[attempt_key] = True
                             new_size = _safe_float(pos.get("token_balance")) or round(size + bought_size, 6)
-                            total_cost = round(entry_price * size + buy_price * bought_size, 6)
+                            # 均价计算：用当前持有份额的成本 + 抄底成本
+                            # size 可能被 FAK 部分成交改小过，要用实际持有量而非原始总量
+                            _current_holding_cost = round(entry_price * size, 6)
+                            _dip_cost = round(buy_price * bought_size, 6)
+                            total_cost = round(_current_holding_cost + _dip_cost, 6)
                             new_avg_price = total_cost / new_size if new_size > 0 else entry_price
                             # 健全性检查：均价不应超过1.0（二元市场token价格范围0-1）
                             if new_avg_price > 1.0 or new_avg_price < 0.01:
