@@ -3446,11 +3446,35 @@ def monitor():
                         continue
 
                 # ═══ P0: 双曲贴现止盈 + v12.8 Trailing Take-Profit ═══
-                # v12.9.4: 伏击仓位跳过P0/Trailing TP，持有到结算拿$1.00
+                # v12.9.16: 伏击仓位有GTD止盈单 → 检查止盈单状态，不无脑持有
                 _is_ambush_pos = pos.get("ambush", False)
                 if _is_ambush_pos and profit_rate > 0:
-                    print(f"  💎 伏击持有到结算: +{profit_rate*100:.1f}% | 剩余{remaining:.0f}s (跳过P0止盈)")
-                    continue
+                    _tp_oid = pos.get("tp_order_id")
+                    if _tp_oid:
+                        # 有止盈单：检查是否已成交
+                        try:
+                            _tp_info = clob_client.get_order(_tp_oid)
+                            _tp_status = (_tp_info.get("status", "") if _tp_info else "").upper()
+                            if _tp_status in ("MATCHED", "FILLED"):
+                                _tp_price = pos.get("tp_price", current_price)
+                                print(f"  💰 伏击止盈成交! @${_tp_price:.2f} (+{profit_rate*100:.1f}%)")
+                                self_notify(pos, _tp_price, coin, direction, size, "伏击GTD止盈")
+                                close_position(pos, _tp_price)
+                                close_attempts.pop(attempt_key, None)
+                                continue
+                            elif _tp_status in ("CANCELLED", "CANCELED", "EXPIRED"):
+                                # 止盈单已过期/撤销 → 进入正常P0/阶段4逻辑
+                                print(f"  📋 伏击止盈单已过期({_tp_status}) | 剩余{remaining:.0f}s → 进入兜底")
+                            else:
+                                # 止盈单仍活跃 → 等待成交
+                                print(f"  💎 伏击止盈等待中: +{profit_rate*100:.1f}% | 剩余{remaining:.0f}s | 止盈@${pos.get('tp_price', 0):.2f}")
+                                continue
+                        except Exception as _tp_e:
+                            print(f"  ⚠️ 止盈单查询异常: {_tp_e}")
+                    else:
+                        # 无止盈单（旧仓位/未开启） → 原逻辑持有到结算
+                        print(f"  💎 伏击持有到结算: +{profit_rate*100:.1f}% | 剩余{remaining:.0f}s (跳过P0止盈)")
+                        continue
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K, entry_price)
 
                 # v12.8: 持续更新 high_water_mark（无论是否达标都要追踪）

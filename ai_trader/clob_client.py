@@ -23,6 +23,11 @@ _client: ClobClient = None
 _client_lock = threading.Lock()  # httpx HTTP/2不线程安全，所有SDK HTTP调用需加锁
 _executor = ThreadPoolExecutor(max_workers=4)
 
+# ── Heartbeat（崩溃安全网：15s无心跳自动撤所有挂单） ──
+_heartbeat_running = False
+_heartbeat_id = ""
+_heartbeat_thread = None
+
 # ── 订单簿缓存（2秒TTL，消除同一分析周期内的重复HTTP请求） ──
 _book_cache = {}        # token_id -> (book, timestamp)
 _book_cache_lock = threading.Lock()
@@ -69,6 +74,61 @@ def init_client():
 
     # 启动连接保活守护线程：每30s发GET防止HTTP/2连接超时断开
     _start_keepalive()
+
+    # Heartbeat 不在 init_client() 自动启动 — 由调用方按需调用 start_heartbeat()
+    # 原因：position_monitor 也调用 init_client()，但不需要 heartbeat（不下挂单）
+    # 两个进程同时发 heartbeat 会互踩 heartbeat_id 导致频繁 400
+
+
+def start_heartbeat():
+    """Polymarket Heartbeat — 每5s发送，15s无心跳自动撤所有挂单（崩溃安全网）
+
+    机制：POST /v1/heartbeats，服务端10s+5s缓冲超时。
+    Bot崩溃/断网时，所有GTD/GTC挂单在15s内被交易所自动撤销。
+    """
+    global _heartbeat_running, _heartbeat_id, _heartbeat_thread
+    if _heartbeat_running:
+        return
+    _heartbeat_running = True
+
+    def _heartbeat_loop():
+        global _heartbeat_id, _heartbeat_running
+        _interval = float(os.environ.get("HEARTBEAT_INTERVAL", "5"))
+        _consecutive_fails = 0
+        # 首次立即发送心跳（不先 sleep），确保启动后即 arm 安全网
+        while _heartbeat_running:
+            try:
+                with _client_lock:
+                    resp = _client.post_heartbeat(_heartbeat_id or "")
+                if isinstance(resp, dict):
+                    _heartbeat_id = resp.get("heartbeat_id", _heartbeat_id)
+                elif hasattr(resp, "heartbeat_id"):
+                    _heartbeat_id = resp.heartbeat_id or _heartbeat_id
+                _consecutive_fails = 0
+            except Exception as e:
+                _consecutive_fails += 1
+                _err_msg = str(e)
+                # 400 = expired heartbeat_id，从响应中提取正确的id重试
+                if "400" in _err_msg:
+                    logger.warning(f"💓 Heartbeat id过期，重置为空重试")
+                    _heartbeat_id = ""
+                elif _consecutive_fails >= 3:
+                    logger.error(f"💓 Heartbeat连续失败{_consecutive_fails}次: {_err_msg[:80]}")
+                else:
+                    logger.warning(f"💓 Heartbeat失败: {_err_msg[:80]}")
+            time.sleep(_interval)
+
+    _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    _heartbeat_thread.start()
+    _log_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "5"))
+    logger.info(f"💓 Heartbeat已启动 ({_log_interval}s间隔，15s超时自动撤全部挂单)")
+
+
+def stop_heartbeat():
+    """停止心跳 — 进程退出前调用，15s内交易所自动撤所有挂单"""
+    global _heartbeat_running
+    _heartbeat_running = False
+    logger.info("💓 Heartbeat已停止，15s内所有挂单将被自动撤销")
 
 
 def _start_keepalive():
@@ -424,7 +484,9 @@ def cancel_orders_batch(order_ids):
         canceled = resp.get("canceled", []) if isinstance(resp, dict) else []
         not_canceled = resp.get("not_canceled", {}) if isinstance(resp, dict) else {}
         if not_canceled:
-            logger.warning(f"Batch cancel: {len(canceled)} ok, {len(not_canceled)} failed: {list(not_canceled.keys())[:3]}")
+            # 打印 order_id + reason（而不只是 id），方便诊断
+            _details = [(k[:16], v) for k, v in (not_canceled.items() if isinstance(not_canceled, dict) else [(str(x), "?") for x in not_canceled])]
+            logger.warning(f"Batch cancel: {len(canceled)} ok, {len(not_canceled)} failed: {_details[:3]}")
         return canceled, not_canceled
     except Exception as e:
         logger.warning(f"Batch cancel failed ({len(ids)} orders): {e}")
