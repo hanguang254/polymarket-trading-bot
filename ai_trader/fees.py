@@ -4,6 +4,12 @@ Polymarket taker fee helpers.
 This repo trades crypto markets, so the default category assumption is
 "crypto". The exponent can still be overridden via env when Polymarket
 changes fee schedules again.
+
+Fee schedule verified 2026-03-31 against docs.polymarket.com/trading/fees:
+  Crypto: fee_rate=0.072 (720bps from SDK), exponent=1, peak 1.80% at p=0.50
+  Maker: 0 fee + 20% daily rebate (GTD/GTC limit orders)
+  Taker: bell-curve fee = C × p × fee_rate × (p×(1-p))^exponent
+  Fee at p=0.80: 1.15%, at p=0.90: 0.65%, at p=0.95: 0.34%
 """
 import os
 

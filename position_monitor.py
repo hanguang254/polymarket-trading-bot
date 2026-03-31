@@ -93,7 +93,7 @@ TRAILING_TP_TIME_TIGHTEN = float(os.environ.get("TRAILING_TP_TIME_TIGHTEN", "0.5
 PRICE_DROP_TRIGGER = float(os.environ.get("PRICE_DROP_TRIGGER", "0.15"))
 PRICE_DROP_HARD_STOP = float(os.environ.get("PRICE_DROP_HARD_STOP", "0.25"))
 # v12.8: 无条件绝对硬止损 — 不看方向、不看EV、不看ATR，跌到就走
-ABSOLUTE_HARD_STOP = float(os.environ.get("ABSOLUTE_HARD_STOP", "0.40"))
+ABSOLUTE_HARD_STOP = float(os.environ.get("ABSOLUTE_HARD_STOP", "0.30"))
 ATR_SAFE_THRESHOLD = float(os.environ.get("ATR_SAFE_THRESHOLD", "2.0"))
 ATR_DANGER_THRESHOLD = float(os.environ.get("ATR_DANGER_THRESHOLD", "1.0"))
 DIP_BUY_SIZE_RATIO = float(os.environ.get("DIP_BUY_SIZE_RATIO", "0.50"))
@@ -1270,6 +1270,8 @@ def _calculate_total_realized_pnl(position, final_exit_price):
     final_size = _position_size(position)
     final_exit_price = _safe_float(final_exit_price) or 0.0
 
+    # _position_size 返回 partial 后的剩余仓位（token_balance/size 已同步更新）
+    # 直接用作主退出份数，partial 单独叠加
     total_pnl = (final_exit_price - entry) * final_size if entry > 0 and final_size > 0 else 0.0
     for partial in position.get("partial_exits", []) or []:
         part_price = _safe_float(partial.get("price"))
@@ -1281,7 +1283,7 @@ def _calculate_total_realized_pnl(position, final_exit_price):
     return round(total_pnl, 4)
 
 
-def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel=False, max_retries=3):
+def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel=False, max_retries=3, remaining=None):
     """市价立即卖出（止损专用）
     价格策略（逐级降价，追求成交而非价格）：
       1. 外部传入 price（调用方已有 best_bid，避免重复查询）
@@ -1292,6 +1294,7 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
       success=False, actual_price=None: 正常失败
       success=False, actual_price="NO_BALANCE": token余额为零，不必再重试
     skip_cancel: 调用方已执行cancel_all_orders时传True，避免重复网络调用
+    remaining: 剩余秒数（None=从position slug自动推断，0=禁用maker退出，>0=可尝试maker）
     """
     # 先取消可能存在的旧挂单，释放被锁定的token余额
     if not skip_cancel:
@@ -1311,6 +1314,68 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
         return False, "NO_BALANCE"
     if adjusted is not None:
         size = adjusted
+
+    # ── v13.1 M1: Maker Exit — GTD SELL先尝试(0手续费+20%返佣) ──
+    if remaining is None and position:
+        try:
+            _slug = position.get("slug", "")
+            _start_ts = int(str(_slug).split("-")[-1])
+            remaining = max(_start_ts + 300 - time.time(), 0)
+        except Exception:
+            remaining = 0
+    elif remaining is None:
+        remaining = 0
+
+    _MAKER_EXIT_ENABLED = os.environ.get("MAKER_EXIT_ENABLED", "1") == "1"
+    _MAKER_EXIT_MIN_REMAINING = float(os.environ.get("MAKER_EXIT_MIN_REMAINING", "30"))
+    _MAKER_EXIT_WAIT = float(os.environ.get("MAKER_EXIT_WAIT", "8"))
+
+    if _MAKER_EXIT_ENABLED and remaining > _MAKER_EXIT_MIN_REMAINING:
+        quote = _get_fresh_exit_quote(token_id, price_hint=price)
+        _maker_bid = _safe_float(quote.get("best_bid"))
+        if _maker_bid and _maker_bid > 0.05:
+            # 在best_bid上方1tick挂卖 → 确保不立即match → maker身份(0手续费+返佣)
+            _maker_price = round(_maker_bid + 0.01, 2)
+            from py_clob_client.clob_types import OrderType as _MakerOT
+            _maker_exp = int(time.time()) + 60 + int(_MAKER_EXIT_WAIT)
+            print(
+                f"    🏷️ Maker退出: GTD SELL @${_maker_price:.2f} ×{size:.2f} "
+                f"| bid=${_maker_bid:.2f} | 等{_MAKER_EXIT_WAIT:.0f}s"
+            )
+            try:
+                _maker_result = clob_client.place_order(
+                    token_id, SELL, _maker_price, size,
+                    order_type=_MakerOT.GTD, expiration=_maker_exp)
+                _maker_oid = _maker_result.get("order_id")
+                if _maker_result.get("matched"):
+                    _taking = _maker_result.get("taking", 0) or (_maker_price * size)
+                    _actual = round(_taking / size, 4) if size > 0 and _taking > 0 else _maker_price
+                    print(f"    🏷️ Maker即时成交! ${_actual:.4f} (0手续费)")
+                    return True, _actual
+                if _maker_oid:
+                    _wait_end = time.time() + _MAKER_EXIT_WAIT
+                    while time.time() < _wait_end:
+                        time.sleep(2)
+                        _balance_cache.pop(token_id, None)
+                        _remain = _check_and_adjust_size(token_id, size, position=position)
+                        if _remain == 0 or _remain == -1:
+                            print(f"    🏷️ Maker成交! ${_maker_price:.4f} (0手续费+返佣)")
+                            return True, _maker_price
+                    # 超时 → 撤maker单，准备FAK fallback
+                    try:
+                        clob_client.cancel_order(_maker_oid)
+                    except Exception:
+                        pass
+                    _balance_cache.pop(token_id, None)
+                    _final_check = _check_and_adjust_size(token_id, size, position=position)
+                    if _final_check == 0 or _final_check == -1:
+                        print(f"    🏷️ Maker撤单时成交! ${_maker_price:.4f}")
+                        return True, _maker_price
+                    if _final_check is not None:
+                        size = _final_check
+                    print(f"    🏷️ Maker未成交({_MAKER_EXIT_WAIT:.0f}s)，切换FAK")
+            except Exception as e:
+                print(f"    🏷️ Maker挂单失败: {str(e)[:60]}，切换FAK")
 
     allowance_refreshed = False
     last_bucket = "unknown"
@@ -1354,26 +1419,30 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
 
         if info["matched"]:
             _taking = info.get("taking", 0) or 0
-            gross_price = round(_taking / size, 4) if size > 0 and _taking > 0 else sell_price
-            fill_summary = _sell_fill_summary(token_id, size, _taking, gross_price)
+            _making = _safe_float(info.get("making")) or 0  # 实际成交份数
+            _filled = _making if _making > 0 else size
+            gross_price = round(_taking / _filled, 4) if _filled > 0 and _taking > 0 else sell_price
+            fill_summary = _sell_fill_summary(token_id, _filled, _taking, gross_price)
             actual_price = round(fill_summary["net_price"], 4)
             print(
                 f"    ⚡ 市价成交: gross=${gross_price:.4f} | net=${actual_price:.4f} "
                 f"| fee=${fill_summary['fee_usdc']:.4f} | {info.get('elapsed_ms', 0):.0f}ms"
             )
 
-            # FAK 部分成交检查：查剩余余额
+            # FAK 部分成交检查
             if _use_fak:
                 _balance_cache.pop(token_id, None)
-                _remain = _check_and_adjust_size(token_id, size, position=position)
+                # fix: 用 API making 字段算成交份数（不受链上余额延迟影响）
+                sold_count = round(_making, 6) if _making > 0 else 0
+                if sold_count <= 0 and _taking > 0 and gross_price > 0:
+                    sold_count = round(_taking / gross_price, 6)
+                # fix: 用成交份数计算剩余，不依赖可能延迟的链上余额
+                if sold_count > 0:
+                    _remain = max(0, round(size - sold_count, 6))
+                else:
+                    _remain = _check_and_adjust_size(token_id, size, position=position)
                 if _remain and _remain > 0.5:
                     # 记录已成交部分的 PnL
-                    # 优先用 taking/price 算成交份数（余额API可能有延迟）
-                    _taking_val = _safe_float(info.get("taking"))
-                    if _taking_val and _taking_val > 0 and actual_price > 0:
-                        sold_count = round(_taking_val / actual_price, 6)
-                    else:
-                        sold_count = round(size - _remain, 6)
                     if sold_count > 0 and position is not None:
                         entry_price = _safe_float(position.get("entry_price")) or 0
                         if entry_price > 0:
@@ -1385,7 +1454,9 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
                             position["partial_exits"] = partials
                             from trading_state import record_partial_pnl
                             record_partial_pnl(position.get("slug", ""), actual_price, sold_count, entry_price)
-                            update_position(position, partial_exit=partial)
+                            position["size"] = _remain
+                            position["token_balance"] = _remain
+                            update_position(position, new_size=_remain, partial_exit=partial)
                             print(f"    ⚡ FAK部分成交: 已售{sold_count:.2f}份@${actual_price:.4f} 剩余{_remain:.2f}份，继续卖出")
                         else:
                             print(f"    ⚡ FAK部分成交: 剩余{_remain:.2f}份，继续卖出")
@@ -3444,7 +3515,7 @@ def monitor():
                     )
                     attempted_stop_loss = True
                     cancel_all_orders(token_id)
-                    ok, actual_price = market_sell_immediate(token_id, size, position=pos)
+                    ok, actual_price = market_sell_immediate(token_id, size, position=pos, remaining=0)
                     if actual_price == "NO_BALANCE":
                         print(f"  ⚠️ 绝对硬止损: 余额为零，等结算")
                         _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
@@ -3730,7 +3801,7 @@ def monitor():
                         _arm_close_intent(pos, _cb_reason)
                         close_intents[attempt_key] = {"reason": _cb_reason}
                         cancel_all_orders(token_id)
-                        ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True)
+                        ok, actual_price = market_sell_immediate(token_id, size, position=pos, skip_cancel=True, remaining=0)
                         if ok:
                             sold = True
                             sold_price = actual_price
