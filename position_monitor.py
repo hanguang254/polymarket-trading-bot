@@ -446,18 +446,27 @@ def _plan_dip_buy_size(token_id, original_size, buy_price):
 
 
 def _position_size(position):
+    """当前持有份数（监控用）— 信任链上余额，含 0"""
     token_balance = _safe_float(position.get("token_balance")) if isinstance(position, dict) else None
-    if token_balance and token_balance > 0:
-        return token_balance
+    if token_balance is not None:
+        return max(token_balance, 0.0)
     size = _safe_float(position.get("size")) if isinstance(position, dict) else None
     return size or 0.0
 
 
 def _realized_trade_size(position):
-    total = _position_size(position)
-    for partial in position.get("partial_exits", []) or []:
-        total += _safe_float(partial.get("size")) or 0.0
-    return round(total, 6)
+    """原始入场总份数（outcome 记录用）— 优先 entry_cost/entry_price 回推"""
+    entry_cost = _safe_float(position.get("entry_cost"))
+    entry_price = _safe_float(position.get("entry_price"))
+    if entry_cost and entry_price and entry_price > 0:
+        return round(entry_cost / entry_price, 6)
+    # 回退: size + partial_sizes
+    size = _safe_float(position.get("size")) or 0.0
+    partial_total = sum(
+        _safe_float(p.get("size")) or 0.0
+        for p in (position.get("partial_exits", []) or [])
+    )
+    return round(size + partial_total, 6)
 
 
 def _sell_fill_summary(token_id, size, gross_proceeds, gross_price):
@@ -1269,21 +1278,49 @@ def _bucket_exit_error(error_text):
 
 
 def _calculate_total_realized_pnl(position, final_exit_price):
-    """聚合部分成交和最终平仓，得到整笔交易的真实 realized PnL。"""
-    entry = _safe_float(position.get("entry_price")) or 0.0
-    final_size = _position_size(position)
+    """聚合部分成交和最终平仓，得到整笔交易的真实 realized PnL。
+
+    PnL = 总收入(exit_price × final_size + partial收入) - 实际 entry_cost
+    不依赖 _position_size（token_balance 可能是售后状态=0），独立推算最终退出份数。
+    """
     final_exit_price = _safe_float(final_exit_price) or 0.0
 
-    # _position_size 返回 partial 后的剩余仓位（token_balance/size 已同步更新）
-    # 直接用作主退出份数，partial 单独叠加
-    total_pnl = (final_exit_price - entry) * final_size if entry > 0 and final_size > 0 else 0.0
+    # ── 推算最终退出份数（不用 _position_size） ──
+    # 注意: size 可能已被 partial 流程更新为 remaining，不能当 original。
+    # entry_cost 和 entry_price 永远不被 partial 更新，用它们回推 original_total。
+    token_balance = _safe_float(position.get("token_balance")) if isinstance(position, dict) else None
+    partial_total = sum(
+        _safe_float(p.get("size")) or 0.0
+        for p in (position.get("partial_exits", []) or [])
+    )
+    if token_balance is not None and token_balance > 0:
+        # token_balance > 0 → 售前链上余额，直接作为最终退出份数
+        final_size = token_balance
+    else:
+        # 用 entry_cost / entry_price 回推原始总份数（partial-invariant）
+        _ec = _safe_float(position.get("entry_cost"))
+        _ep = _safe_float(position.get("entry_price"))
+        if _ec and _ep and _ep > 0:
+            original_total = _ec / _ep
+        else:
+            original_total = _safe_float(position.get("size")) or 0.0
+        final_size = max(original_total - partial_total, 0.0)
+
+    # ── 总收入 = 最终平仓收入 + 部分成交收入 ──
+    total_revenue = final_exit_price * final_size
     for partial in position.get("partial_exits", []) or []:
         part_price = _safe_float(partial.get("price"))
         part_size = _safe_float(partial.get("size"))
-        if part_price is None or part_size is None or entry <= 0:
-            continue
-        total_pnl += (part_price - entry) * part_size
+        if part_price is not None and part_size is not None:
+            total_revenue += part_price * part_size
 
+    # ── 总成本 = 实际 entry_cost（含手续费），回退 entry_price × original_size ──
+    entry_cost = _safe_float(position.get("entry_cost"))
+    if entry_cost is None or entry_cost <= 0:
+        entry_price = _safe_float(position.get("entry_price")) or 0.0
+        entry_cost = entry_price * (final_size + partial_total)
+
+    total_pnl = total_revenue - entry_cost
     return round(total_pnl, 4)
 
 
@@ -1622,7 +1659,7 @@ def close_position(position, exit_price):
                 "entry_price": entry,
                 "exit_price": exit_price,
                 "size": _realized_trade_size(position),
-                "entry_cost": round((_safe_float(entry) or 0.0) * _realized_trade_size(position), 6),
+                "entry_cost": round(_safe_float(position.get("entry_cost")) or ((_safe_float(entry) or 0.0) * _realized_trade_size(position)), 6),
                 "realized_pnl": total_pnl,
                 "realized_won": realized_won,
                 "directional_won": directional_won,
@@ -3289,7 +3326,19 @@ def monitor():
                                 settle_price = 1.00 if won else 0.00
                                 print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
-                                settle_price = current_price if current_price else entry_price
+                                # 孤儿无ptb: 尝试从WS/API获取token价（已结算≈0或1）
+                                _fb = get_best_bid_raw(token_id)
+                                if _fb is not None:
+                                    settle_price = 1.00 if _fb > 0.5 else 0.00
+                                    print(f"  ⚠️ 孤儿无ptb，用token价${_fb:.2f}→结算={settle_price:.0f}")
+                                else:
+                                    _raw_ltp = _safe_float(clob_client.get_last_trade_price(token_id))
+                                    if _raw_ltp is not None:
+                                        settle_price = 1.00 if _raw_ltp > 0.5 else 0.00
+                                        print(f"  ⚠️ 孤儿无ptb，用LTP=${_raw_ltp:.2f}→结算={settle_price:.0f}")
+                                    else:
+                                        settle_price = entry_price
+                                        print(f"  ⚠️ 孤儿无ptb且无市场数据，回退entry_price=${entry_price}")
                         close_position(pos, settle_price)
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
                         print(f"  {result_emoji} 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
@@ -3315,7 +3364,18 @@ def monitor():
                                 settle_price = 1.00 if won else 0.00
                                 print(f"  ⚠️ API无outcome，用{src}回退判断")
                             else:
-                                settle_price = current_price if current_price else entry_price
+                                _fb = get_best_bid_raw(token_id)
+                                if _fb is not None:
+                                    settle_price = 1.00 if _fb > 0.5 else 0.00
+                                    print(f"  ⚠️ 孤儿无ptb，用token价${_fb:.2f}→结算={settle_price:.0f}")
+                                else:
+                                    _raw_ltp = _safe_float(clob_client.get_last_trade_price(token_id))
+                                    if _raw_ltp is not None:
+                                        settle_price = 1.00 if _raw_ltp > 0.5 else 0.00
+                                        print(f"  ⚠️ 孤儿无ptb，用LTP=${_raw_ltp:.2f}→结算={settle_price:.0f}")
+                                    else:
+                                        settle_price = entry_price
+                                        print(f"  ⚠️ 孤儿无ptb且无市场数据，回退entry_price=${entry_price}")
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
                         print(f"  {result_emoji} {slug} 已关闭 结算价=${settle_price:.2f}")
                         close_position(pos, settle_price)

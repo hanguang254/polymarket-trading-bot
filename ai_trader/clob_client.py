@@ -528,23 +528,54 @@ def get_balance():
         return 0
 
 
-def get_token_balance(token_id):
-    """获取 conditional token 余额（份数单位）"""
+_bal_cache = {}       # token_id -> (balance, timestamp)
+_bal_429_until = 0.0  # 429 全局退避截止时间
+
+
+def get_token_balance(token_id, cache_ttl=0):
+    """获取 conditional token 余额（份数单位）
+
+    带 per-token 缓存和 429 全局退避（30s）：
+    - cache_ttl>0 时重复查同 token 直接返回缓存（默认 0 = 每次实时读取）
+    - 收到 429 后 30s 内返回缓存值，不打 API
+    """
+    global _bal_429_until
+    token_id = str(token_id)
+    now = time.time()
+    cached = _bal_cache.get(token_id)
+
+    # 429 退避期间返回缓存值
+    if now < _bal_429_until:
+        return cached[0] if cached else None
+
+    # 缓存 TTL 内直接返回
+    if cached and (now - cached[1]) < cache_ttl:
+        return cached[0]
+
     try:
         with _client_lock:
             resp = _client.get_balance_allowance(
                 BalanceAllowanceParams(
                     asset_type=AssetType.CONDITIONAL,
-                    token_id=str(token_id),
+                    token_id=token_id,
                 )
             )
         # API 返回原子单位（6位小数），需除以 1e6 转份数
         if isinstance(resp, dict):
-            return float(resp.get("balance", 0)) / 1e6
-        return float(getattr(resp, "balance", 0)) / 1e6
+            balance = float(resp.get("balance", 0)) / 1e6
+        else:
+            balance = float(getattr(resp, "balance", 0)) / 1e6
+        _bal_cache[token_id] = (balance, time.time())
+        return balance
     except Exception as e:
-        logger.warning(f"获取token余额失败: {e}")
-        return None
+        err_str = str(e)
+        if "429" in err_str or "Too Many" in err_str:
+            _bal_429_until = time.time() + 30
+            logger.warning(f"⚠️ balance-allowance 429限流，退避30秒")
+            return cached[0] if cached else None
+        else:
+            logger.warning(f"获取token余额失败: {e}")
+            return None
 
 
 def update_token_allowance(token_id):

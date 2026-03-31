@@ -686,7 +686,7 @@ class MarketTracker:
         放置逻辑在 _place_directional_ambush()，由 _sniper_scan 的 ask>MAX_PRICE 路径触发。
         """
         AMBUSH_WINDOW_END = float(os.environ.get("SNIPER_AMBUSH_END", "30"))
-        AMBUSH_BAL_INTERVAL = float(os.environ.get("SNIPER_AMBUSH_BAL_INTERVAL", "0.5"))
+        AMBUSH_BAL_INTERVAL = float(os.environ.get("SNIPER_AMBUSH_BAL_INTERVAL", "2.0"))
         AMBUSH_REPRICE_INTERVAL = float(os.environ.get("SNIPER_AMBUSH_REPRICE_INTERVAL", "0.2"))
 
         ambush = self._ambush_orders.get(slug)
@@ -714,8 +714,8 @@ class MarketTracker:
             # ── v13.1 M4: Bilateral fill detection ──
             if ambush.get("bilateral") and _should_check_bal:
                 ambush["last_bal_check"] = _now
-                _up_bal = clob_client.get_token_balance(ambush["up_token"]) or 0
-                _down_bal = clob_client.get_token_balance(ambush["down_token"]) or 0
+                _up_bal = clob_client.get_token_balance(ambush["up_token"], cache_ttl=2.0) or 0
+                _down_bal = clob_client.get_token_balance(ambush["down_token"], cache_ttl=2.0) or 0
                 _up_filled = _up_bal - ambush.get("bal_before_up", 0)
                 _down_filled = _down_bal - ambush.get("bal_before_down", 0)
                 _check_age = round(_now - ambush.get("placed_at", _now), 1)
@@ -762,7 +762,7 @@ class MarketTracker:
 
             elif _should_check_bal:
                 ambush["last_bal_check"] = _now
-                _bal = clob_client.get_token_balance(_token) or 0
+                _bal = clob_client.get_token_balance(_token, cache_ttl=2.0) or 0
                 _filled = _bal - ambush["bal_before"]
                 _check_age = round(_now - ambush.get("placed_at", _now), 1)
                 logger.debug(
