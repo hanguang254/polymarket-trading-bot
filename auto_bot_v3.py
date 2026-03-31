@@ -1042,7 +1042,8 @@ class MarketTracker:
                             _rw_rp = _random_walk_p_win(_gap_rp, atr_val, remaining)
                             _sig_rp = _get_bayesian_signal(_updater_rp, remaining_seconds=remaining)
                             _conf_rp = _sig_rp.get("confidence", 0) if _sig_rp else 0
-                            _p_win_rp = 0.5 + (max(_rw_rp, _conf_rp * 0.5 + 0.5) - 0.5) * 0.60
+                            _SHRINKAGE_RP = float(os.environ.get("SNIPER_AMBUSH_SHRINKAGE", "0.80"))
+                            _p_win_rp = 0.5 + (max(_rw_rp, _conf_rp * 0.5 + 0.5) - 0.5) * _SHRINKAGE_RP
                             # ── v13: 追价也用动态 EDGE — 时间衰减+波动率自适应 ──
                             _base_edge_rp = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))
                             _min_edge_rp = float(os.environ.get("SNIPER_AMBUSH_EDGE_MIN", "0.008"))
@@ -1113,7 +1114,7 @@ class MarketTracker:
                                         f"→ 降到${_new_price:.2f}(edge={_p_win_rp-_new_price:.3f})")
                                 else:
                                     _ask_str = f"ask${_rp_ask:.2f}" if _rp_ask else "ask未知"
-                                    logger.info(
+                                    logger.debug(
                                         f"  [伏] 禁止退让: {coin} ${_old_price:.2f}→${_new_price:.2f} "
                                         f"(旧单edge={_p_win_rp-_old_price:.3f}>{_min_edge_rp} 保持)")
 
@@ -1220,6 +1221,11 @@ class MarketTracker:
                                     ambush["order_id"] = _new_oid
                                     ambush["all_order_ids"] = [_new_oid] if _new_oid else []
                                     ambush["price"] = _new_price
+                                    if ambush.get("bilateral"):
+                                        if ambush["token"] == ambush.get("up_token"):
+                                            ambush["up_price"] = _new_price
+                                        else:
+                                            ambush["down_price"] = _new_price
                                     ambush["reprice_count"] = _reprice_count + 1
                                     ambush["gtd_expires_at"] = _gtd_exp_rp
                                     ambush["last_order_ts"] = time.time()  # v13 M4: 追价重置时间戳
@@ -1238,6 +1244,15 @@ class MarketTracker:
                                             f"(p_win={_p_win_rp:.3f} ATR={_diff_atr_rp:.2f}{_rp_ask_str} "
                                             f"已撤旧单 TTL={GTD_REPRICE_SEC}s "
                                             f"仅跟踪1单 第{_reprice_count+1}/{AMBUSH_REPRICE_MAX}次)")
+                else:
+                    # 追价次数耗尽 — 仍需检测GTD过期，否则订单已死但bot不知道
+                    _gtd_expired_post = _now > ambush.get("gtd_expires_at", float('inf'))
+                    if _gtd_expired_post:
+                        ambush["reprice_count"] = 0
+                        ambush["last_reprice"] = _now
+                        logger.info(
+                            f"  [伏] GTD过期(追价耗尽): {coin} {ambush['direction']} "
+                            f"重置追价计数 → 下轮重新挂单")
             return
 
         # 注意：放置逻辑已移到 _sniper_scan 的 "ask太贵" 路径，不在这里盲挂
@@ -1348,6 +1363,7 @@ class MarketTracker:
             "bal_before": 0, "bal_before_up": bal_up, "bal_before_down": bal_down,
             "placed_at": time.time(), "last_check": time.time(),
             "last_order_ts": time.time(),
+            "last_reprice": time.time(),  # 防止初始挂单立即触发追价检查
             "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
         }
         self._ambush_stat(slug, coin, bilateral=True, placed=True,
@@ -1585,6 +1601,7 @@ class MarketTracker:
                 "bal_before": bal_before,
                 "placed_at": time.time(), "last_check": time.time(),
                 "last_order_ts": time.time(),  # v13 M4: 当前订单下单时间(追价会重置)
+                "last_reprice": time.time(),  # 防止初始挂单立即触发追价检查
                 "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
             }
             self._ambush_stat(slug, coin, placed=True, price=AMBUSH_PRICE, direction=gap_dir)
