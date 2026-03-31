@@ -592,6 +592,7 @@ class MarketTracker:
         self._cached_balance = None               # v12.9: 预缓存余额，狙击线程Kelly用（每周期刷新）
         self._ambush_orders = {}                   # v12.9: slug -> {token, direction, order_id, price, size, bal_before, ...}
         self._ambush_cancelled_at = {}             # v12.9.1: slug -> timestamp, 撤单冷却防循环
+        self._ambush_stats = {}                    # v13.1: slug -> {checks, max_conf, max_atr, skip_reasons, placed, filled, ...}
         self._endgame_entered = set()              # v13.1 M2: 已执行endgame入场的slug
         self._restore_recent_market_state()
 
@@ -933,6 +934,7 @@ class MarketTracker:
                 logger.info(
                     f"\n🎯 伏击成交! {coin} {_dir} ${entry_price:.2f}×{filled_size:.1f}份 "
                     f"cost=${cost:.2f} (方向✅ conf={_fill_conf:.0%})")
+                self._ambush_stat(slug, coin, filled=True, fill_price=entry_price, fill_size=filled_size)
                 send_notification(coin, _dir, max(_fill_conf, ambush.get("confidence", 0.5)),
                                   0, entry_price, filled_size, ambush=True)
 
@@ -986,6 +988,7 @@ class MarketTracker:
                                     _tp_lock.close()
                                 except Exception as _tp_persist_e:
                                     logger.warning(f"  ⚠️ 止盈单持久化失败: {_tp_persist_e}")
+                                self._ambush_stat(slug, coin, tp=True, tp_price=_tp_price)
                                 logger.info(
                                     f"  💰 伏击止盈挂单: {coin} SELL @${_tp_price:.2f}×{_tp_size:.1f}份 "
                                     f"GTD到期前{_TP_DEADLINE}s (oid={_tp_oid[:16]})")
@@ -1347,9 +1350,28 @@ class MarketTracker:
             "last_order_ts": time.time(),
             "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
         }
+        self._ambush_stat(slug, coin, bilateral=True, placed=True,
+                          price=up_price, direction="BILATERAL")
         logger.info(
             f"  🎯🎯 双向伏击: {coin} UP@${up_price:.2f}×{up_size:.1f} + DOWN@${down_price:.2f}×{down_size:.1f} "
             f"| ATR={diff_atr:.2f} p_up={_p_win_up:.3f} edge={edge:.3f} remaining={remaining:.0f}s")
+
+    def _ambush_stat(self, slug, coin, **kw):
+        """更新伏击统计"""
+        s = self._ambush_stats.setdefault(slug, {
+            "coin": coin, "checks": 0, "max_conf": 0, "max_atr": 0,
+            "skip_reasons": {}, "placed": False, "filled": False,
+            "price": 0, "direction": "", "bilateral": False, "tp": False,
+        })
+        for k, v in kw.items():
+            if k == "skip":
+                s["skip_reasons"][v] = s["skip_reasons"].get(v, 0) + 1
+            elif k == "conf":
+                s["max_conf"] = max(s["max_conf"], v)
+            elif k == "atr":
+                s["max_atr"] = max(s["max_atr"], v)
+            else:
+                s[k] = v
 
     def _place_directional_ambush(self, slug, coin, tokens, gap_dir, confidence,
                                   diff_atr, ptb, atr_val, remaining):
@@ -1382,6 +1404,15 @@ class MarketTracker:
             AMBUSH_EDGE *= _vol_ratio
         AMBUSH_EDGE = round(AMBUSH_EDGE, 3)
 
+        # 统计追踪（checks 只在此入口单点自增，代表一次真实伏击检查）
+        s = self._ambush_stats.setdefault(slug, {
+            "coin": coin, "checks": 0, "max_conf": 0, "max_atr": 0,
+            "skip_reasons": {}, "placed": False, "filled": False,
+            "price": 0, "direction": "", "bilateral": False, "tp": False,
+        })
+        s["checks"] += 1
+        self._ambush_stat(slug, coin, conf=confidence, atr=diff_atr)
+
         # 市场活跃度基础门槛
         if diff_atr < AMBUSH_MIN_ATR or atr_val < AMBUSH_MIN_ATR_ABS:
             _skip_key = f"{slug}_signal"
@@ -1394,6 +1425,7 @@ class MarketTracker:
                     f"  [伏] ATR不足跳过: {coin} {gap_dir} "
                     f"diff_atr={diff_atr:.2f}{'<'+str(AMBUSH_MIN_ATR) if diff_atr<AMBUSH_MIN_ATR else '✓'} "
                     f"atr_val=${atr_val:.0f}{'<$'+str(int(AMBUSH_MIN_ATR_ABS)) if atr_val<AMBUSH_MIN_ATR_ABS else '✓'}")
+            self._ambush_stat(slug, coin, skip="ATR不足")
             return
 
         # ── v13.1 M4: Bilateral ambush — 方向不确定时双向挂单对冲方向风险 ──
@@ -1415,6 +1447,7 @@ class MarketTracker:
                 logger.info(
                     f"  [伏] 信号不足跳过: {coin} {gap_dir} "
                     f"conf={confidence:.0%}<{AMBUSH_MIN_CONF}")
+            self._ambush_stat(slug, coin, skip="信号不足")
             return
 
         token = tokens[0] if gap_dir == "UP" else tokens[1]
@@ -1444,6 +1477,7 @@ class MarketTracker:
                                 f"  [伏] OFI逆选跳过: {coin} {gap_dir} "
                                 f"OFI={_ofi:.2f}<-{OFI_THRESHOLD} "
                                 f"bid_depth={_bid_depth:.0f} ask_depth={_ask_depth:.0f}")
+                        self._ambush_stat(slug, coin, skip="OFI逆选")
                         return
                     # ── v13.1 M5: 最低深度门槛 — 薄市场跳过（深市场84%准确率 vs 薄市场61%）──
                     AMBUSH_MIN_DEPTH = float(os.environ.get("SNIPER_AMBUSH_MIN_DEPTH", "100"))
@@ -1457,6 +1491,7 @@ class MarketTracker:
                             logger.info(
                                 f"  [伏] 深度不足跳过: {coin} {gap_dir} "
                                 f"total_depth={_total_depth:.0f}<{AMBUSH_MIN_DEPTH:.0f}")
+                        self._ambush_stat(slug, coin, skip="深度不足")
                         return
         except Exception:
             pass  # WS不可用时跳过OFI/深度检查，继续下单
@@ -1489,6 +1524,7 @@ class MarketTracker:
                         f"  [伏] 市场价过远跳过: {coin} {gap_dir} "
                         f"model=${AMBUSH_PRICE:.2f} ask=${_real_ask:.2f} "
                         f"gap=${_gap_to_market:.2f}>${AMBUSH_MAX_GAP} → 不挂单")
+                self._ambush_stat(slug, coin, skip="价差过远")
                 return
             elif _gap_to_market > AMBUSH_ASK_OFFSET:
                 # 市场略贵，提价到 ask 下方 offset 处
@@ -1551,6 +1587,7 @@ class MarketTracker:
                 "last_order_ts": time.time(),  # v13 M4: 当前订单下单时间(追价会重置)
                 "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
             }
+            self._ambush_stat(slug, coin, placed=True, price=AMBUSH_PRICE, direction=gap_dir)
             logger.info(
                 f"  🎯 伏击挂单: {coin} {gap_dir} @${AMBUSH_PRICE} ×{ambush_size}份 "
                 f"| ATR={diff_atr:.2f} conf={confidence:.0%} p_win={_p_win:.3f} "
@@ -3110,6 +3147,31 @@ class MarketTracker:
                     except Exception:
                         pass
                     logger.info(f"  [伏] 市场结束清理伏击单: {slug}")
+                # ── 伏击本期摘要 ──
+                _stat = self._ambush_stats.pop(slug, None)
+                if _stat:
+                    _c = _stat["coin"]
+                    _n = _stat["checks"]
+                    _parts = [f"{_c} | 检查{_n}次"]
+                    if _stat["placed"]:
+                        _d = _stat.get("direction", "?")
+                        _bi = "双向" if _stat.get("bilateral") else _d
+                        _parts.append(f"挂单@{_stat.get('price', 0):.2f}({_bi})")
+                    if _stat.get("filled"):
+                        _fp = _stat.get("fill_price", 0)
+                        _fs = _stat.get("fill_size", 0)
+                        _parts.append(f"成交@{_fp:.2f}×{_fs:.1f}份")
+                    if _stat.get("tp"):
+                        _parts.append(f"止盈@{_stat.get('tp_price', 0):.2f}已挂")
+                    if not _stat["placed"] and _stat["skip_reasons"]:
+                        _top = sorted(_stat["skip_reasons"].items(), key=lambda x: -x[1])[:3]
+                        _sr = ",".join(f"{k}({v})" for k, v in _top)
+                        _parts.append(f"未挂单:{_sr}")
+                    _mc = _stat.get("max_conf", 0)
+                    _ma = _stat.get("max_atr", 0)
+                    if _mc > 0 or _ma > 0:
+                        _parts.append(f"maxConf={_mc:.0%} maxATR={_ma:.2f}")
+                    logger.info(f"  [伏] 本期摘要: {' | '.join(_parts)}")
                 self._ambush_cancelled_at.pop(slug, None)
 
 
