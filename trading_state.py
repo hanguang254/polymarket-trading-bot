@@ -108,6 +108,18 @@ def _reset_daily_if_needed(state):
     if state.get("daily_pnl_date") != today:
         state["daily_pnl"] = 0.0
         state["daily_pnl_date"] = today
+        # Bug fix: 清除前日遗留的 pending_costs，避免隔夜条目永久累积
+        # 这些条目的 refund 在 settle_bet_cost 中已为 0（跨日不回补），
+        # 但不清理会导致 record_bet_cost 对同 slug 新仓位累加到旧成本上。
+        pending = state.get("pending_costs", {})
+        if isinstance(pending, dict):
+            stale_slugs = [
+                slug for slug, entry in pending.items()
+                if not isinstance(entry, dict) or entry.get("session_date") != today
+            ]
+            for slug in stale_slugs:
+                pending.pop(slug, None)
+            state["pending_costs"] = pending
         return True
     return False
 

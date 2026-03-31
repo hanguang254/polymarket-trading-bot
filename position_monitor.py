@@ -812,6 +812,20 @@ def _estimate_exit_price(token_id, current_price, entry_price):
     return entry_price if entry_price > 0 else 0
 
 
+
+def _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction):
+    """NO_BALANCE时确定退出价：优先查结算结果(1.0/0.0)，未结算则回退到CLOB估算。
+    当 redeem_resolved.py 已赎回token时，余额为零但市场已结算，应按结算价计PnL。
+    """
+    try:
+        settle = get_market_outcome(slug, direction)
+        if settle is not None:
+            return settle
+    except Exception:
+        pass
+    return _estimate_exit_price(token_id, current_price, entry_price)
+
+
 def _estimate_ghost_price(token_id, caller_price):
     """幽灵成交时估算实际成交价（CLOB按best_bid撮合，不是地板价）"""
     ltp = get_last_trade_price(token_id)
@@ -3397,7 +3411,7 @@ def monitor():
                         close_intents.pop(attempt_key, None)
                         continue
                     if actual_price == "NO_BALANCE":
-                        est_exit = _estimate_exit_price(token_id, current_price, entry_price)
+                        est_exit = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
                         print("  ⚠️ 余额为零，标记持仓关闭等结算")
                         self_notify(pos, est_exit, coin, direction, size, f"{reason}(余额已清)")
                         _clear_close_intent(pos)
@@ -3433,8 +3447,9 @@ def monitor():
                     ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                     if actual_price == "NO_BALANCE":
                         print(f"  ⚠️ 绝对硬止损: 余额为零，等结算")
-                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, f"绝对硬止损(-{ABSOLUTE_HARD_STOP*100:.0f}%)(余额已清)")
-                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                        _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                        self_notify(pos, _exit_price, coin, direction, size, f"绝对硬止损(-{ABSOLUTE_HARD_STOP*100:.0f}%)(余额已清)")
+                        close_position(pos, _exit_price)
                         continue
                     if ok:
                         sold = True
@@ -3608,8 +3623,9 @@ def monitor():
                                     continue
                                 elif actual == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                    self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "P0止盈(余额已清)")
-                                    close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                                    _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                                    self_notify(pos, _exit_price, coin, direction, size, "P0止盈(余额已清)")
+                                    close_position(pos, _exit_price)
                                     close_attempts.pop(attempt_key, None)
                                     stop_loss_attempts.pop(attempt_key, None)
                                     tp_state.pop(attempt_key, None)
@@ -3720,9 +3736,10 @@ def monitor():
                             sold_price = actual_price
                             self_notify(pos, sold_price, coin, direction, size, _cb_reason)
                         elif actual_price == "NO_BALANCE":
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, f"{_cb_reason}(余额已清)")
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, f"{_cb_reason}(余额已清)")
                             _clear_close_intent(pos)
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             close_intents.pop(attempt_key, None)
                             continue
@@ -3891,9 +3908,10 @@ def monitor():
                             sold_price = actual_price
                             self_notify(pos, sold_price, coin, direction, size, _ev_reason)
                         elif actual_price == "NO_BALANCE":
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, f"{_ev_reason}(余额已清)")
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, f"{_ev_reason}(余额已清)")
                             _clear_close_intent(pos)
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            close_position(pos, _exit_price)
                             try_reverse_entry(pos, remaining, atr_val=atr_val, ptb_price=ptb_price)
                             close_attempts.pop(attempt_key, None)
                             close_intents.pop(attempt_key, None)
@@ -4018,8 +4036,9 @@ def monitor():
                             sold_price = actual_price
                             self_notify(pos, sold_price, coin, direction, size, f"ATR衰减止损({diff_atr:.1f}/{entry_atr_val:.1f})")
                         elif actual_price == "NO_BALANCE":
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR衰减(余额已清)")
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, "ATR衰减(余额已清)")
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
@@ -4059,9 +4078,10 @@ def monitor():
                             sold_price = actual_price
                             self_notify(pos, sold_price, coin, direction, size, f"ATR加速下降({atr_accel_speed:.1f})")
                         elif actual_price == "NO_BALANCE":
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR加速(余额已清)")
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, "ATR加速(余额已清)")
                             _clear_close_intent(pos)
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             close_intents.pop(attempt_key, None)
                             continue
@@ -4097,9 +4117,10 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "硬止损(-25%)")
                         elif actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "硬止损(余额已清)")
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, "硬止损(余额已清)")
                             _clear_close_intent(pos)
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
@@ -4146,9 +4167,10 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "方向翻转清仓")
                         elif actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "方向翻转(余额已清)")
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, "方向翻转(余额已清)")
                             _clear_close_intent(pos)
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
@@ -4234,8 +4256,9 @@ def monitor():
                                 self_notify(pos, sold_price, coin, direction, size, f"ATR止损({atr_str})")
                             elif actual_price == "NO_BALANCE":
                                 print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "ATR止损(余额已清)")
-                                close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                                _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                                self_notify(pos, _exit_price, coin, direction, size, "ATR止损(余额已清)")
+                                close_position(pos, _exit_price)
                                 close_attempts.pop(attempt_key, None)
                                 stop_loss_attempts.pop(attempt_key, None)
                                 dip_bought.pop(attempt_key, None)
@@ -4363,8 +4386,9 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "方向错误止损")
                         elif actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "止损(余额已清)")
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, "止损(余额已清)")
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             dip_bought.pop(attempt_key, None)
@@ -4418,8 +4442,9 @@ def monitor():
                             self_notify(pos, sold_price, coin, direction, size, "阶段2平仓")
                         elif actual == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段2(余额已清)")
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, "阶段2(余额已清)")
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             stop_loss_attempts.pop(attempt_key, None)
                             continue
@@ -4508,8 +4533,9 @@ def monitor():
                                     ok, actual_price = market_sell_immediate(token_id, size, price=best_bid, position=pos)
                                     if actual_price == "NO_BALANCE":
                                         print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                        self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段3(余额已清)")
-                                        close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                                        _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                                        self_notify(pos, _exit_price, coin, direction, size, "阶段3(余额已清)")
+                                        close_position(pos, _exit_price)
                                         close_attempts.pop(attempt_key, None)
                                         continue
                                     elif ok:
@@ -4528,8 +4554,9 @@ def monitor():
                                 ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                                 if actual_price == "NO_BALANCE":
                                     print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                                    self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段3(余额已清)")
-                                    close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                                    _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                                    self_notify(pos, _exit_price, coin, direction, size, "阶段3(余额已清)")
+                                    close_position(pos, _exit_price)
                                     close_attempts.pop(attempt_key, None)
                                     continue
                                 elif ok:
@@ -4559,8 +4586,9 @@ def monitor():
                         ok, actual_price = market_sell_immediate(token_id, size, position=pos)
                         if actual_price == "NO_BALANCE":
                             print(f"  ⚠️ 余额为零，标记持仓关闭等结算")
-                            self_notify(pos, _estimate_exit_price(token_id, current_price, entry_price), coin, direction, size, "阶段4(余额已清)")
-                            close_position(pos, _estimate_exit_price(token_id, current_price, entry_price))
+                            _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            self_notify(pos, _exit_price, coin, direction, size, "阶段4(余额已清)")
+                            close_position(pos, _exit_price)
                             close_attempts.pop(attempt_key, None)
                             continue
                         elif ok:
@@ -4614,8 +4642,11 @@ def monitor():
 def self_notify(pos, sell_price, coin, direction, size, label):
     """统一平仓通知"""
     entry_price = pos["entry_price"]
-    profit = (sell_price - entry_price) * size
-    pct = (sell_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+    # Bug fix: 用 _calculate_total_realized_pnl 聚合 partial_exits，与 outcomes 一致
+    profit = _calculate_total_realized_pnl(pos, sell_price)
+    total_size = _realized_trade_size(pos)
+    total_cost = entry_price * total_size if entry_price > 0 else 0
+    pct = (profit / total_cost * 100) if total_cost > 0 else 0
     emoji = "📈" if profit > 0 else "📉"
     print(f"  ✅ {label}！盈亏: ${profit:+.2f} ({pct:+.1f}%)")
     

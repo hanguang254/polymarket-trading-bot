@@ -1542,5 +1542,103 @@ class TestAmbushTpPersistence(unittest.TestCase):
             self.assertEqual(pos["entry_price"], 0.55)
 
 
+class TestM2BackwardRepriceGuard(unittest.TestCase):
+    """v13 Module 2 回归: backward reprice 只在旧单edge薄于min_edge时才允许"""
+
+    @patch.dict(os.environ, {
+        "SNIPER_AMBUSH_BAL_INTERVAL": "999",
+        "SNIPER_AMBUSH_REPRICE_INTERVAL": "0",
+        "SNIPER_AMBUSH_REPRICE_MAX": "5",
+        "SNIPER_AMBUSH_EDGE": "0.045",
+        "SNIPER_AMBUSH_EDGE_MIN": "0.008",
+        "SNIPER_AMBUSH_AVG_ATR": "100",
+        "SNIPER_AMBUSH_MIN_PRICE": "0.45",
+        "SNIPER_AMBUSH_MAX_PRICE": "0.65",
+        "SNIPER_AMBUSH_REPRICE_MIN_DELTA": "0.01",
+    }, clear=False)
+    def test_backward_blocked_when_old_edge_healthy(self):
+        """旧单$0.64, p_win=0.68, min_edge=0.008 → old_edge=0.04>0.008 → 禁止退让"""
+        tracker = bot.MarketTracker()
+        slug = "btc-updown-5m-1700000000"
+        tracker._sniper_updaters[slug] = FakeUpdater(direction="UP", confidence=0.60)
+        tracker._sniper_updaters[slug].current_price = 69750
+        tracker._ambush_orders[slug] = {
+            "token": "up_token", "opposite_token": "down_token",
+            "direction": "UP", "confidence": 0.60,
+            "price": 0.64, "size": 5.0, "bal_before": 0.0,
+            "order_id": "oid-old", "all_order_ids": ["oid-old"],
+            "placed_at": 900.0, "last_bal_check": 900.0, "last_reprice": 900.0,
+            "last_order_ts": 900.0, "reprice_count": 0,
+        }
+        # p_win will compute to ~0.68, new_price ~0.62 (backward from 0.64)
+        # But old_price 0.64 < p_win(0.68) - min_edge(0.008) = 0.672 → old edge healthy → BLOCK
+        sys.modules["ai_analyze_v2"]._random_walk_p_win = MagicMock(return_value=0.80)
+
+        with patch.dict(sys.modules, {"py_clob_client.clob_types": MagicMock()}), \
+             patch("auto_bot_v3.time.time", return_value=1001.0), \
+             patch("auto_bot_v3._get_bayesian_signal", return_value={"confidence": 0.60}), \
+             patch.object(bot.clob_client, "get_token_balance", return_value=0.0), \
+             patch.object(bot.clob_client, "cancel_all", return_value=True) as cancel_mock, \
+             patch.object(bot.clob_client, "get_order", return_value={"status": "CANCELLED"}), \
+             patch.object(bot.clob_client, "place_order", return_value={"order_id": "oid-new"}) as place_mock:
+            tracker._manage_ambush(
+                slug=slug, coin="BTC", tokens=("up_token", "down_token"),
+                ptb=69612, atr_val=113, remaining=120, end_buffer=0,
+            )
+
+        # Old order has healthy edge → backward reprice BLOCKED → no cancel, no new order
+        place_mock.assert_not_called()
+        self.assertEqual(tracker._ambush_orders[slug]["price"], 0.64)
+
+
+class TestM4ToxicFillAfterReprice(unittest.TestCase):
+    """v13 Module 4 回归: 追价后极快成交必须触发toxic fill"""
+
+    def test_toxic_fill_triggers_after_reprice(self):
+        """追价重置last_order_ts后, 0.6s内成交 → toxic fill → 阈值提高到0.35"""
+        tracker = bot.MarketTracker()
+        slug = "btc-updown-5m-1700000000"
+        tracker._sniper_updaters[slug] = FakeUpdater(direction="UP", confidence=0.20)
+        # 价格接近ptb(69612)，gap小于atr*0.3 → 价格不确认方向 → 走贝叶斯校验
+        tracker._sniper_updaters[slug].current_price = 69630
+        tracker.ptb_cache[slug] = 69612
+        tracker.tracked[slug] = {"coin": "BTC", "end_time": "2026-03-30T10:05:00Z"}
+        tracker._ambush_orders[slug] = {
+            "token": "up_token", "opposite_token": "down_token",
+            "up_token": "up_token", "down_token": "down_token",
+            "direction": "UP", "confidence": 0.60,
+            "price": 0.62, "size": 5.0, "bal_before": 0.0,
+            "order_id": "oid-repriced", "all_order_ids": ["oid-repriced"],
+            "placed_at": 900.0,       # 原始挂单时间(100+秒前)
+            "last_order_ts": 1001.0,   # 追价后重置的时间(0.6秒前)
+            "last_bal_check": 0, "last_reprice": 900.0,
+            "reprice_count": 2,
+        }
+
+        # Simulate: at t=1001.6, balance check finds fill
+        mock_place_fok = MagicMock(return_value={"taking": "3.0"})
+        with patch.dict(os.environ, {
+                 "SNIPER_AMBUSH_BAL_INTERVAL": "0",
+                 "SNIPER_AMBUSH_FILL_MIN_CONF": "0.15",
+             }), \
+             patch("auto_bot_v3.time.time", return_value=1001.6), \
+             patch("auto_bot_v3._get_bayesian_signal", return_value={
+                 "direction": "UP", "p_hat": 0.55, "confidence": 0.20,
+             }), \
+             patch.object(bot.clob_client, "get_token_balance", return_value=5.1), \
+             patch.object(bot.clob_client, "cancel_all", return_value=True), \
+             patch.object(bot.clob_client, "cancel_orders_batch", return_value=True), \
+             patch.object(bot.clob_client, "place_fok_order", mock_place_fok):
+            tracker._manage_ambush(
+                slug=slug, coin="BTC", tokens=("up_token", "down_token"),
+                ptb=69612, atr_val=113, remaining=120, end_buffer=0,
+            )
+
+        # fill_elapsed = 1001.6 - 1001.0 = 0.6s < 2.0s → toxic fill
+        # toxic fill → AMBUSH_FILL_MIN_CONF raised to 0.35
+        # conf=0.20 < 0.35 → direction check fails → forced sell (place_fok_order called)
+        mock_place_fok.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

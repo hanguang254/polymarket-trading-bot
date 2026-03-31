@@ -713,11 +713,19 @@ class MarketTracker:
                 _bal = clob_client.get_token_balance(_token) or 0
                 _filled = _bal - ambush["bal_before"]
                 _check_age = round(_now - ambush.get("placed_at", _now), 1)
-                logger.info(
+                logger.debug(
                 f"  [伏] 检查: {coin} {ambush['direction']} @${ambush['price']:.2f} "
                 f"| bal={_bal:.2f} before={ambush['bal_before']:.2f} "
                 f"{'WS触发' if _ws_fill else '轮询'} "
                 f"| 已挂{_check_age}s 追价{ambush.get('reprice_count',0)}次")
+                # 每5秒输出一条摘要（替代per-tick刷屏）
+                _last_summary = ambush.get("_last_summary_ts", 0)
+                if _now - _last_summary >= 5:
+                    ambush["_last_summary_ts"] = _now
+                    logger.info(
+                        f"  [伏] 等待成交: {coin} {ambush['direction']} @${ambush['price']:.2f} "
+                        f"| 已挂{_check_age:.0f}s 追价{ambush.get('reprice_count',0)}次 "
+                        f"| 剩余{remaining:.0f}s")
 
             if _filled > 0.1:
                 # v12.9.6: 全量入仓 — 不管是哪个追价单成交的，余额增多少就入多少
@@ -734,8 +742,19 @@ class MarketTracker:
                         f"  [伏] 多单成交: 预期{ambush.get('size',0):.1f}份 实际{filled_size:.1f}份 "
                         f"(追价残留成交，全量入仓)")
 
+                # ── v13 Module 4: 有毒成交检测 — 极快成交暗示知情交易者对手 ──
+                # last_order_ts = 当前订单(含追价)的下单时间，追价后会重置
+                _fill_elapsed = time.time() - ambush.get("last_order_ts", ambush.get("placed_at", time.time()))
+                _toxic_fill = _fill_elapsed < 2.0  # 当前订单2秒内被吃 = 疑似知情对手
+                if _toxic_fill:
+                    logger.warning(
+                        f"  [伏] ⚠️ 有毒成交: {coin} {_dir} 挂单{_fill_elapsed:.1f}s即被吃 "
+                        f"→ 提高方向确认阈值")
+
                 # ── v12.9.4: 成交后方向校验 — 方向翻转或信号消失则立即卖出 ──
-                AMBUSH_FILL_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_FILL_MIN_CONF", "0.15"))
+                # v13: toxic fill 时提高确认阈值 (0.15 → 0.35)
+                _base_fill_conf = float(os.environ.get("SNIPER_AMBUSH_FILL_MIN_CONF", "0.15"))
+                AMBUSH_FILL_MIN_CONF = 0.35 if _toxic_fill else _base_fill_conf
                 _updater = self._sniper_updaters.get(slug)
                 _dir_ok = True
                 _fill_conf = 0
@@ -962,7 +981,15 @@ class MarketTracker:
                             _sig_rp = _get_bayesian_signal(_updater_rp, remaining_seconds=remaining)
                             _conf_rp = _sig_rp.get("confidence", 0) if _sig_rp else 0
                             _p_win_rp = 0.5 + (max(_rw_rp, _conf_rp * 0.5 + 0.5) - 0.5) * 0.60
-                            AMBUSH_EDGE = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))
+                            # ── v13: 追价也用动态 EDGE — 时间衰减+波动率自适应 ──
+                            _base_edge_rp = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))
+                            _min_edge_rp = float(os.environ.get("SNIPER_AMBUSH_EDGE_MIN", "0.008"))
+                            AMBUSH_EDGE = _base_edge_rp * (max(remaining, 1) / 300.0) ** 0.5 + _min_edge_rp
+                            _avg_atr_rp = float(os.environ.get("SNIPER_AMBUSH_AVG_ATR", "30"))
+                            if _avg_atr_rp > 0 and atr_val and atr_val > 0:
+                                _vol_ratio_rp = max(0.5, min(2.0, atr_val / _avg_atr_rp))
+                                AMBUSH_EDGE *= _vol_ratio_rp
+                            AMBUSH_EDGE = round(AMBUSH_EDGE, 3)
                             AMBUSH_MIN_P = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
                             AMBUSH_MAX_P = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.65"))
                             _new_price = round(round((_p_win_rp - AMBUSH_EDGE) / 0.01) * 0.01, 2)
@@ -1011,18 +1038,28 @@ class MarketTracker:
                                     f"  [伏] edge腐蚀: {coin} 旧${_old_price:.2f}≥公允${_p_win_rp:.3f} "
                                     f"→ 降价到${_new_price:.2f}")
                             elif _price_delta < AMBUSH_REPRICE_MIN_DELTA:
-                                logger.info(
+                                logger.debug(
                                     f"  [伏] 价格稳定: {coin} ${_old_price:.2f}→${_new_price:.2f} "
                                     f"(差${_price_delta:.2f}<${AMBUSH_REPRICE_MIN_DELTA:.2f} 不追价)")
                             elif _is_backward and not _stale_above_ask:
-                                _ask_str = f"ask${_rp_ask:.2f}" if _rp_ask else "ask未知"
-                                logger.info(
-                                    f"  [伏] 禁止退让: {coin} ${_old_price:.2f}→${_new_price:.2f} "
-                                    f"(旧单在{_ask_str}之下，保持)")
+                                # v13 Module 2: EV退让 — 旧单edge已薄于min_edge时允许主动降价
+                                # 关键：条件是旧单edge不足，而非新单有EV（后者恒真）
+                                _ev_positive_retreat = _old_price >= _p_win_rp - _min_edge_rp
+                                if _ev_positive_retreat:
+                                    logger.info(
+                                        f"  [伏] EV退让: {coin} 旧${_old_price:.2f}≥公允${_p_win_rp:.3f}-{_min_edge_rp} "
+                                        f"→ 降到${_new_price:.2f}(edge={_p_win_rp-_new_price:.3f})")
+                                else:
+                                    _ask_str = f"ask${_rp_ask:.2f}" if _rp_ask else "ask未知"
+                                    logger.info(
+                                        f"  [伏] 禁止退让: {coin} ${_old_price:.2f}→${_new_price:.2f} "
+                                        f"(旧单edge={_p_win_rp-_old_price:.3f}>{_min_edge_rp} 保持)")
 
+                            # v13 Module 2: 仅当旧单edge薄于min_edge时允许backward
+                            _ev_positive_retreat = _is_backward and _old_price >= _p_win_rp - _min_edge_rp and not _stale_above_ask
                             _should_reprice_now = (
                                 (_price_delta >= AMBUSH_REPRICE_MIN_DELTA or _gtd_expired)
-                                and (not _is_backward or _stale_above_ask or _gtd_expired or _edge_eroded)
+                                and (not _is_backward or _stale_above_ask or _gtd_expired or _edge_eroded or _ev_positive_retreat)
                             )
                             if _stale_above_ask and _should_reprice_now:
                                 logger.warning(
@@ -1123,6 +1160,7 @@ class MarketTracker:
                                     ambush["price"] = _new_price
                                     ambush["reprice_count"] = _reprice_count + 1
                                     ambush["gtd_expires_at"] = _gtd_exp_rp
+                                    ambush["last_order_ts"] = time.time()  # v13 M4: 追价重置时间戳
                                     if _new_result.get("matched"):
                                         # 追价即时成交 → 清场 + 标记待确认，禁止后续追价
                                         clob_client.cancel_all(_token)  # 撤所有残留
@@ -1161,7 +1199,17 @@ class MarketTracker:
         AMBUSH_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_MIN_CONF", "0.35"))
         AMBUSH_MIN_PRICE = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
         AMBUSH_MAX_PRICE = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.65"))
-        AMBUSH_EDGE = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))  # min edge + fees
+        # ── v13: 动态 EDGE — 时间衰减(AS模型) + 波动率自适应(GLFT模型) ──
+        _base_edge = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))
+        _min_edge = float(os.environ.get("SNIPER_AMBUSH_EDGE_MIN", "0.008"))
+        # 模块1: edge ∝ sqrt(remaining/300) — 剩余时间越少越激进
+        AMBUSH_EDGE = _base_edge * (max(remaining, 1) / 300.0) ** 0.5 + _min_edge
+        # 模块5: edge ∝ σ — 高波动加宽，低波动收窄
+        _avg_atr = float(os.environ.get("SNIPER_AMBUSH_AVG_ATR", "30"))
+        if _avg_atr > 0:
+            _vol_ratio = max(0.5, min(2.0, atr_val / _avg_atr))
+            AMBUSH_EDGE *= _vol_ratio
+        AMBUSH_EDGE = round(AMBUSH_EDGE, 3)
 
         # 方向信号够强 + 市场够活跃才埋单
         if diff_atr < AMBUSH_MIN_ATR or confidence < AMBUSH_MIN_CONF or atr_val < AMBUSH_MIN_ATR_ABS:
@@ -1181,6 +1229,34 @@ class MarketTracker:
 
         token = tokens[0] if gap_dir == "UP" else tokens[1]
         opposite = tokens[1] if gap_dir == "UP" else tokens[0]
+
+        # ── v13 Module 3: OFI 逆向选择检测 — 订单簿倾斜严重时放弃挂单 ──
+        OFI_THRESHOLD = float(os.environ.get("SNIPER_AMBUSH_OFI_THRESHOLD", "0.60"))
+        try:
+            from ai_trader.polymarket_ws import poly_ws as _ofi_ws
+            _ofi_bids, _ofi_asks = _ofi_ws.get_book(token)
+            if _ofi_bids and _ofi_asks:
+                _bid_depth = sum(float(b.get("size", 0)) for b in _ofi_bids[:5])
+                _ask_depth = sum(float(a.get("size", 0)) for a in _ofi_asks[:5])
+                _total_depth = _bid_depth + _ask_depth
+                if _total_depth > 0:
+                    # OFI > 0 = 买方压力 (好), OFI < 0 = 卖方压力 (逆向选择)
+                    _ofi = (_bid_depth - _ask_depth) / _total_depth
+                    # 我方是买方，OFI严重偏空 = 大量卖单堆积 = 逆向选择风险
+                    if _ofi < -OFI_THRESHOLD:
+                        _ofi_key = f"{slug}_ofi"
+                        _last_ofi = getattr(self, '_ambush_skip_log', {})
+                        if _last_ofi.get(_ofi_key) != f"{_ofi:.2f}":
+                            if not hasattr(self, '_ambush_skip_log'):
+                                self._ambush_skip_log = {}
+                            self._ambush_skip_log[_ofi_key] = f"{_ofi:.2f}"
+                            logger.info(
+                                f"  [伏] OFI逆选跳过: {coin} {gap_dir} "
+                                f"OFI={_ofi:.2f}<-{OFI_THRESHOLD} "
+                                f"bid_depth={_bid_depth:.0f} ask_depth={_ask_depth:.0f}")
+                        return
+        except Exception:
+            pass  # WS不可用时跳过OFI检查，继续下单
 
         # v12.9.4: 动态定价 — fair_value 减去利润空间
         from ai_analyze_v2 import _random_walk_p_win
@@ -1268,6 +1344,7 @@ class MarketTracker:
                 "price": AMBUSH_PRICE, "size": ambush_size,
                 "bal_before": bal_before,
                 "placed_at": time.time(), "last_check": time.time(),
+                "last_order_ts": time.time(),  # v13 M4: 当前订单下单时间(追价会重置)
                 "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
             }
             logger.info(
