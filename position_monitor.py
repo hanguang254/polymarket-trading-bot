@@ -99,6 +99,10 @@ ATR_DANGER_THRESHOLD = float(os.environ.get("ATR_DANGER_THRESHOLD", "1.0"))
 DIP_BUY_SIZE_RATIO = float(os.environ.get("DIP_BUY_SIZE_RATIO", "0.50"))
 DIP_BUY_MIN_REMAINING = float(os.environ.get("DIP_BUY_MIN_REMAINING", "60"))
 
+# 伏击仓位持有到期（跳过中途止损，只保留绝对硬止损兜底）
+AMBUSH_HOLD_TO_EXPIRY = os.environ.get("AMBUSH_HOLD_TO_EXPIRY", "1") == "1"
+AMBUSH_HARD_STOP = float(os.environ.get("AMBUSH_HARD_STOP", "0.70"))  # 伏击仓位绝对硬止损阈值
+
 # PTB Proximity Buffer（临近PTB时冻结方向信号，防止噪音触发止损）
 PTB_PROXIMITY_ATR = float(os.environ.get("PTB_PROXIMITY_ATR", "0.7"))
 PTB_PROXIMITY_EXTREME_STOP = float(os.environ.get("PTB_PROXIMITY_EXTREME_STOP", "0.50"))
@@ -3504,9 +3508,16 @@ def monitor():
                 market_ev = current_price - entry_price if current_price else None
                 ev_label_global = f"EV={market_ev:+.3f}" if market_ev is not None else "EV=N/A"
 
+                # ═══ 伏击仓位标记（提前识别，供后续止损/止盈分流）═══
+                _is_ambush_pos = pos.get("ambush", False)
+
                 # ═══ v12.8: 绝对硬止损 — 不看方向/EV/ATR，跌到就走 ═══
                 # v12.9: 最后60秒放宽到-70%（噪音洗出去比亏损更贵，让结算自然完成）
-                _hard_stop_threshold = ABSOLUTE_HARD_STOP if remaining > 60 else 0.70
+                # v13.1: 伏击仓位用更宽的阈值（AMBUSH_HARD_STOP，默认-70%）
+                if _is_ambush_pos and AMBUSH_HOLD_TO_EXPIRY:
+                    _hard_stop_threshold = AMBUSH_HARD_STOP
+                else:
+                    _hard_stop_threshold = ABSOLUTE_HARD_STOP if remaining > 60 else 0.70
                 if profit_rate <= -_hard_stop_threshold and remaining > 10:
                     _hard_label = f"-{_hard_stop_threshold*100:.0f}%" + ("(宽松)" if remaining <= 60 else "")
                     print(
@@ -3531,36 +3542,38 @@ def monitor():
                         try_reverse_entry(pos, remaining, atr_val=atr_val, ptb_price=ptb_price)
                         continue
 
-                # ═══ P0: 双曲贴现止盈 + v12.8 Trailing Take-Profit ═══
-                # v12.9.16: 伏击仓位有GTD止盈单 → 检查止盈单状态，不无脑持有
-                _is_ambush_pos = pos.get("ambush", False)
-                if _is_ambush_pos and profit_rate > 0:
+                # ═══ v13.1: 伏击仓位统一处理 — TP检查 + 持有到期 ═══
+                # 不论 profit_rate 正负，只要是伏击仓位就先查 TP 单状态
+                if _is_ambush_pos and AMBUSH_HOLD_TO_EXPIRY:
                     _tp_oid = pos.get("tp_order_id")
                     if _tp_oid:
-                        # 有止盈单：检查是否已成交
                         try:
                             _tp_info = clob_client.get_order(_tp_oid)
                             _tp_status = (_tp_info.get("status", "") if _tp_info else "").upper()
                             if _tp_status in ("MATCHED", "FILLED"):
                                 _tp_price = pos.get("tp_price", current_price)
-                                print(f"  💰 伏击止盈成交! @${_tp_price:.2f} (+{profit_rate*100:.1f}%)")
+                                print(f"  💰 伏击止盈成交! @${_tp_price:.2f} ({profit_rate*100:+.1f}%)")
                                 self_notify(pos, _tp_price, coin, direction, size, "伏击GTD止盈")
                                 close_position(pos, _tp_price)
                                 close_attempts.pop(attempt_key, None)
                                 continue
                             elif _tp_status in ("CANCELLED", "CANCELED", "EXPIRED"):
-                                # 止盈单已过期/撤销 → 进入正常P0/阶段4逻辑
-                                print(f"  📋 伏击止盈单已过期({_tp_status}) | 剩余{remaining:.0f}s → 进入兜底")
+                                print(f"  📋 伏击止盈单已过期({_tp_status}) | 剩余{remaining:.0f}s → 持有到期")
                             else:
-                                # 止盈单仍活跃 → 等待成交
-                                print(f"  💎 伏击止盈等待中: +{profit_rate*100:.1f}% | 剩余{remaining:.0f}s | 止盈@${pos.get('tp_price', 0):.2f}")
+                                # 止盈单仍活跃 → 持有等待
+                                if int(remaining) % 30 < 2:
+                                    print(f"  💎 伏击持有中: {profit_rate*100:+.1f}% | 剩余{remaining:.0f}s | 止盈@${pos.get('tp_price', 0):.2f}")
                                 continue
                         except Exception as _tp_e:
                             print(f"  ⚠️ 止盈单查询异常: {_tp_e}")
-                    else:
-                        # 无止盈单（旧仓位/未开启） → 原逻辑持有到结算
-                        print(f"  💎 伏击持有到结算: +{profit_rate*100:.1f}% | 剩余{remaining:.0f}s (跳过P0止盈)")
-                        continue
+                    # 无TP单 或 TP已过期/查询异常 → 持有到期等结算
+                    if int(remaining) % 30 < 2:
+                        print(
+                            f"  💎 伏击持有到期: {profit_rate*100:+.1f}% | "
+                            f"方向{'✅' if direction_correct else '❌'} | "
+                            f"{ev_label_global} | 剩余{remaining:.0f}s")
+                    continue
+
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K, entry_price)
 
                 # v12.8: 持续更新 high_water_mark（无论是否达标都要追踪）
