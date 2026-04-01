@@ -786,7 +786,26 @@ class MarketTracker:
                 # 立即清掉该token所有残留挂单（防止后续继续成交）
                 clob_client.cancel_all(_token)
                 clob_client.cancel_orders_batch(ambush.get("all_order_ids", []))
-                entry_price = ambush["price"]  # 用最新挂单价（近似）
+                # 确定实际成交价 — ambush["price"]是最新追价价格，追价竞争条件下可能不准
+                entry_price = ambush["price"]
+                _entry_confirmed = False  # 是否已从 CLOB 确认精确成交价
+                _tracked_oid = ambush.get("order_id")
+                if _tracked_oid:
+                    try:
+                        _ord_info = clob_client.get_order(_tracked_oid)
+                        if _ord_info:
+                            _ord_status = str(_ord_info.get("status", "")).upper()
+                            _ord_price = float(_ord_info.get("price") or 0)
+                            if _ord_status in ("MATCHED", "FILLED") and _ord_price > 0:
+                                entry_price = _ord_price  # 当前订单成交，用其精确价格
+                                _entry_confirmed = True
+                            elif _ord_status not in ("MATCHED", "FILLED"):
+                                # 当前订单未成交 → 成交来自追价前的旧单（竞争条件）
+                                logger.info(
+                                    f"  [伏] 追价竞争: 跟踪单状态={_ord_status}，"
+                                    f"成交来自旧单，entry=${entry_price:.3f}待修正")
+                    except Exception:
+                        pass
                 cost = round(entry_price * filled_size, 4)
                 _dir = ambush["direction"]
                 _opp = ambush["opposite_token"]
@@ -875,7 +894,19 @@ class MarketTracker:
                         _sell_usdc = float(_sell_result.get("taking", 0) or 0)
                         _sell_price_avg = round(_sell_usdc / _sell_size, 4) if _sell_size > 0 else 0
                         if _sell_result.get("matched"):
-                            _loss = round(cost - _sell_usdc, 2)
+                            # 追价竞争修正: 仅在 entry 未经 CLOB 确认时，用卖出价近似
+                            _actual_cost = cost
+                            if (not _entry_confirmed
+                                    and entry_price > 0 and _sell_price_avg > 0
+                                    and entry_price > _sell_price_avg * 1.3):
+                                _corrected_entry = _sell_price_avg
+                                _actual_cost = round(_corrected_entry * filled_size, 4)
+                                logger.info(
+                                    f"  [伏] PnL修正: entry ${entry_price:.3f}→${_corrected_entry:.3f} "
+                                    f"(追价竞争，sell=${_sell_price_avg:.3f})")
+                                entry_price = _corrected_entry
+                                cost = _actual_cost
+                            _loss = round(_actual_cost - _sell_usdc, 2)
                             logger.info(f"  ⚡ 即时卖出成功: ${_sell_price_avg:.3f}×{_sell_size:.1f}=${_sell_usdc:.2f} 亏${_loss:.2f}")
                             send_notification(coin, _dir, _fill_conf, 0,
                                               _sell_price_avg, _sell_size, ambush=True)
@@ -1040,8 +1071,24 @@ class MarketTracker:
                             _gap_rp = abs(_cur_price_rp - ptb)
                             _diff_atr_rp = _gap_rp / atr_val
                             _rw_rp = _random_walk_p_win(_gap_rp, atr_val, remaining)
+                            # _rw_rp = P(UP wins)；bilateral 追踪 DOWN 侧时需反转
+                            _is_bi = ambush.get("bilateral")
+                            _tracking_down = _is_bi and ambush.get("token") == ambush.get("down_token")
+                            if _tracking_down:
+                                _rw_rp = 1.0 - _rw_rp  # P(DOWN wins)
+                            else:
+                                _diff_rp = _cur_price_rp - ptb
+                                _rw_rp = _rw_rp if _diff_rp > 0 else (1.0 - _rw_rp)
                             _sig_rp = _get_bayesian_signal(_updater_rp, remaining_seconds=remaining)
                             _conf_rp = _sig_rp.get("confidence", 0) if _sig_rp else 0
+                            # bilateral: 信号方向对齐追踪侧
+                            if _is_bi:
+                                _tracked_dir = "DOWN" if _tracking_down else "UP"
+                                if _sig_rp and _sig_rp.get("direction") != _tracked_dir:
+                                    _conf_rp = -_conf_rp
+                            else:
+                                if _sig_rp and _sig_rp.get("direction") != ambush.get("direction", "UP"):
+                                    _conf_rp = -_conf_rp
                             _SHRINKAGE_RP = float(os.environ.get("SNIPER_AMBUSH_SHRINKAGE", "0.80"))
                             _p_win_rp = 0.5 + (max(_rw_rp, _conf_rp * 0.5 + 0.5) - 0.5) * _SHRINKAGE_RP
                             # ── v13: 追价也用动态 EDGE — 时间衰减+波动率自适应 ──
@@ -1053,7 +1100,11 @@ class MarketTracker:
                                 _vol_ratio_rp = max(0.5, min(2.0, atr_val / _avg_atr_rp))
                                 AMBUSH_EDGE *= _vol_ratio_rp
                             AMBUSH_EDGE = round(AMBUSH_EDGE, 3)
-                            AMBUSH_MIN_P = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
+                            # bilateral 用独立 min_price，不用 AMBUSH_MIN_PRICE
+                            if _is_bi:
+                                AMBUSH_MIN_P = float(os.environ.get("BILATERAL_MIN_PRICE", "0.15"))
+                            else:
+                                AMBUSH_MIN_P = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
                             AMBUSH_MAX_P = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.85"))
                             _new_price = round(round((_p_win_rp - AMBUSH_EDGE) / 0.01) * 0.01, 2)
                             _new_price = max(AMBUSH_MIN_P, min(AMBUSH_MAX_P, _new_price))
@@ -1130,9 +1181,14 @@ class MarketTracker:
                                     f"→ 安全降价到${_new_price:.2f}")
                             if _should_reprice_now:
                                 # v12.9.12: 安全追价 — cancel_all 信任制 + stuck-order 诊断
-                                _old_oids = [oid for oid in dict.fromkeys(ambush.get("all_order_ids", [])) if oid]
-                                if _old_oid and _old_oid not in _old_oids:
-                                    _old_oids.append(_old_oid)
+                                # bilateral: 只检查被追踪侧的 oid，弱侧仍然 live 是正常的
+                                if _is_bi:
+                                    _tracked_oid = ambush.get("order_id")
+                                    _old_oids = [_tracked_oid] if _tracked_oid else []
+                                else:
+                                    _old_oids = [oid for oid in dict.fromkeys(ambush.get("all_order_ids", [])) if oid]
+                                    if _old_oid and _old_oid not in _old_oids:
+                                        _old_oids.append(_old_oid)
 
                                 # token级全撤（Polymarket cancel_market_orders 是最可靠的撤单方式）
                                 _cancel_ok = clob_client.cancel_all(_token)
@@ -1148,7 +1204,12 @@ class MarketTracker:
                                     logger.warning(
                                         f"  [伏] 追价中止: {coin} 余额查询失败，无法确认旧单状态")
                                     return
-                                _verify_filled = _verify_bal - ambush["bal_before"]
+                                # bilateral: 用追踪侧的 bal_before（bal_before=0 是 bilateral 初始值）
+                                if _is_bi:
+                                    _bi_bb = ambush.get("bal_before_down", 0) if _tracking_down else ambush.get("bal_before_up", 0)
+                                else:
+                                    _bi_bb = ambush["bal_before"]
+                                _verify_filled = _verify_bal - _bi_bb
                                 if _verify_filled > 0.1:
                                     ambush["pending_fill"] = True
                                     logger.info(
@@ -1257,11 +1318,12 @@ class MarketTracker:
 
         # 注意：放置逻辑已移到 _sniper_scan 的 "ask太贵" 路径，不在这里盲挂
 
-    def _place_bilateral_ambush(self, slug, coin, tokens, diff_atr, ptb, atr_val,
-                                remaining, edge, min_price, max_price):
+    def _place_bilateral_ambush(self, slug, coin, tokens, gap_dir, diff_atr, ptb, atr_val,
+                                remaining, edge, max_price):
         """v13.1 M4: 双向GTD伏击 — 方向不确定时在UP和DOWN同时挂单
 
         当一侧成交时撤另一侧，由_manage_ambush检测并路由。
+        gap_dir: 当前偏向方向（用于概率分配，bilateral会做50%shrinkage）
         """
         if slug in self._ambush_orders or slug in self.positions or slug in self.analyzed:
             return
@@ -1276,15 +1338,20 @@ class MarketTracker:
         # 计算双方fair value
         from ai_analyze_v2 import _random_walk_p_win
         from ai_trader.base_rate import get_base_rate
-        _gap = abs(ptb * diff_atr * atr_val / max(atr_val, 1)) if atr_val > 0 else 0
+        # FIX: _gap 是实际美元价差（diff_atr × atr_val），不乘 ptb
+        _gap = diff_atr * atr_val if atr_val > 0 else 0
         _rw = _random_walk_p_win(_gap, atr_val, remaining) if _gap > 0 else 0.5
-        _p_win_up = 0.5 + (_rw - 0.5) * 0.50  # 更保守的shrinkage(bilateral不确定性高)
+        # FIX: 根据 gap_dir 分配概率 — 之前 abs() 导致永远偏向 UP
+        _p_favored = 0.5 + (_rw - 0.5) * 0.50  # 50% shrinkage toward 0.5
+        _p_win_up = _p_favored if gap_dir == "UP" else (1.0 - _p_favored)
         _p_win_down = 1.0 - _p_win_up
 
         up_price = round(round((_p_win_up - edge) / 0.01) * 0.01, 2)
         down_price = round(round((_p_win_down - edge) / 0.01) * 0.01, 2)
-        up_price = max(min_price, min(max_price, up_price))
-        down_price = max(min_price, min(max_price, down_price))
+        # FIX: bilateral 用独立的 min_price — 共用 AMBUSH_MIN_PRICE 会把弱侧 edge 压成负数
+        _bi_min = float(os.environ.get("BILATERAL_MIN_PRICE", "0.15"))
+        up_price = max(_bi_min, min(max_price, up_price))
+        down_price = max(_bi_min, min(max_price, down_price))
 
         # Kelly: 用较小的f* (保守)
         _br = get_base_rate(diff_atr)
@@ -1349,17 +1416,55 @@ class MarketTracker:
         if not up_oid and not down_oid:
             return
 
+        # 强侧必须下单成功，否则取消弱侧并放弃 bilateral
+        _strong_oid = up_oid if gap_dir == "UP" else down_oid
+        if not _strong_oid:
+            _weak_oid = down_oid if gap_dir == "UP" else up_oid
+            if _weak_oid:
+                _weak_token = tokens[1] if gap_dir == "UP" else tokens[0]
+                # cancel_order 失败返回 False（不抛异常），需检查返回值
+                _cancelled = clob_client.cancel_order(_weak_oid)
+                if not _cancelled:
+                    # fallback: 按 token 撤销该侧全部挂单
+                    _cancelled = clob_client.cancel_all(_weak_token)
+                if not _cancelled:
+                    # 双重撤单失败 — 建立最小托管状态，让 _manage_ambush 接管至 GTD 过期
+                    logger.critical(
+                        f"  🚨 弱侧撤单失败，建立托管状态: {coin} oid={_weak_oid}")
+                    _weak_price = down_price if gap_dir == "UP" else up_price
+                    _weak_dir = "DOWN" if gap_dir == "UP" else "UP"
+                    _weak_opp = tokens[0] if gap_dir == "UP" else tokens[1]
+                    self._ambush_orders[slug] = {
+                        "bilateral": False,
+                        "token": _weak_token, "opposite_token": _weak_opp,
+                        "up_token": tokens[0], "down_token": tokens[1],
+                        "direction": _weak_dir, "confidence": 0,
+                        "order_id": _weak_oid, "all_order_ids": [_weak_oid],
+                        "price": _weak_price,
+                        "size": down_size if gap_dir == "UP" else up_size,
+                        "bal_before": bal_down if gap_dir == "UP" else bal_up,
+                        "placed_at": time.time(), "last_check": time.time(),
+                        "last_order_ts": time.time(), "last_reprice": time.time(),
+                        "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
+                    }
+                    return
+            logger.info(f"  ⚠️ 双向伏击放弃: {coin} 强侧({gap_dir})下单失败，弱侧已撤单")
+            return
+
+        # 追踪强侧（gap_dir 偏向的那一侧） — 追价/CLOB感知都在这个token上运行
+        _strong_token = tokens[0] if gap_dir == "UP" else tokens[1]
+        _strong_price = up_price if gap_dir == "UP" else down_price
         self._ambush_orders[slug] = {
             "bilateral": True,
-            "token": tokens[0], "opposite_token": tokens[1],
+            "token": _strong_token, "opposite_token": tokens[1] if gap_dir == "UP" else tokens[0],
             "up_token": tokens[0], "down_token": tokens[1],
             "direction": "BILATERAL", "confidence": 0,
-            "order_id": up_oid or down_oid,
+            "order_id": _strong_oid,
             "all_order_ids": all_oids,
             "up_order_id": up_oid, "down_order_id": down_oid,
             "up_price": up_price, "down_price": down_price,
             "up_size": up_size, "down_size": down_size,
-            "price": up_price, "size": max(up_size, down_size),
+            "price": _strong_price, "size": max(up_size, down_size),
             "bal_before": 0, "bal_before_up": bal_up, "bal_before_down": bal_down,
             "placed_at": time.time(), "last_check": time.time(),
             "last_order_ts": time.time(),
@@ -1448,8 +1553,8 @@ class MarketTracker:
         _BILATERAL = os.environ.get("BILATERAL_AMBUSH", "0") == "1"
         _BI_MAX_CONF = float(os.environ.get("BILATERAL_MAX_CONF", "0.50"))
         if _BILATERAL and confidence < _BI_MAX_CONF and confidence >= 0.15:
-            self._place_bilateral_ambush(slug, coin, tokens, diff_atr, ptb, atr_val,
-                                          remaining, AMBUSH_EDGE, AMBUSH_MIN_PRICE, AMBUSH_MAX_PRICE)
+            self._place_bilateral_ambush(slug, coin, tokens, gap_dir, diff_atr, ptb, atr_val,
+                                          remaining, AMBUSH_EDGE, AMBUSH_MAX_PRICE)
             return
 
         # 单向伏击: 置信度门槛

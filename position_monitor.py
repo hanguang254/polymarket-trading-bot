@@ -3199,7 +3199,15 @@ def monitor():
                                 _ap_asset = _ap.get("asset", "")
                                 _ap_size = _ap.get("size", 0)
                                 if _ap_asset and _ap_size > 0.5 and _ap_asset not in _known_tokens:
-                                    # 孤儿 token — 写入 positions.jsonl 让 monitor 管理
+                                    # 链上余额交叉验证 — data-api的size是历史值，可能远大于实际持有
+                                    _real_bal = clob_client.get_token_balance(_ap_asset)
+                                    if _real_bal is None:
+                                        continue  # 查询失败，不标记已知，下轮重试
+                                    if _real_bal < 0.5:
+                                        _orphan_known_tokens.add(_ap_asset)  # 确认是dust，永久跳过
+                                        continue
+                                    # 孤儿 token — 用链上真实余额写入
+                                    _ap_size = _real_bal
                                     _orphan_record = {
                                         "token_id": _ap_asset,
                                         "slug": _ap.get("eventSlug", _ap.get("slug", "orphan")),
