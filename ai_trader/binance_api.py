@@ -5,6 +5,7 @@ import json
 import requests
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 from ai_trader.ws_ssl import get_websocket_sslopt
@@ -55,6 +56,8 @@ class BinancePriceStream:
         self.event_timestamps = {}  # {"BTC": event_time, ...}
         self.trade_timestamps = {}  # {"BTC": trade_time, ...}
         self.update_count = {}  # {"BTC": 123, ...}
+        # v14.1: 交易流动量缓冲区 — (ts, price, qty, is_buyer_maker)
+        self._trade_tape = {}  # {"BTC": deque(maxlen=500), ...}
         self._ws = None
         self._running = False
         self._thread = None
@@ -111,6 +114,15 @@ class BinancePriceStream:
                 self.event_timestamps[coin] = event_ts
                 self.trade_timestamps[coin] = trade_ts
                 self.update_count[coin] = self.update_count.get(coin, 0) + 1
+                # v14.1: 积累交易流数据 — qty + is_buyer_maker
+                qty = float(data.get("q", 0))
+                is_buyer_maker = data.get("m", False)  # True=卖方主动, False=买方主动
+                if qty > 0:
+                    tape = self._trade_tape.get(coin)
+                    if tape is None:
+                        tape = deque(maxlen=500)
+                        self._trade_tape[coin] = tape
+                    tape.append((received_at, price, qty, is_buyer_maker))
         except Exception:
             pass
 
@@ -152,6 +164,35 @@ class BinancePriceStream:
             "trade_age_ms": trade_age_ms,
             "updates": self.update_count.get(coin, 0),
         }
+
+    def get_tick_momentum(self, coin="BTC", window_sec=10):
+        """v14.1: 计算滚动窗口内的交易流动量
+
+        返回 {"ofi": float, "buy_vol": float, "sell_vol": float, "n_trades": int, "direction": str|None}
+        ofi = (buy_vol - sell_vol) / (buy_vol + sell_vol), 范围 [-1, 1]
+        direction: "UP" if ofi > 0.15, "DOWN" if ofi < -0.15, None otherwise
+        """
+        tape = self._trade_tape.get(coin)
+        if not tape:
+            return {"ofi": 0, "buy_vol": 0, "sell_vol": 0, "n_trades": 0, "direction": None}
+        now = time.time()
+        cutoff = now - window_sec
+        buy_vol = 0.0
+        sell_vol = 0.0
+        n = 0
+        for ts, price, qty, is_buyer_maker in tape:
+            if ts < cutoff:
+                continue
+            n += 1
+            if is_buyer_maker:
+                sell_vol += qty * price  # 卖方是maker=买方主动吃单=卖压
+            else:
+                buy_vol += qty * price   # 买方是maker=卖方主动吃单=买压
+        total = buy_vol + sell_vol
+        ofi = (buy_vol - sell_vol) / total if total > 0 else 0
+        direction = "UP" if ofi > 0.15 else ("DOWN" if ofi < -0.15 else None)
+        return {"ofi": round(ofi, 4), "buy_vol": round(buy_vol, 2),
+                "sell_vol": round(sell_vol, 2), "n_trades": n, "direction": direction}
 
     def stop(self):
         self._running = False

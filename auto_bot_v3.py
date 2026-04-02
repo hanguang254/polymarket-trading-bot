@@ -711,56 +711,7 @@ class MarketTracker:
             _should_check_bal = _should_cleanup or _ws_fill or (_now - ambush.get("last_bal_check", 0) >= AMBUSH_BAL_INTERVAL)
             _filled = 0
 
-            # ── v13.1 M4: Bilateral fill detection ──
-            if ambush.get("bilateral") and _should_check_bal:
-                ambush["last_bal_check"] = _now
-                _up_bal = clob_client.get_token_balance(ambush["up_token"], cache_ttl=2.0) or 0
-                _down_bal = clob_client.get_token_balance(ambush["down_token"], cache_ttl=2.0) or 0
-                _up_filled = _up_bal - ambush.get("bal_before_up", 0)
-                _down_filled = _down_bal - ambush.get("bal_before_down", 0)
-                _check_age = round(_now - ambush.get("placed_at", _now), 1)
-                if _up_filled > 0.1:
-                    _filled = _up_filled
-                    _token = ambush["up_token"]
-                    ambush["token"] = _token
-                    ambush["direction"] = "UP"
-                    ambush["price"] = ambush.get("up_price", ambush["price"])
-                    ambush["opposite_token"] = ambush["down_token"]
-                    ambush["bal_before"] = ambush.get("bal_before_up", 0)
-                    if ambush.get("down_order_id"):
-                        try:
-                            clob_client.cancel_order(ambush["down_order_id"])
-                        except Exception:
-                            pass
-                    clob_client.cancel_all(ambush["down_token"])
-                    ambush.pop("bilateral", None)  # 成交后转单向
-                    logger.info(f"  [伏] 双向→UP成交: ×{_up_filled:.2f}份 → 撤DOWN侧")
-                elif _down_filled > 0.1:
-                    _filled = _down_filled
-                    _token = ambush["down_token"]
-                    ambush["token"] = _token
-                    ambush["direction"] = "DOWN"
-                    ambush["price"] = ambush.get("down_price", ambush["price"])
-                    ambush["opposite_token"] = ambush["up_token"]
-                    ambush["bal_before"] = ambush.get("bal_before_down", 0)
-                    if ambush.get("up_order_id"):
-                        try:
-                            clob_client.cancel_order(ambush["up_order_id"])
-                        except Exception:
-                            pass
-                    clob_client.cancel_all(ambush["up_token"])
-                    ambush.pop("bilateral", None)  # 成交后转单向
-                    logger.info(f"  [伏] 双向→DOWN成交: ×{_down_filled:.2f}份 → 撤UP侧")
-                else:
-                    _last_summary = ambush.get("_last_summary_ts", 0)
-                    if _now - _last_summary >= 5:
-                        ambush["_last_summary_ts"] = _now
-                        logger.info(
-                            f"  [伏] 双向等待: {coin} UP@${ambush.get('up_price',0):.2f} "
-                            f"DOWN@${ambush.get('down_price',0):.2f} | 已挂{_check_age:.0f}s | 剩余{remaining:.0f}s")
-                    # bilateral标记保留 — 两侧都未成交，继续双向监控
-
-            elif _should_check_bal:
+            if _should_check_bal:
                 ambush["last_bal_check"] = _now
                 _bal = clob_client.get_token_balance(_token, cache_ttl=2.0) or 0
                 _filled = _bal - ambush["bal_before"]
@@ -801,9 +752,28 @@ class MarketTracker:
                                 _entry_confirmed = True
                             elif _ord_status not in ("MATCHED", "FILLED"):
                                 # 当前订单未成交 → 成交来自追价前的旧单（竞争条件）
-                                logger.info(
-                                    f"  [伏] 追价竞争: 跟踪单状态={_ord_status}，"
-                                    f"成交来自旧单，entry=${entry_price:.3f}待修正")
+                                # v14.1: 遍历_oid_history找到实际成交单的真实价格
+                                for _hist_oid in ambush.get("_oid_history", []):
+                                    if _hist_oid == _tracked_oid:
+                                        continue
+                                    try:
+                                        _hist_info = clob_client.get_order(_hist_oid)
+                                        if _hist_info:
+                                            _hist_status = str(_hist_info.get("status", "")).upper()
+                                            _hist_price = float(_hist_info.get("price") or 0)
+                                            if _hist_status in ("MATCHED", "FILLED") and _hist_price > 0:
+                                                entry_price = _hist_price
+                                                _entry_confirmed = True
+                                                logger.info(
+                                                    f"  [伏] 旧单确认: oid={_hist_oid[:8]}.. "
+                                                    f"price=${_hist_price:.3f} → entry已修正")
+                                                break
+                                    except Exception:
+                                        pass
+                                if not _entry_confirmed:
+                                    logger.info(
+                                        f"  [伏] 追价竞争: 跟踪单状态={_ord_status}，"
+                                        f"旧单遍历未找到成交，entry=${entry_price:.3f}待修正")
                     except Exception:
                         pass
                 cost = round(entry_price * filled_size, 4)
@@ -910,6 +880,72 @@ class MarketTracker:
                             logger.info(f"  ⚡ 即时卖出成功: ${_sell_price_avg:.3f}×{_sell_size:.1f}=${_sell_usdc:.2f} 亏${_loss:.2f}")
                             send_notification(coin, _dir, _fill_conf, 0,
                                               _sell_price_avg, _sell_size, ambush=True)
+                            # v14.1: 决策快照 — 方向翻转forced-sell
+                            try:
+                                from ai_trader.trade_logger import log_exit
+                                log_exit(slug, coin, "direction_flip",
+                                         exit_price=_sell_price_avg,
+                                         entry_price=entry_price,
+                                         size=_sell_size,
+                                         realized_pnl=round(-_loss, 4))
+                            except Exception:
+                                pass
+                            # v14.2: direction_flip PnL 入账 — 之前这条路径完全不写
+                            # positions.jsonl / trading_state，导致真实亏损不可见
+                            _flip_pnl = round(_sell_usdc - _actual_cost, 4)
+                            try:
+                                record_bet_cost(slug, _actual_cost)
+                                from trading_state import settle_bet_cost
+                                settle_bet_cost(slug, _flip_pnl)
+                                record_bet_result(False, slug, pnl=0.0)
+                            except Exception as _pe:
+                                logger.warning(f"  [伏] direction_flip PnL入账异常: {_pe}")
+                            # v14.3: record_outcome — 写 outcomes.jsonl + base_rate 校准
+                            try:
+                                from ai_trader.base_rate import record_outcome
+                                record_outcome(
+                                    slug=slug,
+                                    direction=_dir,
+                                    diff_in_atr=round(abs(_live_price - ptb) / atr_val, 2) if (atr_val and _live_price and ptb) else 0,
+                                    won=(_flip_pnl > 0),
+                                    extra={
+                                        "entry_price": entry_price,
+                                        "exit_price": _sell_price_avg,
+                                        "size": _sell_size,
+                                        "entry_cost": _actual_cost,
+                                        "realized_pnl": _flip_pnl,
+                                        "realized_won": (_flip_pnl > 0),
+                                        "directional_won": None,
+                                        "calibration_eligible": False,
+                                        "exit_reason": "direction_flip",
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            # 写 positions.jsonl（已关闭状态）
+                            _flip_ts = datetime.now(timezone.utc).isoformat()
+                            _flip_record = {
+                                "token_id": _token, "slug": slug,
+                                "direction": _dir, "entry_price": entry_price,
+                                "size": _sell_size, "entry_cost": _actual_cost,
+                                "entry_time": _flip_ts,
+                                "price_to_beat": ptb, "atr": atr_val,
+                                "opposite_token_id": _opp,
+                                "sniper_thread": True, "ambush": True,
+                                "closed": True, "exit_price": _sell_price_avg,
+                                "exit_time": _flip_ts,
+                                "exit_reason": "direction_flip",
+                            }
+                            try:
+                                import fcntl as _fc
+                                _fl = open(POSITIONS_FILE + ".lock", "w")
+                                _fc.flock(_fl, _fc.LOCK_EX)
+                                with open(POSITIONS_FILE, "a") as _pf:
+                                    _pf.write(json.dumps(_flip_record) + "\n")
+                                _fc.flock(_fl, _fc.LOCK_UN)
+                                _fl.close()
+                            except Exception:
+                                pass
                         else:
                             logger.warning(f"  ⚡ 即时卖出未成交: {_sell_result.get('status')}")
                     except Exception as _e:
@@ -936,6 +972,20 @@ class MarketTracker:
                 }
                 self.analyzed.add(slug)
                 record_bet_cost(slug, cost)
+                # v14.1: 决策快照
+                try:
+                    from ai_trader.trade_logger import log_entry
+                    log_entry(slug, coin, "ambush",
+                              direction=_dir, entry_price=entry_price,
+                              size=filled_size, cost=cost,
+                              ptb=ptb, atr=atr_val, remaining=remaining,
+                              maker_or_taker="maker",
+                              entry_confirmed=_entry_confirmed,
+                              confidence=ambush.get("confidence", 0),
+                              entry_max_price=ambush.get("max_price"),
+                              market_ask_at_entry=ambush.get("market_ask"))
+                except Exception:
+                    pass
 
                 # 写 positions.jsonl
                 import fcntl
@@ -969,11 +1019,11 @@ class MarketTracker:
                 send_notification(coin, _dir, max(_fill_conf, ambush.get("confidence", 0.5)),
                                   0, entry_price, filled_size, ambush=True)
 
-                # ── v12.9.16: 伏击止盈单 — 成交后立即挂 GTD SELL 限价单锁定利润 ──
+                # ── v14: 伏击止盈单 — 用Phase1高位TP挂单，monitor会动态阶梯下调 ──
                 _AMBUSH_TP_ENABLED = os.environ.get("AMBUSH_TP_ENABLED", "1") == "1"
                 if _AMBUSH_TP_ENABLED and filled_size > 0:
                     try:
-                        _TP_RATIO = float(os.environ.get("AMBUSH_TP_RATIO", "0.5"))
+                        _TP_RATIO = float(os.environ.get("AMBUSH_TP_PHASE1_RATIO", "0.60"))
                         _TP_DEADLINE = int(os.environ.get("AMBUSH_TP_DEADLINE", "15"))
                         _tp_price = round(entry_price + (1.0 - entry_price) * _TP_RATIO, 2)
                         _tp_price = max(entry_price + 0.01, min(0.99, _tp_price))
@@ -1035,11 +1085,6 @@ class MarketTracker:
                 # 批量撤全部历史挂单（1次API）+ cancel_all兜底
                 clob_client.cancel_orders_batch(ambush.get("all_order_ids", []))
                 clob_client.cancel_all(_token)  # 兜底：撤该token所有残留
-                # v13.1 M4: bilateral → 也撤另一侧token
-                if ambush.get("bilateral") or ambush.get("down_order_id"):
-                    _other = ambush.get("down_token") if _token == ambush.get("up_token") else ambush.get("up_token")
-                    if _other:
-                        clob_client.cancel_all(_other)
                 self._ambush_orders.pop(slug, None)
                 self._ambush_cancelled_at[slug] = time.time()
                 logger.info(f"  [伏] 撤销伏击单: {coin} {ambush['direction']} (剩余{remaining:.0f}s)")
@@ -1071,24 +1116,13 @@ class MarketTracker:
                             _gap_rp = abs(_cur_price_rp - ptb)
                             _diff_atr_rp = _gap_rp / atr_val
                             _rw_rp = _random_walk_p_win(_gap_rp, atr_val, remaining)
-                            # _rw_rp = P(UP wins)；bilateral 追踪 DOWN 侧时需反转
-                            _is_bi = ambush.get("bilateral")
-                            _tracking_down = _is_bi and ambush.get("token") == ambush.get("down_token")
-                            if _tracking_down:
-                                _rw_rp = 1.0 - _rw_rp  # P(DOWN wins)
-                            else:
-                                _diff_rp = _cur_price_rp - ptb
-                                _rw_rp = _rw_rp if _diff_rp > 0 else (1.0 - _rw_rp)
+                            # _rw_rp = P(UP wins)
+                            _diff_rp = _cur_price_rp - ptb
+                            _rw_rp = _rw_rp if _diff_rp > 0 else (1.0 - _rw_rp)
                             _sig_rp = _get_bayesian_signal(_updater_rp, remaining_seconds=remaining)
                             _conf_rp = _sig_rp.get("confidence", 0) if _sig_rp else 0
-                            # bilateral: 信号方向对齐追踪侧
-                            if _is_bi:
-                                _tracked_dir = "DOWN" if _tracking_down else "UP"
-                                if _sig_rp and _sig_rp.get("direction") != _tracked_dir:
-                                    _conf_rp = -_conf_rp
-                            else:
-                                if _sig_rp and _sig_rp.get("direction") != ambush.get("direction", "UP"):
-                                    _conf_rp = -_conf_rp
+                            if _sig_rp and _sig_rp.get("direction") != ambush.get("direction", "UP"):
+                                _conf_rp = -_conf_rp
                             _SHRINKAGE_RP = float(os.environ.get("SNIPER_AMBUSH_SHRINKAGE", "0.80"))
                             _p_win_rp = 0.5 + (max(_rw_rp, _conf_rp * 0.5 + 0.5) - 0.5) * _SHRINKAGE_RP
                             # ── v13: 追价也用动态 EDGE — 时间衰减+波动率自适应 ──
@@ -1100,15 +1134,10 @@ class MarketTracker:
                                 _vol_ratio_rp = max(0.5, min(2.0, atr_val / _avg_atr_rp))
                                 AMBUSH_EDGE *= _vol_ratio_rp
                             AMBUSH_EDGE = round(AMBUSH_EDGE, 3)
-                            # bilateral 用独立 min_price，不用 AMBUSH_MIN_PRICE
-                            if _is_bi:
-                                AMBUSH_MIN_P = float(os.environ.get("BILATERAL_MIN_PRICE", "0.15"))
-                            else:
-                                AMBUSH_MIN_P = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
-                            AMBUSH_MAX_P = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.85"))
+                            AMBUSH_MIN_P = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
+                            AMBUSH_MAX_P = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.60"))
                             _new_price = round(round((_p_win_rp - AMBUSH_EDGE) / 0.01) * 0.01, 2)
                             _new_price = max(AMBUSH_MIN_P, min(AMBUSH_MAX_P, _new_price))
-
                             # v12.9.13: 追价也接入 CLOB 感知 + offset 时间衰减
                             _rp_ask = None
                             _token_rp = ambush.get("token")
@@ -1130,7 +1159,52 @@ class MarketTracker:
                                     if _clob_price > _new_price:
                                         _new_price = _clob_price
 
+                            # v14.1: p_win硬门槛 — CLOB提价后最终检查（不能入场即负EV）
                             _old_price = ambush["price"]
+                            _gtd_expired = _now > ambush.get("gtd_expires_at", float('inf'))
+                            if _new_price >= _p_win_rp:
+                                if _old_price >= _p_win_rp or _gtd_expired:
+                                    # 旧单也过贵或已过期 → 撤旧单 + 冷却
+                                    _cancel_ok = clob_client.cancel_all(_token)
+                                    if _cancel_ok:
+                                        logger.info(
+                                            f"  [伏] 追价封顶+撤旧单: {coin} new=${_new_price:.2f} old=${_old_price:.2f} "
+                                            f"≥p_win=${_p_win_rp:.3f} {'(GTD过期)' if _gtd_expired else ''} → 已撤单")
+                                        self._ambush_orders.pop(slug, None)
+                                        self._ambush_cancelled_at[slug] = time.time()
+                                    else:
+                                        # 撤单失败 → 保留托管状态，下轮重试
+                                        logger.warning(
+                                            f"  [伏] 追价封顶撤单失败: {coin} old=${_old_price:.2f} → 保留托管下轮重试")
+                                else:
+                                    # 旧单价有正EV — 但需确认仍live
+                                    _old_oid_check = ambush.get("order_id")
+                                    _old_status = None  # None=查询失败, str=拿到状态
+                                    if _old_oid_check:
+                                        try:
+                                            _oi = clob_client.get_order(_old_oid_check)
+                                            if _oi:
+                                                _old_status = str(_oi.get("status", "")).upper()
+                                        except Exception:
+                                            pass  # _old_status stays None → 下面走保守路径
+                                    if _old_status in ("LIVE", "OPEN", "ACTIVE"):
+                                        logger.info(
+                                            f"  [伏] 追价封顶: {coin} new=${_new_price:.2f}≥p_win=${_p_win_rp:.3f} "
+                                            f"→ 保留旧单${_old_price:.2f}(确认live)")
+                                    elif _old_status in ("CANCELLED", "CANCELED", "EXPIRED", "MATCHED", "FILLED"):
+                                        # 旧单已明确终结 → 清状态
+                                        logger.info(
+                                            f"  [伏] 追价封顶+旧单已终结: {coin} old=${_old_price:.2f} "
+                                            f"status={_old_status} → 清状态")
+                                        self._ambush_orders.pop(slug, None)
+                                        self._ambush_cancelled_at[slug] = time.time()
+                                    else:
+                                        # API失败/返回空/无oid → 不能确认死活，保留托管下轮重查
+                                        logger.warning(
+                                            f"  [伏] 追价封顶+旧单状态未知: {coin} old=${_old_price:.2f} "
+                                            f"status={_old_status} → 保留托管下轮重查")
+                                return
+
                             _old_oid = ambush.get("order_id")
 
                             AMBUSH_REPRICE_MIN_DELTA = float(
@@ -1139,8 +1213,7 @@ class MarketTracker:
                             _price_delta = abs(_new_price - _old_price)
                             _is_backward = _new_price < _old_price
                             _stale_above_ask = _is_backward and _rp_ask and _old_price > _rp_ask
-                            # v12.9.14: GTD过期检测 — 订单已被交易所自动撤
-                            _gtd_expired = _now > ambush.get("gtd_expires_at", float('inf'))
+                            # _gtd_expired 已在 p_win 硬门槛处计算
                             # v12.9.14: Edge腐蚀 — 旧单价≥模型公允价，成交即亏
                             _edge_eroded = _is_backward and _old_price >= _p_win_rp
                             if _gtd_expired:
@@ -1181,14 +1254,9 @@ class MarketTracker:
                                     f"→ 安全降价到${_new_price:.2f}")
                             if _should_reprice_now:
                                 # v12.9.12: 安全追价 — cancel_all 信任制 + stuck-order 诊断
-                                # bilateral: 只检查被追踪侧的 oid，弱侧仍然 live 是正常的
-                                if _is_bi:
-                                    _tracked_oid = ambush.get("order_id")
-                                    _old_oids = [_tracked_oid] if _tracked_oid else []
-                                else:
-                                    _old_oids = [oid for oid in dict.fromkeys(ambush.get("all_order_ids", [])) if oid]
-                                    if _old_oid and _old_oid not in _old_oids:
-                                        _old_oids.append(_old_oid)
+                                _old_oids = [oid for oid in dict.fromkeys(ambush.get("all_order_ids", [])) if oid]
+                                if _old_oid and _old_oid not in _old_oids:
+                                    _old_oids.append(_old_oid)
 
                                 # token级全撤（Polymarket cancel_market_orders 是最可靠的撤单方式）
                                 _cancel_ok = clob_client.cancel_all(_token)
@@ -1204,12 +1272,7 @@ class MarketTracker:
                                     logger.warning(
                                         f"  [伏] 追价中止: {coin} 余额查询失败，无法确认旧单状态")
                                     return
-                                # bilateral: 用追踪侧的 bal_before（bal_before=0 是 bilateral 初始值）
-                                if _is_bi:
-                                    _bi_bb = ambush.get("bal_before_down", 0) if _tracking_down else ambush.get("bal_before_up", 0)
-                                else:
-                                    _bi_bb = ambush["bal_before"]
-                                _verify_filled = _verify_bal - _bi_bb
+                                _verify_filled = _verify_bal - ambush["bal_before"]
                                 if _verify_filled > 0.1:
                                     ambush["pending_fill"] = True
                                     logger.info(
@@ -1281,12 +1344,10 @@ class MarketTracker:
                                     # 旧单已确认撤销，只跟踪新单
                                     ambush["order_id"] = _new_oid
                                     ambush["all_order_ids"] = [_new_oid] if _new_oid else []
+                                    # v14.1: 累积历史oid到独立字段（仅entry_price追溯用）
+                                    if _new_oid:
+                                        ambush.setdefault("_oid_history", []).append(_new_oid)
                                     ambush["price"] = _new_price
-                                    if ambush.get("bilateral"):
-                                        if ambush["token"] == ambush.get("up_token"):
-                                            ambush["up_price"] = _new_price
-                                        else:
-                                            ambush["down_price"] = _new_price
                                     ambush["reprice_count"] = _reprice_count + 1
                                     ambush["gtd_expires_at"] = _gtd_exp_rp
                                     ambush["last_order_ts"] = time.time()  # v13 M4: 追价重置时间戳
@@ -1305,6 +1366,15 @@ class MarketTracker:
                                             f"(p_win={_p_win_rp:.3f} ATR={_diff_atr_rp:.2f}{_rp_ask_str} "
                                             f"已撤旧单 TTL={GTD_REPRICE_SEC}s "
                                             f"仅跟踪1单 第{_reprice_count+1}/{AMBUSH_REPRICE_MAX}次)")
+                                else:
+                                    # place_order 失败: 旧单已撤但新单没下成 → 场上无单
+                                    # 清状态+冷却，让下轮重新挂单（不能留半更新状态）
+                                    _err_status = _new_result.get("status", "unknown")
+                                    logger.warning(
+                                        f"  [伏] 追价重挂失败: {coin} ${_new_price:.2f} "
+                                        f"status={_err_status} → 清状态+冷却")
+                                    self._ambush_orders.pop(slug, None)
+                                    self._ambush_cancelled_at[slug] = time.time()
                 else:
                     # 追价次数耗尽 — 仍需检测GTD过期，否则订单已死但bot不知道
                     _gtd_expired_post = _now > ambush.get("gtd_expires_at", float('inf'))
@@ -1318,171 +1388,13 @@ class MarketTracker:
 
         # 注意：放置逻辑已移到 _sniper_scan 的 "ask太贵" 路径，不在这里盲挂
 
-    def _place_bilateral_ambush(self, slug, coin, tokens, gap_dir, diff_atr, ptb, atr_val,
-                                remaining, edge, max_price):
-        """v13.1 M4: 双向GTD伏击 — 方向不确定时在UP和DOWN同时挂单
-
-        当一侧成交时撤另一侧，由_manage_ambush检测并路由。
-        gap_dir: 当前偏向方向（用于概率分配，bilateral会做50%shrinkage）
-        """
-        if slug in self._ambush_orders or slug in self.positions or slug in self.analyzed:
-            return
-
-        AMBUSH_WINDOW_END = float(os.environ.get("SNIPER_AMBUSH_END", "30"))
-        if remaining <= AMBUSH_WINDOW_END + 5:
-            return
-        _last_cancel = self._ambush_cancelled_at.get(slug, 0)
-        if time.time() - _last_cancel < 30:
-            return
-
-        # 计算双方fair value
-        from ai_analyze_v2 import _random_walk_p_win
-        from ai_trader.base_rate import get_base_rate
-        # FIX: _gap 是实际美元价差（diff_atr × atr_val），不乘 ptb
-        _gap = diff_atr * atr_val if atr_val > 0 else 0
-        _rw = _random_walk_p_win(_gap, atr_val, remaining) if _gap > 0 else 0.5
-        # FIX: 根据 gap_dir 分配概率 — 之前 abs() 导致永远偏向 UP
-        _p_favored = 0.5 + (_rw - 0.5) * 0.50  # 50% shrinkage toward 0.5
-        _p_win_up = _p_favored if gap_dir == "UP" else (1.0 - _p_favored)
-        _p_win_down = 1.0 - _p_win_up
-
-        up_price = round(round((_p_win_up - edge) / 0.01) * 0.01, 2)
-        down_price = round(round((_p_win_down - edge) / 0.01) * 0.01, 2)
-        # FIX: bilateral 用独立的 min_price — 共用 AMBUSH_MIN_PRICE 会把弱侧 edge 压成负数
-        _bi_min = float(os.environ.get("BILATERAL_MIN_PRICE", "0.15"))
-        up_price = max(_bi_min, min(max_price, up_price))
-        down_price = max(_bi_min, min(max_price, down_price))
-
-        # Kelly: 用较小的f* (保守)
-        _br = get_base_rate(diff_atr)
-        _kr = 0.25  # bilateral更保守: 1/8 Kelly而非1/4
-        _bal = self._cached_balance if self._cached_balance and self._cached_balance > 0 else 20.0
-        _f_up = (_p_win_up - up_price) / (1.0 - up_price) if _p_win_up > up_price else 0
-        _f_down = (_p_win_down - down_price) / (1.0 - down_price) if _p_win_down > down_price else 0
-        if _f_up <= 0 and _f_down <= 0:
-            return
-
-        MIN_BET = float(os.environ.get("MIN_BET_SIZE", "2"))
-        MAX_BET = float(os.environ.get("MAX_BET_SIZE", "3"))
-
-        def _calc_size(f_star, price):
-            dollar = _bal * f_star * _kr
-            net = round(dollar / price, 1) if price > 0 else 0
-            net = max(MIN_BET, min(MAX_BET, net))
-            return round(net / 0.975, 2)
-
-        up_size = _calc_size(_f_up, up_price) if _f_up > 0 else 0
-        down_size = _calc_size(_f_down, down_price) if _f_down > 0 else 0
-        if up_size <= 0 and down_size <= 0:
-            return
-
-        # GTD expiration
-        from py_clob_client.order_builder.constants import BUY as _BI_BUY
-        from py_clob_client.clob_types import OrderType as _BI_OT
-        AMBUSH_END_SEC = float(os.environ.get("SNIPER_AMBUSH_END", "30"))
-        _market = self.tracked.get(slug, {})
-        _end_str = _market.get("end_time", "")
-        _gtd_exp = 0
-        if _end_str:
-            _end_dt = datetime.fromisoformat(_end_str.replace("Z", "+00:00"))
-            _gtd_exp = int(_end_dt.timestamp()) - int(AMBUSH_END_SEC) + 60
-
-        bal_up = clob_client.get_token_balance(tokens[0]) or 0
-        bal_down = clob_client.get_token_balance(tokens[1]) or 0
-
-        up_oid = None
-        down_oid = None
-        all_oids = []
-
-        if up_size > 0:
-            try:
-                r = clob_client.place_order(tokens[0], _BI_BUY, up_price, up_size,
-                                             order_type=_BI_OT.GTD, expiration=_gtd_exp)
-                up_oid = r.get("order_id")
-                if up_oid:
-                    all_oids.append(up_oid)
-            except Exception:
-                pass
-        if down_size > 0:
-            try:
-                r = clob_client.place_order(tokens[1], _BI_BUY, down_price, down_size,
-                                             order_type=_BI_OT.GTD, expiration=_gtd_exp)
-                down_oid = r.get("order_id")
-                if down_oid:
-                    all_oids.append(down_oid)
-            except Exception:
-                pass
-
-        if not up_oid and not down_oid:
-            return
-
-        # 强侧必须下单成功，否则取消弱侧并放弃 bilateral
-        _strong_oid = up_oid if gap_dir == "UP" else down_oid
-        if not _strong_oid:
-            _weak_oid = down_oid if gap_dir == "UP" else up_oid
-            if _weak_oid:
-                _weak_token = tokens[1] if gap_dir == "UP" else tokens[0]
-                # cancel_order 失败返回 False（不抛异常），需检查返回值
-                _cancelled = clob_client.cancel_order(_weak_oid)
-                if not _cancelled:
-                    # fallback: 按 token 撤销该侧全部挂单
-                    _cancelled = clob_client.cancel_all(_weak_token)
-                if not _cancelled:
-                    # 双重撤单失败 — 建立最小托管状态，让 _manage_ambush 接管至 GTD 过期
-                    logger.critical(
-                        f"  🚨 弱侧撤单失败，建立托管状态: {coin} oid={_weak_oid}")
-                    _weak_price = down_price if gap_dir == "UP" else up_price
-                    _weak_dir = "DOWN" if gap_dir == "UP" else "UP"
-                    _weak_opp = tokens[0] if gap_dir == "UP" else tokens[1]
-                    self._ambush_orders[slug] = {
-                        "bilateral": False,
-                        "token": _weak_token, "opposite_token": _weak_opp,
-                        "up_token": tokens[0], "down_token": tokens[1],
-                        "direction": _weak_dir, "confidence": 0,
-                        "order_id": _weak_oid, "all_order_ids": [_weak_oid],
-                        "price": _weak_price,
-                        "size": down_size if gap_dir == "UP" else up_size,
-                        "bal_before": bal_down if gap_dir == "UP" else bal_up,
-                        "placed_at": time.time(), "last_check": time.time(),
-                        "last_order_ts": time.time(), "last_reprice": time.time(),
-                        "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
-                    }
-                    return
-            logger.info(f"  ⚠️ 双向伏击放弃: {coin} 强侧({gap_dir})下单失败，弱侧已撤单")
-            return
-
-        # 追踪强侧（gap_dir 偏向的那一侧） — 追价/CLOB感知都在这个token上运行
-        _strong_token = tokens[0] if gap_dir == "UP" else tokens[1]
-        _strong_price = up_price if gap_dir == "UP" else down_price
-        self._ambush_orders[slug] = {
-            "bilateral": True,
-            "token": _strong_token, "opposite_token": tokens[1] if gap_dir == "UP" else tokens[0],
-            "up_token": tokens[0], "down_token": tokens[1],
-            "direction": "BILATERAL", "confidence": 0,
-            "order_id": _strong_oid,
-            "all_order_ids": all_oids,
-            "up_order_id": up_oid, "down_order_id": down_oid,
-            "up_price": up_price, "down_price": down_price,
-            "up_size": up_size, "down_size": down_size,
-            "price": _strong_price, "size": max(up_size, down_size),
-            "bal_before": 0, "bal_before_up": bal_up, "bal_before_down": bal_down,
-            "placed_at": time.time(), "last_check": time.time(),
-            "last_order_ts": time.time(),
-            "last_reprice": time.time(),  # 防止初始挂单立即触发追价检查
-            "gtd_expires_at": _gtd_exp if _gtd_exp > 0 else float('inf'),
-        }
-        self._ambush_stat(slug, coin, bilateral=True, placed=True,
-                          price=up_price, direction="BILATERAL")
-        logger.info(
-            f"  🎯🎯 双向伏击: {coin} UP@${up_price:.2f}×{up_size:.1f} + DOWN@${down_price:.2f}×{down_size:.1f} "
-            f"| ATR={diff_atr:.2f} p_up={_p_win_up:.3f} edge={edge:.3f} remaining={remaining:.0f}s")
 
     def _ambush_stat(self, slug, coin, **kw):
         """更新伏击统计"""
         s = self._ambush_stats.setdefault(slug, {
             "coin": coin, "checks": 0, "max_conf": 0, "max_atr": 0,
             "skip_reasons": {}, "placed": False, "filled": False,
-            "price": 0, "direction": "", "bilateral": False, "tp": False,
+            "price": 0, "direction": "", "tp": False,
         })
         for k, v in kw.items():
             if k == "skip":
@@ -1512,7 +1424,7 @@ class MarketTracker:
         AMBUSH_MIN_ATR_ABS = float(os.environ.get("SNIPER_AMBUSH_MIN_ATR_ABS", "30"))
         AMBUSH_MIN_CONF = float(os.environ.get("SNIPER_AMBUSH_MIN_CONF", "0.35"))
         AMBUSH_MIN_PRICE = float(os.environ.get("SNIPER_AMBUSH_MIN_PRICE", "0.45"))
-        AMBUSH_MAX_PRICE = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.85"))
+        AMBUSH_MAX_PRICE = float(os.environ.get("SNIPER_AMBUSH_MAX_PRICE", "0.60"))
         # ── v13: 动态 EDGE — 时间衰减(AS模型) + 波动率自适应(GLFT模型) ──
         _base_edge = float(os.environ.get("SNIPER_AMBUSH_EDGE", "0.045"))
         _min_edge = float(os.environ.get("SNIPER_AMBUSH_EDGE_MIN", "0.008"))
@@ -1529,7 +1441,7 @@ class MarketTracker:
         s = self._ambush_stats.setdefault(slug, {
             "coin": coin, "checks": 0, "max_conf": 0, "max_atr": 0,
             "skip_reasons": {}, "placed": False, "filled": False,
-            "price": 0, "direction": "", "bilateral": False, "tp": False,
+            "price": 0, "direction": "", "tp": False,
         })
         s["checks"] += 1
         self._ambush_stat(slug, coin, conf=confidence, atr=diff_atr)
@@ -1549,14 +1461,6 @@ class MarketTracker:
             self._ambush_stat(slug, coin, skip="ATR不足")
             return
 
-        # ── v13.1 M4: Bilateral ambush — 方向不确定时双向挂单对冲方向风险 ──
-        _BILATERAL = os.environ.get("BILATERAL_AMBUSH", "0") == "1"
-        _BI_MAX_CONF = float(os.environ.get("BILATERAL_MAX_CONF", "0.50"))
-        if _BILATERAL and confidence < _BI_MAX_CONF and confidence >= 0.15:
-            self._place_bilateral_ambush(slug, coin, tokens, gap_dir, diff_atr, ptb, atr_val,
-                                          remaining, AMBUSH_EDGE, AMBUSH_MAX_PRICE)
-            return
-
         # 单向伏击: 置信度门槛
         if confidence < AMBUSH_MIN_CONF:
             _skip_key = f"{slug}_conf"
@@ -1570,6 +1474,29 @@ class MarketTracker:
                     f"conf={confidence:.0%}<{AMBUSH_MIN_CONF}")
             self._ambush_stat(slug, coin, skip="信号不足")
             return
+
+        # v14.1: 快速方向 + 贝叶斯一致性硬门槛 — 只在多信号一致时挂单
+        _AMBUSH_REQUIRE_FAST = os.environ.get("AMBUSH_REQUIRE_FAST_DIR", "1") == "1"
+        if _AMBUSH_REQUIRE_FAST and atr_val and atr_val > 0:
+            try:
+                from ai_trader.fast_direction import get_fast_direction
+                _fast = get_fast_direction(
+                    coin, ptb, atr_val,
+                    tokens[0], tokens[1])
+                if _fast["direction"] and _fast["direction"] != gap_dir:
+                    _skip_key = f"{slug}_fast_conflict"
+                    _last_skip = getattr(self, '_ambush_skip_log', {})
+                    if _last_skip.get(_skip_key) != _fast["direction"]:
+                        if not hasattr(self, '_ambush_skip_log'):
+                            self._ambush_skip_log = {}
+                        self._ambush_skip_log[_skip_key] = _fast["direction"]
+                        logger.info(
+                            f"  [伏] 信号冲突跳过: {coin} bayesian={gap_dir} "
+                            f"fast={_fast['direction']} conf={_fast['confidence']:.2f} → 不挂单")
+                    self._ambush_stat(slug, coin, skip="fast方向冲突")
+                    return
+            except Exception:
+                pass  # fast_direction不可用时不阻塞挂单
 
         token = tokens[0] if gap_dir == "UP" else tokens[1]
         opposite = tokens[1] if gap_dir == "UP" else tokens[0]
@@ -1625,6 +1552,10 @@ class MarketTracker:
         _p_win = 0.5 + (max(_rw, confidence * 0.5 + 0.5) - 0.5) * _AMBUSH_SHRINKAGE
         AMBUSH_PRICE = round(round((_p_win - AMBUSH_EDGE) / 0.01) * 0.01, 2)  # tick 对齐 + 精度修正
         AMBUSH_PRICE = max(AMBUSH_MIN_PRICE, min(AMBUSH_MAX_PRICE, AMBUSH_PRICE))
+        # v14.1: 硬门槛 — 挂单价不能超过模型公允价
+        if AMBUSH_PRICE >= _p_win:
+            self._ambush_stat(slug, coin, skip="价格超公允值")
+            return
 
         # v12.9.13: CLOB感知定价 — 当市场价远高于模型价时，参考ask下方挂单
         AMBUSH_ASK_OFFSET = float(os.environ.get("SNIPER_AMBUSH_ASK_OFFSET", "0.05"))
@@ -1663,6 +1594,10 @@ class MarketTracker:
                         f"model=${AMBUSH_PRICE:.2f} ask=${_real_ask:.2f} "
                         f"→ ${_market_price:.2f} (ask-{AMBUSH_ASK_OFFSET})")
                 AMBUSH_PRICE = _market_price
+        # v14.1: CLOB感知提价后再次检查不超过p_win
+        if AMBUSH_PRICE >= _p_win:
+            self._ambush_stat(slug, coin, skip="CLOB提价超公允值")
+            return
 
         # Kelly 仓位计算
         _br = get_base_rate(diff_atr)
@@ -1702,7 +1637,10 @@ class MarketTracker:
                 "up_token": tokens[0], "down_token": tokens[1],
                 "direction": gap_dir, "confidence": confidence,
                 "order_id": oid, "all_order_ids": [oid],
+                "_oid_history": [oid],  # v14.1: 独立历史oid（entry_price追溯用）
                 "price": AMBUSH_PRICE, "size": ambush_size,
+                "max_price": AMBUSH_MAX_PRICE,  # v14.3: 校准用
+                "market_ask": _real_ask,  # v14.3: 校准用
                 "bal_before": bal_before,
                 "placed_at": time.time(), "last_check": time.time(),
                 "last_order_ts": time.time(),  # v13 M4: 当前订单下单时间(追价会重置)
@@ -1742,6 +1680,8 @@ class MarketTracker:
         返回True=市场已被占用(有持仓/伏击/已入场)或成功下单，False=endgame未行动(让常规狙击继续)。
         """
         ENDGAME_ENABLED = os.environ.get("ENDGAME_ENABLED", "1") == "1"
+        # v14.1: endgame 降级为 shadow — 只记信号不下单
+        _ENDGAME_LIVE = os.environ.get("ENDGAME_LIVE", "0") == "1"
         if not ENDGAME_ENABLED:
             return False
 
@@ -1824,6 +1764,22 @@ class MarketTracker:
             return False  # 时间不够挂GTD，放行常规狙击
 
         buy_price = round(token_ask, 2)
+
+        # v14.1: endgame shadow mode — 只记信号不下单
+        if not _ENDGAME_LIVE:
+            try:
+                from ai_trader.trade_logger import log_shadow
+                log_shadow(slug, coin, "endgame",
+                           direction=gap_dir, price=buy_price,
+                           size=endgame_size, p_win_mc=round(p_win_mc, 4),
+                           diff_atr=round(diff_atr, 2), remaining=remaining)
+            except Exception:
+                pass
+            logger.info(
+                f"  [终] endgame shadow: {coin} {gap_dir} @${buy_price:.2f} "
+                f"P(win)={p_win_mc:.3f} (禁用实盘，仅记录)")
+            return False  # 放行常规狙击
+
         result = clob_client.place_order(
             target_token, _EG_BUY, buy_price, endgame_size,
             order_type=_EG_OT.GTD, expiration=_gtd_exp)
@@ -2000,7 +1956,24 @@ class MarketTracker:
             # ── 独立贝叶斯：狙击线程自己维护updater，100ms自更新 ──
             if slug not in self._sniper_updaters:
                 from ai_trader.bayesian_engine import BayesianUpdater
-                self._sniper_updaters[slug] = BayesianUpdater(prior_up=0.5, atr_val=atr_val)
+                _sniper_updater = BayesianUpdater(prior_up=0.5, atr_val=atr_val)
+                # v14.1: 快速方向先验偏置（fail-closed: ATR无效时跳过）
+                if atr_val is not None:
+                    try:
+                        from ai_trader.fast_direction import get_fast_direction
+                        _tokens = self.token_cache.get(slug)
+                        _fast = get_fast_direction(
+                            coin, ptb, atr_val,
+                            _tokens[0] if _tokens else None,
+                            _tokens[1] if _tokens else None)
+                        if _fast["direction"]:
+                            _sniper_updater.set_prior_bias(_fast["prior_bias"])
+                            logger.info(
+                                f"  [狙] ⚡ 快速方向: {coin} → {_fast['direction']} "
+                                f"prior={_fast['prior_bias']:.3f}")
+                    except Exception:
+                        pass
+                self._sniper_updaters[slug] = _sniper_updater
                 logger.info(f"  [狙] 狙击线程: {coin} 创建独立贝叶斯(ATR={atr_val:.2f})")
             updater = self._sniper_updaters[slug]
             updater.update(price, ptb)
@@ -2198,6 +2171,25 @@ class MarketTracker:
 
             # ── v12.9.5: FOK入场前清掉该token所有伏击残留挂单 ──
             sniper_token = tokens[0] if gap_dir == "UP" else tokens[1]
+            # v14.1: shadow gate 必须在 cancel_all 之前，否则 shadow 会撤 live ambush 单
+            _SNIPER_TAKER_LIVE = os.environ.get("SNIPER_TAKER_LIVE", "0") == "1"
+            if not _SNIPER_TAKER_LIVE:
+                try:
+                    from ai_trader.trade_logger import log_shadow
+                    log_shadow(slug, coin, "sniper_taker",
+                               direction=gap_dir, ask=real_ask,
+                               ev=ev_est, p_win=round(p_win, 4),
+                               confidence=signal["confidence"],
+                               diff_atr=round(diff_atr, 2), remaining=remaining)
+                except Exception:
+                    pass
+                logger.info(
+                    f"  [狙] shadow: {coin} {gap_dir} ask=${real_ask:.2f} "
+                    f"EV={ev_est:.3f} p={p_win:.3f} (taker禁用，仅记录)")
+                # 清理 _sniper_processing 防止泄漏
+                with self._sniper_lock:
+                    self._sniper_processing.discard(slug)
+                continue
             clob_client.cancel_all(sniper_token)
             _did_sniper_inc = False
             global _pending_bets
@@ -2360,11 +2352,12 @@ class MarketTracker:
                             )
                         else:
                             atr_val = None
-                        self.bayesian_updaters[slug] = BayesianUpdater(
+                        _updater = BayesianUpdater(
                             prior_up=0.50,
                             atr_val=atr_val
                         )
-                        logger.info(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s | 贝叶斯先验UP=0.500(无偏) ATR={atr_val}")
+                        self.bayesian_updaters[slug] = _updater
+                        logger.info(f"\n🔥 预热开始: {market['coin']} | {slug} | 剩余{remaining:.0f}s | ATR={atr_val}")
                     except Exception as e:
                         logger.warning(f"\n🔥 预热开始(无贝叶斯): {market['coin']} | {slug} | {e}")
 
@@ -2413,6 +2406,23 @@ class MarketTracker:
                             # 贝叶斯更新
                             updater = self.bayesian_updaters.get(slug)
                             if updater:
+                                # v14.1: 首次update前注入快速方向先验（PTB刚就绪时补跑）
+                                if updater.n_updates == 0 and getattr(updater, 'atr_real', False):
+                                    # fail-closed: atr_real=False说明ATR来自fallback，不注入先验
+                                    try:
+                                        from ai_trader.fast_direction import get_fast_direction
+                                        _tokens = self.token_cache.get(slug)
+                                        _fast = get_fast_direction(
+                                            coin, ptb_now, updater.atr_val,
+                                            _tokens[0] if _tokens else None,
+                                            _tokens[1] if _tokens else None)
+                                        if _fast["direction"]:
+                                            updater.set_prior_bias(_fast["prior_bias"])
+                                            logger.info(
+                                                f"  ⚡ 快速方向(采样注入): {coin} → {_fast['direction']} "
+                                                f"prior={_fast['prior_bias']:.3f} | {_fast['reason']}")
+                                    except Exception:
+                                        pass
                                 updater.update(price, ptb_now)
                                 signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
                                 if signal:
@@ -2599,6 +2609,18 @@ class MarketTracker:
                                                                 "opposite_token_id": tokens[1] if sniper_dir == "UP" else tokens[0],
                                                                 "sniper": True,
                                                             }
+                                                            # v14.1: main-loop taker 降级 shadow
+                                                            _MAIN_TAKER_LIVE = os.environ.get("SNIPER_TAKER_LIVE", "0") == "1"
+                                                            if not _MAIN_TAKER_LIVE:
+                                                                try:
+                                                                    from ai_trader.trade_logger import log_shadow
+                                                                    log_shadow(slug, market['coin'], "main_taker",
+                                                                               direction=sniper_dir, ev=ev_est,
+                                                                               p_win=round(p_win, 4), confidence=b_conf,
+                                                                               remaining=remaining)
+                                                                except Exception:
+                                                                    pass
+                                                                continue
                                                             _bal = self._cached_balance if self._cached_balance and self._cached_balance > 0 else 999.0
                                                             success, entry_price, bet_size, output = execute_bet(
                                                                 slug, sniper_dir, sniper_token,
@@ -2728,8 +2750,9 @@ class MarketTracker:
             LATE_BET_START = strategy_cfg["late_bet_start"]
             MAX_TRADE_RETRIES = strategy_cfg["max_trade_retries"]
             if LATE_BET_START <= elapsed <= LATE_BET_END and slug not in self.analyzed:
-                # FOK/流动性失败重试上限
-                if self.trade_attempts.get(slug, 0) >= MAX_TRADE_RETRIES:
+                # FOK/流动性失败重试上限（仅taker live时生效，shadow不消费retries）
+                _TAKER_LIVE_LATE = os.environ.get("SNIPER_TAKER_LIVE", "0") == "1"
+                if _TAKER_LIVE_LATE and self.trade_attempts.get(slug, 0) >= MAX_TRADE_RETRIES:
                     self.analyzed.add(slug)
                     logger.warning(f"\n⚠️ {market['coin']} 晚期窗口已重试{MAX_TRADE_RETRIES}次，放弃")
                     continue
@@ -2778,8 +2801,9 @@ class MarketTracker:
                                 "reanalyze_count": 0,
                                 "window": "late",
                             }
-                            # 成熟样本下的极低置信度不再每轮重扫，交给波动重触发重新放行。
-                            if gap_trend == "穿越" or len(samples) >= strategy_cfg["late_mature_sample_count"]:
+                            # 成熟样本下的极低置信度 — taker live时标记放弃，shadow时不标记(让ambush继续)
+                            _TAKER_LIVE = os.environ.get("SNIPER_TAKER_LIVE", "0") == "1"
+                            if _TAKER_LIVE and (gap_trend == "穿越" or len(samples) >= strategy_cfg["late_mature_sample_count"]):
                                 self.analyzed.add(slug)
                         logger.warning(f"\n⚠️ {market['coin']} 贝叶斯置信度极低({b_conf:.3f})，等待变化")
                         continue
@@ -2805,9 +2829,10 @@ class MarketTracker:
                 elif gap_trend == "震荡":
                     extra_info["min_discount"] = 0.15
 
-                self.trade_attempts[slug] = self.trade_attempts.get(slug, 0) + 1
+                # v14.1: shadow模式不消费trade_attempts（不是真正的FOK/liquidity retry）
+                if os.environ.get("SNIPER_TAKER_LIVE", "0") == "1":
+                    self.trade_attempts[slug] = self.trade_attempts.get(slug, 0) + 1
                 self.skipped_markets.pop(slug, None)
-                self.analyzed.add(slug)  # 本轮已入分析队列，避免重复调度
                 pending_trades.append((slug, market, extra_info))
 
         # 并行获取 PTB（优先轻量 HTTP，失败时单币种回退 Playwright 进程）
@@ -2944,8 +2969,8 @@ class MarketTracker:
             if ptb:
                 self.ptb_cache[slug] = ptb
         if not ptb:
-            print("  ❌ 无法获取 PTB")
-            self.analyzed.add(slug)
+            print("  ❌ 无法获取 PTB（下轮重试）")
+            # v14.1: 不标记analyzed — PTB暂时拿不到不应封死ambush入口
             logger.info(f"{'='*60}\n")
             return
         
@@ -3066,8 +3091,8 @@ class MarketTracker:
         up_token = extra_info.get("up_token")
         down_token = extra_info.get("down_token")
         if not up_token or not down_token:
-            logger.error(f"  ❌ 无法获取 token_id")
-            self.analyzed.add(slug)
+            logger.error(f"  ❌ 无法获取 token_id（下轮重试）")
+            # v14.1: 不标记analyzed — token暂时拿不到不应封死ambush入口
             logger.info(f"{'='*60}\n")
             if _did_increment_pending:
                 with _position_lock:
@@ -3100,6 +3125,24 @@ class MarketTracker:
         # ★ P0: 二次检查 — AI分析耗时数秒，期间狙击线程可能已入仓
         if slug in self.positions:
             logger.info(f"  ⚡ 放弃下单: {coin} 分析期间已被狙击线程入仓")
+            if _did_increment_pending:
+                with _position_lock:
+                    _pending_bets = max(0, _pending_bets - 1)
+            return
+
+        # v14.1: analyze_and_trade taker 降级 shadow
+        _MAIN_TAKER_LIVE = os.environ.get("SNIPER_TAKER_LIVE", "0") == "1"
+        if not _MAIN_TAKER_LIVE:
+            try:
+                from ai_trader.trade_logger import log_shadow
+                log_shadow(slug, coin, "analyze_taker",
+                           direction=direction, ev=details.get('expected_value', 0),
+                           p_hat=p_hat, confidence=confidence,
+                           remaining=extra_info.get("remaining", 0) if extra_info else 0)
+            except Exception:
+                pass
+            logger.info(f"  [shadow] analyze_and_trade: {coin} {direction} (taker禁用)")
+            # 不加 analyzed — 否则会封死 ambush 入口
             if _did_increment_pending:
                 with _position_lock:
                     _pending_bets = max(0, _pending_bets - 1)
@@ -3277,8 +3320,7 @@ class MarketTracker:
                     _parts = [f"{_c} | 检查{_n}次"]
                     if _stat["placed"]:
                         _d = _stat.get("direction", "?")
-                        _bi = "双向" if _stat.get("bilateral") else _d
-                        _parts.append(f"挂单@{_stat.get('price', 0):.2f}({_bi})")
+                        _parts.append(f"挂单@{_stat.get('price', 0):.2f}({_d})")
                     if _stat.get("filled"):
                         _fp = _stat.get("fill_price", 0)
                         _fs = _stat.get("fill_size", 0)

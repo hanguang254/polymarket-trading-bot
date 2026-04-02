@@ -103,6 +103,21 @@ DIP_BUY_MIN_REMAINING = float(os.environ.get("DIP_BUY_MIN_REMAINING", "60"))
 AMBUSH_HOLD_TO_EXPIRY = os.environ.get("AMBUSH_HOLD_TO_EXPIRY", "1") == "1"
 AMBUSH_HARD_STOP = float(os.environ.get("AMBUSH_HARD_STOP", "0.70"))  # 伏击仓位绝对硬止损阈值
 
+# v14: 分阶段时间衰减止盈止损
+AMBUSH_TP_PHASE1_RATIO = float(os.environ.get("AMBUSH_TP_PHASE1_RATIO", "0.60"))
+AMBUSH_TP_PHASE2_RATIO = float(os.environ.get("AMBUSH_TP_PHASE2_RATIO", "0.55"))
+AMBUSH_TP_PHASE3_RATIO = float(os.environ.get("AMBUSH_TP_PHASE3_RATIO", "0.40"))
+AMBUSH_TP_PHASE4_FIXED = float(os.environ.get("AMBUSH_TP_PHASE4_FIXED", "0.05"))
+AMBUSH_RAPID_SL = float(os.environ.get("AMBUSH_RAPID_SL", "0.25"))
+AMBUSH_MID_SL = float(os.environ.get("AMBUSH_MID_SL", "0.35"))
+AMBUSH_NOISE_TOLERANCE = float(os.environ.get("AMBUSH_NOISE_TOLERANCE", "0.10"))  # v14.3: 方向✅时额外容忍度
+AMBUSH_LATE_SL = float(os.environ.get("AMBUSH_LATE_SL", "0.30"))
+AMBUSH_RAPID_SL_WINDOW = int(os.environ.get("AMBUSH_RAPID_SL_WINDOW", "30"))
+AMBUSH_BREAKEVEN_TRIGGER = float(os.environ.get("AMBUSH_BREAKEVEN_TRIGGER", "0.15"))
+AMBUSH_BREAKEVEN_MARGIN = float(os.environ.get("AMBUSH_BREAKEVEN_MARGIN", "0.02"))
+AMBUSH_CONFIRM_WINDOW = int(os.environ.get("AMBUSH_CONFIRM_WINDOW", "15"))
+AMBUSH_CONFIRM_THRESHOLD = float(os.environ.get("AMBUSH_CONFIRM_THRESHOLD", "0.0003"))
+
 # PTB Proximity Buffer（临近PTB时冻结方向信号，防止噪音触发止损）
 PTB_PROXIMITY_ATR = float(os.environ.get("PTB_PROXIMITY_ATR", "0.7"))
 PTB_PROXIMITY_EXTREME_STOP = float(os.environ.get("PTB_PROXIMITY_EXTREME_STOP", "0.50"))
@@ -183,6 +198,55 @@ def should_release_proximity_guard(profit_rate, remaining, wrong_streak, wrong_r
     streak_threshold = 2 if profit_rate is not None and profit_rate <= -PRICE_DROP_HARD_STOP else 4
     released = wrong_streak >= streak_threshold or wrong_ratio >= 0.75
     return released, extreme_stop, streak_threshold
+
+
+def evaluate_proximity_guard(direction_correct, true_direction_correct, diff_atr, remaining,
+                             profit_rate, wrong_streak=0, direction_history=None):
+    """预判 proximity guard 是否应冻结方向，供伏击止损和通用保护共用。"""
+    result = {
+        "freeze": False,
+        "in_proximity": False,
+        "released": False,
+        "release_by_extreme_stop": False,
+        "prox_threshold": None,
+        "projected_streak": wrong_streak,
+        "wrong_ratio": 0.0,
+        "extreme_stop": None,
+        "streak_threshold": 0,
+    }
+    if direction_correct is not False or true_direction_correct is not False or diff_atr is None:
+        return result
+
+    prox_threshold = calc_proximity_threshold(remaining)
+    result["prox_threshold"] = prox_threshold
+    if diff_atr >= prox_threshold:
+        return result
+
+    result["in_proximity"] = True
+    projected_streak = wrong_streak + 1
+    history = list(direction_history or [])
+    history.append(False)
+    projected_hist = history[-8:]
+    wrong_ratio = (
+        sum(1 for d in projected_hist if d is False) / len(projected_hist)
+        if len(projected_hist) >= 4 else 0
+    )
+    released, extreme_stop, streak_threshold = should_release_proximity_guard(
+        profit_rate, remaining, projected_streak, wrong_ratio
+    )
+    result.update({
+        "released": released,
+        "projected_streak": projected_streak,
+        "wrong_ratio": wrong_ratio,
+        "extreme_stop": extreme_stop,
+        "streak_threshold": streak_threshold,
+    })
+    if released and profit_rate is not None and profit_rate <= -extreme_stop:
+        result["release_by_extreme_stop"] = True
+        return result
+    if not released:
+        result["freeze"] = True
+    return result
 
 
 def should_direction_downgrade(direction_correct, remaining, diff_atr, profit_rate):
@@ -323,6 +387,135 @@ def classify_tail_oracle_state(direction, ptb_price, atr_val, recent_prices, rem
 # {token_id: (balance, timestamp)}
 _balance_cache = {}
 BALANCE_CACHE_TTL = 8  # 缓存有效期(秒)，观望区每轮刷新
+
+# v14.3: TP单状态缓存 — zone-based TTL 避免每轮迭代都 HTTP 查询
+# {order_id: (info_dict, fetch_time)}
+_tp_status_cache = {}
+_TP_CACHE_COLD = float(os.environ.get("TP_CACHE_COLD_TTL", "5.0"))   # 冷区: 5s
+_TP_CACHE_WARM = float(os.environ.get("TP_CACHE_WARM_TTL", "2.0"))   # 暖区: 2s
+
+# v14.3: TP重挂节流 — 避免高频 cancel+place 导致 TP 空窗
+_TP_REBUILD_MIN_INTERVAL = float(os.environ.get("TP_REBUILD_MIN_INTERVAL", "5.0"))
+_last_tp_rebuild = {}  # attempt_key -> timestamp
+
+
+_OUTCOMES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "outcomes.jsonl")
+_OUTCOMES_LOCK = _OUTCOMES_PATH + ".lock"
+_OUTCOMES_SCAN_INTERVAL = 60  # 定期回填间隔(秒)
+_last_outcomes_scan = 0
+
+
+def _periodic_outcomes_backfill():
+    """v14.3: 定期扫描 outcomes.jsonl，为已结算市场回填 directional_won
+
+    修复四个问题:
+    1. SL/TP提前退出的仓位在市场结算后也能被回填(不依赖open positions)
+    2. 只对官方结算(get_market_outcome返回0/1)标记 calibration_eligible=True
+    3. 覆盖所有结算分支(periodic scan独立于settlement代码路径)
+    4. 用 fcntl 文件锁防止与 record_outcome append 竞争
+    """
+    global _last_outcomes_scan
+    now = time.time()
+    if now - _last_outcomes_scan < _OUTCOMES_SCAN_INTERVAL:
+        return
+    _last_outcomes_scan = now
+
+    if not os.path.exists(_OUTCOMES_PATH):
+        return
+
+    # Step 1: 找出 directional_won=null 的 slug(只看最近24h)
+    from datetime import timedelta
+    cutoff_str = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    pending_slugs = set()
+    try:
+        with open(_OUTCOMES_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("directional_won") is not None:
+                    continue
+                ts = rec.get("timestamp", "")
+                if ts < cutoff_str:
+                    continue
+                slug = rec.get("slug", "")
+                if slug:
+                    pending_slugs.add(slug)
+    except Exception:
+        return
+
+    if not pending_slugs:
+        return
+
+    # Step 2: 通过 Gamma API 获取官方结算结果(只有0.00/1.00)
+    resolved = {}  # slug -> settle_price (UP视角: 1.00=UP赢, 0.00=DOWN赢)
+    for slug in pending_slugs:
+        try:
+            settle = get_market_outcome(slug, "UP")  # UP视角统一查询
+            if settle is not None:
+                resolved[slug] = settle
+        except Exception:
+            continue
+
+    if not resolved:
+        return
+
+    # Step 3: 在文件锁下回填
+    lock_fd = None
+    try:
+        lock_fd = open(_OUTCOMES_LOCK, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        lines = []
+        updated = 0
+        with open(_OUTCOMES_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    lines.append(line)
+                    continue
+                slug = rec.get("slug", "")
+                if slug in resolved and rec.get("directional_won") is None:
+                    up_won = resolved[slug] > 0.5  # UP视角
+                    rec_dir = rec.get("direction", "UP")
+                    rec["directional_won"] = up_won if rec_dir == "UP" else not up_won
+                    rec["calibration_eligible"] = True
+                    updated += 1
+                lines.append(json.dumps(rec, ensure_ascii=False))
+
+        if updated > 0:
+            _tmp = _OUTCOMES_PATH + ".tmp"
+            with open(_tmp, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            os.rename(_tmp, _OUTCOMES_PATH)  # atomic rename: 读侧永远看到完整文件
+            print(f"  📊 定期回填 directional_won: {updated}条 ({', '.join(resolved.keys())})")
+    except Exception as e:
+        print(f"  ⚠️ outcomes 回填失败: {e}")
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+
+def _get_tp_status(tp_oid, ttl=5.0):
+    """带 TTL 缓存的 TP 状态查询"""
+    cached = _tp_status_cache.get(tp_oid)
+    if cached and (time.time() - cached[1]) < ttl:
+        return cached[0]
+    try:
+        info = clob_client.get_order(tp_oid)
+        _tp_status_cache[tp_oid] = (info, time.time())
+        return info
+    except Exception:
+        return cached[0] if cached else None
 
 # Telegram 通知配置
 
@@ -1605,11 +1798,24 @@ def sell_position(token_id, size, price, max_retries=3):
 
 def close_position(position, exit_price):
     """标记持仓为已关闭"""
+    # v14.1: 在清除close_intent前先提取退出原因
+    _exit_reason = position.get("close_intent_reason", "unknown")
     for key in ("close_intent_active", "close_intent_reason", "close_intent_at"):
         position.pop(key, None)
     position["closed"] = True
     position["exit_price"] = exit_price
     position["exit_time"] = datetime.now(timezone.utc).isoformat()
+    # v14.1: 决策快照 — 退出记录（用真实PnL计算，含partial exits和fee）
+    try:
+        from ai_trader.trade_logger import log_exit
+        _real_pnl = _calculate_total_realized_pnl(position, exit_price)
+        log_exit(position.get("slug", ""), position.get("coin", ""),
+                 _exit_reason, exit_price=exit_price,
+                 entry_price=position.get("entry_price", 0),
+                 size=position.get("size", 0),
+                 realized_pnl=round(_real_pnl, 4))
+    except Exception:
+        pass
 
     # 跨进程文件锁: 防止 bot append 和 monitor rewrite 竞争导致持仓丢失
     lock_fd = None
@@ -3162,6 +3368,7 @@ def monitor():
     ev_exit_confirm = {}  # (slug, entry_time) -> 连续EV退出确认轮数（EV-Gate用）
     bn_price_history = {}  # (slug, entry_time) -> deque of (ts, price) BN价格快照
     high_water_mark = {}  # v12.8: (slug, entry_time) -> 持仓期间最高利润率（trailing TP用）
+    rapid_sl_confirms = {}  # v14: 快速止损方向❌连续确认轮数（防单次噪音触发）
     trailing_tp_active = {}  # v12.8: (slug, entry_time) -> True if trailing TP已激活
     last_wake_context = {"label": "startup", "detail": None}
     
@@ -3219,7 +3426,6 @@ def monitor():
                                         "orphan_detected": True,
                                         "ambush": True,
                                     }
-                                    import fcntl
                                     try:
                                         _lfd = open(POSITIONS_LOCK, "w")
                                         fcntl.flock(_lfd, fcntl.LOCK_EX)
@@ -3237,6 +3443,9 @@ def monitor():
                                     _orphan_known_tokens.add(_ap_asset)  # 即使写入失败也标记已知
                 except Exception as _oe:
                     pass  # 扫描失败不影响主循环
+
+            # v14.3: 定期回填 directional_won（独立于持仓，覆盖SL/TP早退记录）
+            _periodic_outcomes_backfill()
 
             positions = get_open_positions()
             
@@ -3265,6 +3474,13 @@ def monitor():
             bn_price_history = {k: v for k, v in bn_price_history.items() if k in open_keys}
             high_water_mark = {k: v for k, v in high_water_mark.items() if k in open_keys}
             trailing_tp_active = {k: v for k, v in trailing_tp_active.items() if k in open_keys}
+            rapid_sl_confirms = {k: v for k, v in rapid_sl_confirms.items() if k in open_keys}
+            # v14.3: 清理 TP 缓存/节流状态中已关闭仓位的条目
+            for _stale_key in [k for k in _last_tp_rebuild if k not in open_keys]:
+                _last_tp_rebuild.pop(_stale_key, None)
+            _active_tp_oids = {p.get("tp_order_id") for p in positions if p.get("tp_order_id")}
+            for _stale_oid in [k for k in _tp_status_cache if k not in _active_tp_oids]:
+                _tp_status_cache.pop(_stale_oid, None)
 
             # 退订已关闭持仓的 token_ids
             active_token_ids = set()
@@ -3348,6 +3564,7 @@ def monitor():
                                         settle_price = entry_price
                                         print(f"  ⚠️ 孤儿无ptb且无市场数据，回退entry_price=${entry_price}")
                         close_position(pos, settle_price)
+                        # v14.3: directional_won 回填已改为 _periodic_outcomes_backfill() 定期扫描
                         result_emoji = "🟢" if settle_price > 0.5 else "🔴"
                         print(f"  {result_emoji} 清理过期持仓: {slug} (过期{-remaining:.0f}s) 结算价=${settle_price:.2f}")
                         close_attempts.pop(attempt_key, None)
@@ -3450,6 +3667,8 @@ def monitor():
                         tail_oracle_wrong_streak.pop(attempt_key, None)
                 else:
                     tail_oracle_wrong_streak.pop(attempt_key, None)
+
+                true_direction_correct = direction_correct
 
                 # PTB 在下注时已记录，直接从持仓数据读取
                 is_losing = bool(tail_info and tail_info["active"] and tail_info["state"] == "wrong_confirmed")
@@ -3593,11 +3812,52 @@ def monitor():
                         f"方向{'✅' if direction_correct else '❌'} | {ev_label_global} | 剩余{remaining:.0f}s"
                     )
                     attempted_stop_loss = True
-                    cancel_all_orders(token_id)
+                    # v14: 伏击仓位TP保护 — 撤单前先确认TP状态
+                    _hs_tp_oid = pos.get("tp_order_id") if _is_ambush_pos else None
+                    _hs_tp_confirmed_dead = not _hs_tp_oid
+                    if _hs_tp_oid:
+                        try:
+                            _hs_tp_info = clob_client.get_order(_hs_tp_oid)
+                            _hs_tp_status = (_hs_tp_info.get("status", "") if _hs_tp_info else "").upper()
+                            if _hs_tp_status in ("MATCHED", "FILLED"):
+                                _hs_tp_price = pos.get("tp_price", current_price)
+                                _hs_ord_price = float(_hs_tp_info.get("price") or 0)
+                                if _hs_ord_price > 0:
+                                    _hs_tp_price = _hs_ord_price
+                                print(f"  💰 硬止损路径: TP已成交@${_hs_tp_price:.2f}，用TP价格关仓")
+                                self_notify(pos, _hs_tp_price, coin, direction, size, "伏击GTD止盈(硬止损路径)")
+                                close_position(pos, _hs_tp_price)
+                                close_attempts.pop(attempt_key, None)
+                                continue
+                            elif _hs_tp_status in ("CANCELLED", "CANCELED", "EXPIRED"):
+                                _hs_tp_confirmed_dead = True
+                            else:
+                                _hs_tp_confirmed_dead = False
+                        except Exception:
+                            _hs_tp_confirmed_dead = False  # 查询失败，不能确认TP已死
+                    _hs_cancel_ok = cancel_all_orders(token_id)
+                    if not _hs_tp_confirmed_dead and not _hs_cancel_ok:
+                        print(f"  ⚠️ 硬止损: TP可能仍活跃且撤单失败，跳过卖出")
+                        continue
                     ok, actual_price = market_sell_immediate(token_id, size, position=pos, remaining=0)
                     if actual_price == "NO_BALANCE":
                         print(f"  ⚠️ 绝对硬止损: 余额为零，等结算")
                         _exit_price = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                        # v14: NO_BALANCE时回查TP是否刚成交
+                        if _hs_tp_oid:
+                            try:
+                                _hs_tp_recheck = clob_client.get_order(_hs_tp_oid)
+                                _hs_re_status = (_hs_tp_recheck.get("status", "") if _hs_tp_recheck else "").upper()
+                                if _hs_re_status in ("MATCHED", "FILLED"):
+                                    _hs_fill_price = pos.get("tp_price", 0)
+                                    _hs_ord_price2 = float(_hs_tp_recheck.get("price") or 0)
+                                    if _hs_ord_price2 > 0:
+                                        _hs_fill_price = _hs_ord_price2
+                                    if _hs_fill_price > 0:
+                                        print(f"  💰 NO_BALANCE: TP已成交@${_hs_fill_price:.2f}，用TP价格关仓")
+                                        _exit_price = _hs_fill_price
+                            except Exception:
+                                pass
                         self_notify(pos, _exit_price, coin, direction, size, f"绝对硬止损(-{ABSOLUTE_HARD_STOP*100:.0f}%)(余额已清)")
                         close_position(pos, _exit_price)
                         continue
@@ -3610,15 +3870,35 @@ def monitor():
                         try_reverse_entry(pos, remaining, atr_val=atr_val, ptb_price=ptb_price)
                         continue
 
-                # ═══ v13.1: 伏击仓位统一处理 — TP检查 + 持有到期 ═══
-                # 不论 profit_rate 正负，只要是伏击仓位就先查 TP 单状态
+                # ═══ v14: 伏击分阶段时间衰减止盈止损 ═══
                 if _is_ambush_pos and AMBUSH_HOLD_TO_EXPIRY:
-                    _tp_oid = pos.get("tp_order_id")
-                    if _tp_oid:
+                    # ── 计算持仓时长 ──
+                    _entry_ts_str = pos.get("entry_time", "")
+                    _held_seconds = 0
+                    if _entry_ts_str:
                         try:
-                            _tp_info = clob_client.get_order(_tp_oid)
+                            _entry_dt = datetime.fromisoformat(_entry_ts_str.replace("Z", "+00:00"))
+                            _held_seconds = (now - _entry_dt).total_seconds()
+                        except Exception:
+                            pass
+
+                    # ── Step 1: TP单状态检查（v14.3: zone-based缓存，冷区5s/暖区2s跳过HTTP）──
+                    _tp_oid = pos.get("tp_order_id")
+                    _tp_active = False
+                    _tp_confirmed_dead = not _tp_oid  # 无oid → 确认无TP
+                    if _tp_oid:
+                        # zone TTL: 根据 remaining + profit 选择查询频率
+                        if remaining < 30 or abs(profit_rate) > 0.40:
+                            _tp_ttl = 0.0  # 热区: 即将结算或极端盈亏 → 每次查
+                        elif remaining < 60 or profit_rate > (pos.get("tp_price", 1.0) / entry_price - 1) * 0.7:
+                            _tp_ttl = _TP_CACHE_WARM  # 暖区: 临近结算或利润接近TP → 2s
+                        else:
+                            _tp_ttl = _TP_CACHE_COLD  # 冷区: 安全观望 → 5s
+                        try:
+                            _tp_info = _get_tp_status(_tp_oid, ttl=_tp_ttl)
                             _tp_status = (_tp_info.get("status", "") if _tp_info else "").upper()
                             if _tp_status in ("MATCHED", "FILLED"):
+                                _tp_status_cache.pop(_tp_oid, None)  # 已成交，清缓存
                                 _tp_price = pos.get("tp_price", current_price)
                                 print(f"  💰 伏击止盈成交! @${_tp_price:.2f} ({profit_rate*100:+.1f}%)")
                                 self_notify(pos, _tp_price, coin, direction, size, "伏击GTD止盈")
@@ -3626,20 +3906,301 @@ def monitor():
                                 close_attempts.pop(attempt_key, None)
                                 continue
                             elif _tp_status in ("CANCELLED", "CANCELED", "EXPIRED"):
-                                print(f"  📋 伏击止盈单已过期({_tp_status}) | 剩余{remaining:.0f}s → 持有到期")
+                                _tp_status_cache.pop(_tp_oid, None)  # 已终结，清缓存
+                                _tp_confirmed_dead = True  # TP已终结，明确证伪
+                                pos["tp_order_id"] = ""  # 清oid让_need_tp_rebuild生效
+                                pos["tp_price"] = 0
                             else:
-                                # 止盈单仍活跃 → 持有等待
-                                if int(remaining) % 30 < 2:
-                                    print(f"  💎 伏击持有中: {profit_rate*100:+.1f}% | 剩余{remaining:.0f}s | 止盈@${pos.get('tp_price', 0):.2f}")
-                                continue
+                                _tp_active = True  # TP仍活跃
+                                _tp_confirmed_dead = False
                         except Exception as _tp_e:
                             print(f"  ⚠️ 止盈单查询异常: {_tp_e}")
-                    # 无TP单 或 TP已过期/查询异常 → 持有到期等结算
+                            _tp_confirmed_dead = False  # 查询失败，不能确认TP已死
+
+                    # ── NO_BALANCE时TP竞态回查辅助函数 ──
+                    def _resolve_exit_with_tp_check(_tp_oid_local, _fallback_price):
+                        """NO_BALANCE时先查TP是否刚成交，用TP价格代替估算价"""
+                        if _tp_oid_local:
+                            try:
+                                _tp_recheck = clob_client.get_order(_tp_oid_local)
+                                _tp_re_status = (_tp_recheck.get("status", "") if _tp_recheck else "").upper()
+                                if _tp_re_status in ("MATCHED", "FILLED"):
+                                    _tp_fill_price = pos.get("tp_price", 0)
+                                    _ord_price = float(_tp_recheck.get("price") or 0)
+                                    if _ord_price > 0:
+                                        _tp_fill_price = _ord_price
+                                    if _tp_fill_price > 0:
+                                        print(f"  💰 NO_BALANCE: TP已成交@${_tp_fill_price:.2f}，用TP价格关仓")
+                                        return _tp_fill_price
+                            except Exception:
+                                pass
+                        return _fallback_price
+
+                    # ── Step 2: 方向确认窗口（成交后AMBUSH_CONFIRM_WINDOW秒内）──
+                    if _held_seconds > 0 and _held_seconds <= AMBUSH_CONFIRM_WINDOW and crypto_price and ptb_price:
+                        _dir_upper = direction.upper()
+                        _btc_move = (crypto_price - ptb_price) / ptb_price
+                        _dir_confirmed = (_dir_upper == "UP" and _btc_move > 0) or (_dir_upper == "DOWN" and _btc_move < 0)
+                        _btc_reversed = abs(_btc_move) > AMBUSH_CONFIRM_THRESHOLD and not _dir_confirmed
+                        if _btc_reversed:
+                            print(
+                                f"  🚫 方向确认失败: {coin} {direction} | BTC {_btc_move*100:+.4f}% 反向 "
+                                f"| 持仓{_held_seconds:.0f}s → 立即止损")
+                            _cancel_ok = cancel_all_orders(token_id)
+                            if not _tp_confirmed_dead and not _cancel_ok:
+                                print(f"  ⚠️ TP可能仍活跃且撤单失败，跳过方向确认止损")
+                                continue
+                            attempted_stop_loss = True
+                            ok, actual_price = market_sell_immediate(token_id, size, position=pos, remaining=0)
+                            if actual_price == "NO_BALANCE":
+                                _fallback = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                                _exit_price = _resolve_exit_with_tp_check(_tp_oid, _fallback)
+                                self_notify(pos, _exit_price, coin, direction, size, "伏击方向确认失败(余额已清)")
+                                close_position(pos, _exit_price)
+                                continue
+                            if ok:
+                                self_notify(pos, actual_price, coin, direction, size, "伏击方向确认失败")
+                                close_position(pos, actual_price)
+                                continue
+
+                    _ambush_diff_atr = None
+                    if crypto_price and ptb_price and atr_val:
+                        _, _, _ambush_diff_atr = calc_realtime_ev(
+                            direction, crypto_price, ptb_price, atr_val, entry_price
+                        )
+                    if not (tail_info and tail_info["active"]):
+                        _ambush_proximity = evaluate_proximity_guard(
+                            direction_correct=direction_correct,
+                            true_direction_correct=true_direction_correct,
+                            diff_atr=_ambush_diff_atr,
+                            remaining=remaining,
+                            profit_rate=profit_rate,
+                            wrong_streak=direction_wrong_streak.get(attempt_key, 0),
+                            direction_history=direction_history.get(attempt_key),
+                        )
+                        if _ambush_proximity["freeze"]:
+                            print(
+                                f"  🔶 伏击PTB死区保护: {_ambush_diff_atr:.2f}ATR<"
+                                f"{_ambush_proximity['prox_threshold']:.2f} | 方向冻结✅ "
+                                f"| streak={_ambush_proximity['projected_streak']} "
+                                f"ratio={_ambush_proximity['wrong_ratio']:.0%} | 剩余{remaining:.0f}s"
+                            )
+                            direction_correct = True
+
+                    # ── Step 3: 分阶段止损 ──
+                    _ambush_sl_triggered = False
+                    if _held_seconds <= AMBUSH_RAPID_SL_WINDOW:
+                        _RAPID_SL_CONFIRMS_NEEDED = 3  # 需要连续3轮方向❌确认
+                        # v14.3: 硬截断 — 确认期内亏损超过MID_SL直接退出，不等3轮确认
+                        # 防止从-25%滑到-47%的滑点问题（Trade #5/#10实证）
+                        if direction_correct is False and profit_rate <= -AMBUSH_MID_SL:
+                            rapid_sl_confirms.pop(attempt_key, None)
+                            print(
+                                f"  ⚡ 快速止损硬截断: {profit_rate*100:+.1f}% 超过-{AMBUSH_MID_SL*100:.0f}% "
+                                f"| 持仓{_held_seconds:.0f}s | 方向❌ → 跳过确认直接退出")
+                            _ambush_sl_triggered = True
+                        elif direction_correct is False and profit_rate <= -AMBUSH_RAPID_SL:
+                            # 方向错误+亏损超阈值: 累积确认
+                            _rsl_count = rapid_sl_confirms.get(attempt_key, 0) + 1
+                            rapid_sl_confirms[attempt_key] = _rsl_count
+                            if _rsl_count >= _RAPID_SL_CONFIRMS_NEEDED:
+                                print(
+                                    f"  ⚡ 伏击快速止损: {profit_rate*100:+.1f}% 超过-{AMBUSH_RAPID_SL*100:.0f}% "
+                                    f"| 持仓{_held_seconds:.0f}s | 方向❌×{_rsl_count} → 确认退出")
+                                _ambush_sl_triggered = True
+                            else:
+                                print(
+                                    f"  ⏸️ 快速止损确认中: {profit_rate*100:+.1f}% 方向❌ "
+                                    f"| {_rsl_count}/{_RAPID_SL_CONFIRMS_NEEDED}轮 | 持仓{_held_seconds:.0f}s")
+                        elif direction_correct is True:
+                            # v14.3 Step2: 方向✅时用自适应阈值（base + 噪音容忍）
+                            _effective_sl = AMBUSH_MID_SL + AMBUSH_NOISE_TOLERANCE  # -35%+10% = -45%
+                            if profit_rate <= -_effective_sl:
+                                rapid_sl_confirms.pop(attempt_key, None)
+                                print(
+                                    f"  ⚡ 伏击快速止损(方向✅深亏): {profit_rate*100:+.1f}% 超过-{_effective_sl*100:.0f}% "
+                                    f"| 持仓{_held_seconds:.0f}s → 流动性异常，止损退出")
+                                _ambush_sl_triggered = True
+                        else:
+                            rapid_sl_confirms.pop(attempt_key, None)  # 条件不满足，重置计数
+                    elif remaining <= 60:
+                        if profit_rate <= -AMBUSH_LATE_SL:
+                            print(
+                                f"  ⏰ 伏击尾盘止损: {profit_rate*100:+.1f}% 超过-{AMBUSH_LATE_SL*100:.0f}% "
+                                f"| 剩余{remaining:.0f}s → 止损优于骑到$0")
+                            _ambush_sl_triggered = True
+                    else:
+                        # v14.3 Step2: 中期止损 — 方向✅时加宽容忍度，随时间衰减
+                        _effective_mid_sl = AMBUSH_MID_SL
+                        if direction_correct is True and AMBUSH_NOISE_TOLERANCE > 0:
+                            if remaining >= 120:
+                                _effective_mid_sl = AMBUSH_MID_SL + AMBUSH_NOISE_TOLERANCE  # 全量容忍
+                            elif remaining > 60:
+                                _decay = (remaining - 60) / 60.0  # 120s→60s 线性衰减
+                                _effective_mid_sl = AMBUSH_MID_SL + AMBUSH_NOISE_TOLERANCE * _decay
+                            # remaining <= 60 时不加容忍，用原始 MID_SL
+                        if profit_rate <= -_effective_mid_sl:
+                            print(
+                                f"  📉 伏击中期止损: {profit_rate*100:+.1f}% 超过-{_effective_mid_sl*100:.0f}% "
+                                f"| 剩余{remaining:.0f}s | 方向{'✅' if direction_correct else '❌'}"
+                                f"{' (噪音容忍)' if _effective_mid_sl > AMBUSH_MID_SL else ''}")
+                            _ambush_sl_triggered = True
+
+                    if _ambush_sl_triggered:
+                        _cancel_ok = cancel_all_orders(token_id)
+                        if not _tp_confirmed_dead and not _cancel_ok:
+                            print(f"  ⚠️ TP可能仍活跃且撤单失败，跳过分阶段止损")
+                            continue
+                        attempted_stop_loss = True
+                        ok, actual_price = market_sell_immediate(token_id, size, position=pos, remaining=0)
+                        if actual_price == "NO_BALANCE":
+                            _fallback = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                            _exit_price = _resolve_exit_with_tp_check(_tp_oid, _fallback)
+                            self_notify(pos, _exit_price, coin, direction, size, "伏击分阶段止损(余额已清)")
+                            close_position(pos, _exit_price)
+                            continue
+                        if ok:
+                            self_notify(pos, actual_price, coin, direction, size, "伏击分阶段止损")
+                            close_position(pos, actual_price)
+                            try_reverse_entry(pos, remaining, atr_val=atr_val, ptb_price=ptb_price)
+                            continue
+
+                    # ── Step 4: Breakeven锁定 ──
+                    if profit_rate >= AMBUSH_BREAKEVEN_TRIGGER and _held_seconds > AMBUSH_RAPID_SL_WINDOW:
+                        _be_price = round(entry_price * (1 + AMBUSH_BREAKEVEN_MARGIN), 4)
+                        if current_price and current_price < _be_price:
+                            print(
+                                f"  🔒 Breakeven止损: 曾盈利{AMBUSH_BREAKEVEN_TRIGGER*100:.0f}%+ "
+                                f"但回撤到${current_price:.3f} < 保本${_be_price:.3f} → 锁定退出")
+                            _cancel_ok = cancel_all_orders(token_id)
+                            if not _tp_confirmed_dead and not _cancel_ok:
+                                print(f"  ⚠️ TP可能仍活跃且撤单失败，跳过Breakeven止损")
+                                continue
+                            attempted_stop_loss = True
+                            ok, actual_price = market_sell_immediate(token_id, size, position=pos, remaining=0)
+                            if actual_price == "NO_BALANCE":
+                                _fallback = _resolve_or_estimate_exit_price(token_id, current_price, entry_price, slug, direction)
+                                _exit_price = _resolve_exit_with_tp_check(_tp_oid, _fallback)
+                                self_notify(pos, _exit_price, coin, direction, size, "Breakeven锁定(余额已清)")
+                                close_position(pos, _exit_price)
+                                continue
+                            if ok:
+                                self_notify(pos, actual_price, coin, direction, size, "Breakeven锁定")
+                                close_position(pos, actual_price)
+                                continue
+
+                    # ── Step 5: 动态TP阶梯 — 调价 / 补挂丢失的TP ──
+                    _need_tp_rebuild = not pos.get("tp_order_id") and _tp_confirmed_dead
+                    if (_tp_active or _need_tp_rebuild) and remaining > 10:
+                        _cur_tp = pos.get("tp_price", 0)
+                        if remaining > 180:
+                            _target_tp = round(entry_price + (1 - entry_price) * AMBUSH_TP_PHASE1_RATIO, 2)
+                        elif remaining > 90:
+                            _target_tp = round(entry_price + (1 - entry_price) * AMBUSH_TP_PHASE2_RATIO, 2)
+                        elif remaining > 30:
+                            _target_tp = round(entry_price + (1 - entry_price) * AMBUSH_TP_PHASE3_RATIO, 2)
+                        else:
+                            _target_tp = round(entry_price + AMBUSH_TP_PHASE4_FIXED, 2)
+                        _target_tp = max(entry_price + 0.01, min(0.99, _target_tp))
+
+                        _do_place_tp = False
+                        # v14.3: TP重挂节流 — 同一仓位5s内最多重挂一次，减少TP空窗期
+                        if not _need_tp_rebuild and time.time() - _last_tp_rebuild.get(attempt_key, 0) < _TP_REBUILD_MIN_INTERVAL:
+                            pass  # 节流: 上次重挂不到5s，跳过阶梯调整
+                        # (A) 补挂: 无活跃TP需重建（上轮重挂失败或TP已过期）
+                        elif _need_tp_rebuild:
+                            # 先清理可能残留在CLOB上的孤儿卖单（释放token余额）
+                            _cleanup_ok = cancel_all_orders(token_id)
+                            if _cleanup_ok:
+                                _do_place_tp = True
+                                print(f"  🔄 TP补挂: 清理完成，目标@${_target_tp:.2f} | 剩余{remaining:.0f}s")
+                            else:
+                                print(f"  ⚠️ TP补挂: 孤儿订单清理失败，跳过补挂，下轮重试")
+                        # (B) 重挂: TP活跃且需下调（上调无意义）
+                        elif _cur_tp > 0 and _target_tp < _cur_tp - 0.01:
+                            try:
+                                _cancel_ok = clob_client.cancel_order(_tp_oid)
+                                if not _cancel_ok:
+                                    _cancel_ok = clob_client.cancel_all(token_id)
+                                if not _cancel_ok:
+                                    print(f"  ⚠️ TP阶梯: 旧TP撤单失败，保留旧TP@${_cur_tp:.2f}，跳过重挂")
+                                    raise StopIteration
+                                _do_place_tp = True
+                            except StopIteration:
+                                pass  # 撤单失败，已打日志，保留旧TP
+                            except Exception as _tp_cancel_e:
+                                print(f"  ⚠️ TP撤单异常: {_tp_cancel_e}")
+
+                        if _do_place_tp:
+                            try:
+                                from py_clob_client.order_builder.constants import SELL as _SELL_TP
+                                from py_clob_client.clob_types import OrderType as _OT_TP
+                                _new_exp = int(end_timestamp) - 15 + 60
+                                if _new_exp > int(time.time()) + 30:
+                                    _tp_size = min(size, int(size * 10000) / 10000)
+                                    _new_tp_result = clob_client.place_order(
+                                        token_id, _SELL_TP, _target_tp, _tp_size,
+                                        order_type=_OT_TP.GTD, expiration=_new_exp)
+                                    _new_tp_oid = _new_tp_result.get("order_id")
+                                    # 即时成交: GTD TP下单瞬间被撮合（matched=True, order_id可能为空）
+                                    if _new_tp_result.get("matched"):
+                                        print(f"  💰 TP即时成交@${_target_tp:.2f} ({profit_rate*100:+.1f}%)")
+                                        self_notify(pos, _target_tp, coin, direction, size, "伏击GTD止盈(即时成交)")
+                                        close_position(pos, _target_tp)
+                                        close_attempts.pop(attempt_key, None)
+                                        continue
+                                    elif _new_tp_oid:
+                                        _tp_persist_vals = {"tp_order_id": _new_tp_oid, "tp_price": _target_tp}
+                                    else:
+                                        print(f"  ⚠️ TP{'补挂' if _need_tp_rebuild else '重挂'}失败: {_new_tp_result.get('status')}")
+                                        _tp_persist_vals = {"tp_order_id": "", "tp_price": 0}
+                                    # 更新内存 + 持久化到 positions.jsonl
+                                    pos["tp_order_id"] = _tp_persist_vals["tp_order_id"]
+                                    pos["tp_price"] = _tp_persist_vals["tp_price"]
+                                    try:
+                                        _tp_lk = open(POSITIONS_LOCK, "w")
+                                        fcntl.flock(_tp_lk, fcntl.LOCK_EX)
+                                        _tp_rows = []
+                                        if os.path.exists(POSITIONS_FILE):
+                                            with open(POSITIONS_FILE, "r") as _tpf:
+                                                for _tpl in _tpf:
+                                                    if _tpl.strip():
+                                                        try:
+                                                            _tpr = json.loads(_tpl)
+                                                            if (isinstance(_tpr, dict)
+                                                                    and _tpr.get("token_id") == token_id
+                                                                    and _tpr.get("entry_time") == entry_time):
+                                                                _tpr.update(_tp_persist_vals)
+                                                            _tp_rows.append(_tpr)
+                                                        except Exception:
+                                                            pass
+                                        with open(POSITIONS_FILE, "w") as _tpf:
+                                            for _tpr in _tp_rows:
+                                                _tpf.write(json.dumps(_tpr) + "\n")
+                                        fcntl.flock(_tp_lk, fcntl.LOCK_UN)
+                                        _tp_lk.close()
+                                    except Exception as _tp_persist_e:
+                                        print(f"  ⚠️ TP持久化失败: {_tp_persist_e}")
+                                    if _new_tp_oid:
+                                        _last_tp_rebuild[attempt_key] = time.time()  # v14.3: 记录重挂时间用于节流
+                                        _tp_status_cache.pop(_tp_oid, None)  # v14.3: 清旧oid缓存
+                                        _tp_act = "补挂成功" if _need_tp_rebuild else f"阶梯下调: ${_cur_tp:.2f}→"
+                                        print(
+                                            f"  📊 TP{_tp_act}${_target_tp:.2f} "
+                                            f"| 剩余{remaining:.0f}s (oid={_new_tp_oid[:16]})")
+                            except Exception as _tp_place_e:
+                                print(f"  ⚠️ TP下单异常: {_tp_place_e}")
+
+                    # ── Step 6: 尾盘小亏持有到期（<30%亏损 + 最后60s → 省手续费）──
                     if int(remaining) % 30 < 2:
+                        _phase = "确认" if _held_seconds <= AMBUSH_CONFIRM_WINDOW else (
+                            "快速" if _held_seconds <= AMBUSH_RAPID_SL_WINDOW else (
+                                "尾盘" if remaining <= 60 else "中期"))
+                        _tp_label = f"止盈@${pos.get('tp_price', 0):.2f}" if _tp_active else "无TP"
                         print(
-                            f"  💎 伏击持有到期: {profit_rate*100:+.1f}% | "
+                            f"  💎 伏击持有({_phase}): {profit_rate*100:+.1f}% | "
                             f"方向{'✅' if direction_correct else '❌'} | "
-                            f"{ev_label_global} | 剩余{remaining:.0f}s")
+                            f"{_tp_label} | 剩余{remaining:.0f}s")
                     continue
 
                 profit_threshold = compute_p0_profit_threshold(remaining, P0_BASE_PROFIT, P0_HYPERBOLIC_K, entry_price)
@@ -3812,7 +4373,6 @@ def monitor():
                         atr_history[attempt_key] = deque(maxlen=5)
                     atr_history[attempt_key].append(diff_atr)
                 entry_atr_val = entry_atr.get(attempt_key)
-                true_direction_correct = direction_correct
 
                 # ═══ EV-Gate 止损（v11）═══
                 if ENABLE_EV_GATE:
@@ -4118,32 +4678,40 @@ def monitor():
                         direction_correct = False
 
                     # --- PTB Proximity Buffer ---
-                    raw_direction_correct = direction_signal_correct if tail_info and tail_info["active"] else direction_correct
+                    raw_direction_correct = direction_signal_correct if tail_info and tail_info["active"] else true_direction_correct
                     in_proximity = False
                     if diff_atr is not None and crypto_price and ptb_price and not (tail_info and tail_info["active"]):
-                        prox_threshold = calc_proximity_threshold(remaining)
-                        in_proximity = diff_atr < prox_threshold
-
-                        if in_proximity and direction_correct is False and true_direction_correct is False:
-                            cur_streak = direction_wrong_streak.get(attempt_key, 0)
-                            projected_streak = cur_streak + 1
-                            hist = list(direction_history.get(attempt_key, deque(maxlen=8)))
-                            hist.append(False)
-                            projected_hist = hist[-8:]
-                            wrong_ratio = sum(1 for d in projected_hist if d is False) / len(projected_hist) if len(projected_hist) >= 4 else 0
-                            released, extreme_stop, prox_streak_threshold = should_release_proximity_guard(
-                                profit_rate, remaining, projected_streak, wrong_ratio
+                        prox_info = evaluate_proximity_guard(
+                            direction_correct=direction_correct,
+                            true_direction_correct=true_direction_correct,
+                            diff_atr=diff_atr,
+                            remaining=remaining,
+                            profit_rate=profit_rate,
+                            wrong_streak=direction_wrong_streak.get(attempt_key, 0),
+                            direction_history=direction_history.get(attempt_key),
+                        )
+                        in_proximity = prox_info["in_proximity"]
+                        if prox_info["release_by_extreme_stop"]:
+                            print(
+                                f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<"
+                                f"{prox_info['prox_threshold']:.2f} 但跌{profit_rate*100:+.1f}%>"
+                                f"{-prox_info['extreme_stop']*100:.0f}% → 不冻结"
                             )
-
-                            if released and profit_rate <= -extreme_stop:
-                                print(f"  🚨 Proximity极端止损: {diff_atr:.2f}ATR<{prox_threshold:.2f} 但跌{profit_rate*100:+.1f}%>{-extreme_stop*100:.0f}% → 不冻结")
-                                in_proximity = False
-                            elif released:
-                                print(f"  🔶→🚨 Proximity保护解除: streak={projected_streak}≥{prox_streak_threshold} or ratio={wrong_ratio:.0%}≥75% | {diff_atr:.2f}ATR | 剩余{remaining:.0f}s")
-                                in_proximity = False
-                            else:
-                                print(f"  🔶 PTB临近区: {diff_atr:.2f}ATR<{prox_threshold:.2f} | 方向冻结✅ | streak={projected_streak} ratio={wrong_ratio:.0%} | 剩余{remaining:.0f}s")
-                                direction_correct = True
+                            in_proximity = False
+                        elif prox_info["released"]:
+                            print(
+                                f"  🔶→🚨 Proximity保护解除: streak={prox_info['projected_streak']}≥"
+                                f"{prox_info['streak_threshold']} or ratio={prox_info['wrong_ratio']:.0%}≥75% "
+                                f"| {diff_atr:.2f}ATR | 剩余{remaining:.0f}s"
+                            )
+                            in_proximity = False
+                        elif prox_info["freeze"]:
+                            print(
+                                f"  🔶 PTB临近区: {diff_atr:.2f}ATR<{prox_info['prox_threshold']:.2f} "
+                                f"| 方向冻结✅ | streak={prox_info['projected_streak']} "
+                                f"ratio={prox_info['wrong_ratio']:.0%} | 剩余{remaining:.0f}s"
+                            )
+                            direction_correct = True
 
                     # --- 更新方向错误计数 ---
                     if raw_direction_correct is not None:

@@ -60,12 +60,20 @@ class TestAdaptiveEntryHelpers(unittest.TestCase):
 class TestExecuteBetAdaptiveRetry(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
-        self.prev_cwd = os.getcwd()
-        os.chdir(self.tmpdir.name)
-        os.makedirs("logs", exist_ok=True)
+        self._logs = os.path.join(self.tmpdir.name, "logs")
+        os.makedirs(self._logs, exist_ok=True)
+        # Patch module-level file constants so writes go to tmpdir
+        self._patches = [
+            patch.object(ai_analyze_v2, "BETS_FILE", os.path.join(self._logs, "bets.jsonl")),
+            patch.object(ai_analyze_v2, "DECISIONS_FILE", os.path.join(self._logs, "decisions_v2.jsonl")),
+            patch.object(ai_analyze_v2, "POSITIONS_FILE", os.path.join(self._logs, "positions.jsonl")),
+        ]
+        for p in self._patches:
+            p.start()
 
     def tearDown(self):
-        os.chdir(self.prev_cwd)
+        for p in self._patches:
+            p.stop()
         self.tmpdir.cleanup()
 
     def test_execute_bet_requotes_after_explicit_fok_kill_without_ghost_check(self):
@@ -152,7 +160,7 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
         self.assertEqual(place_mock.call_args_list[0].args[2:], (0.86, 7))
         self.assertEqual(place_mock.call_args_list[1].args[2:], (0.92, 7))
 
-        with open("logs/bets.jsonl") as f:
+        with open(os.path.join(self._logs, "bets.jsonl")) as f:
             record = json.loads(f.readline())
 
         self.assertEqual(record["quoted_price"], 0.85)
@@ -221,7 +229,7 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
         self.assertAlmostEqual(actual_size, 7.033124, places=6)
         self.assertAlmostEqual(actual_price, 5.039998 / 7.033124, places=6)
 
-        with open("logs/bets.jsonl") as f:
+        with open(os.path.join(self._logs, "bets.jsonl")) as f:
             record = json.loads(f.readline())
 
         self.assertAlmostEqual(record["size"], 7.033124, places=6)
@@ -299,7 +307,7 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
                         "entry_fee_rate": 0.0,
                         "skip_reason": None,
                     }):
-                        with patch.object(ai_analyze_v2, "PENDING_ORDERS_FILE", os.path.join("logs", "pending_orders.jsonl")):
+                        with patch.object(ai_analyze_v2, "PENDING_ORDERS_FILE", os.path.join(self._logs, "pending_orders.jsonl")):
                             with patch.object(ai_analyze_v2.clob_client, "get_orderbook", return_value=None):
                                 with patch.object(ai_analyze_v2.clob_client, "place_fok_order", side_effect=[request_exception, explicit_fok_error, explicit_fok_error]):
                                     with patch.object(ai_analyze_v2.clob_client, "get_token_balance", return_value=None):
@@ -321,14 +329,14 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
         self.assertEqual(actual_size, 8.3)
         self.assertTrue(output.startswith("PENDING_GHOST:"))
 
-        with open("logs/bets.jsonl") as f:
+        with open(os.path.join(self._logs, "bets.jsonl")) as f:
             record = json.loads(f.readline())
 
         self.assertFalse(record["success"])
         self.assertTrue(record["pending"])
         self.assertEqual(record["status"], "PENDING")
 
-        with open("logs/pending_orders.jsonl") as f:
+        with open(os.path.join(self._logs, "pending_orders.jsonl")) as f:
             pending = json.loads(f.readline())
 
         self.assertEqual(pending["slug"], "btc-updown-5m-ghost")
@@ -396,7 +404,7 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
                         "entry_fee_rate": 0.0,
                         "skip_reason": None,
                     }):
-                        with patch.object(ai_analyze_v2, "PENDING_ORDERS_FILE", os.path.join("logs", "pending_orders.jsonl")):
+                        with patch.object(ai_analyze_v2, "PENDING_ORDERS_FILE", os.path.join(self._logs, "pending_orders.jsonl")):
                             with patch.object(ai_analyze_v2.clob_client, "get_orderbook", return_value=None):
                                 with patch.object(ai_analyze_v2.clob_client, "place_fok_order", side_effect=[request_exception, matched_retry]):
                                     with patch.object(ai_analyze_v2, "_detect_ghost_fill", return_value=None):
@@ -418,21 +426,21 @@ class TestExecuteBetAdaptiveRetry(unittest.TestCase):
         self.assertEqual(actual_size, 5.2)
         self.assertEqual(output, "{'status': 'matched'}")
 
-        with open("logs/bets.jsonl") as f:
+        with open(os.path.join(self._logs, "bets.jsonl")) as f:
             record = json.loads(f.readline())
 
         self.assertTrue(record["success"])
         self.assertFalse(record["pending"])
         self.assertTrue(record["ghost_pending_id"])
 
-        with open("logs/pending_orders.jsonl") as f:
+        with open(os.path.join(self._logs, "pending_orders.jsonl")) as f:
             pending = json.loads(f.readline())
 
         self.assertEqual(pending["slug"], "btc-updown-5m-dup")
         self.assertEqual(pending["status"], "PENDING")
         self.assertEqual(pending["limit_price"], 0.56)
 
-        with open("logs/positions.jsonl") as f:
+        with open(os.path.join(self._logs, "positions.jsonl")) as f:
             position = json.loads(f.readline())
 
         self.assertEqual(position["slug"], "btc-updown-5m-dup")

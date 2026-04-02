@@ -1,4 +1,4 @@
-# Polymarket Trading Bot v13.0.0
+# Polymarket Trading Bot v14.3
 
 Automated trading bot for Polymarket 5-minute crypto UP/DOWN markets. Uses EV-driven entry/exit with Bayesian sequential updating, random-walk probability modeling, LMSR theoretical pricing, momentum sniper fast-path, trailing take-profit, event-driven WebSocket orderbook, market-price stop-loss, pending order reconciliation, and correlated exposure control.
 
@@ -55,6 +55,17 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 - **Sniper Safety Guards (v12.9)**: Four-layer defense against false signal entries: (1) **WS Health Check** — blocks FOK when WS BBA age > `SNIPER_WS_MAX_AGE` (default 5s), prevents stale REST fallback prices from triggering entries (production case: WS age=9999ms caused REST $0.61->$0.50 flash entry). Ambush limit orders still allowed during WS outage. (2) **Gap Momentum Check** — skips when current gap < peak gap x `SNIPER_GAP_DECAY_RATIO` (default 0.75), detects dead-cat bounces and mean reversion. (3) **Time-Decayed Shrinkage** — when `remaining > SNIPER_SHRINK_FULL_AT` (default 120s), p_win shrinkage scales down proportionally, prevents overconfident early entries. (4) **Pre-FOK Revalidation** — re-reads Chainlink price before order submission; aborts if ATR dropped below threshold or direction reversed (solves 1-2s price shift between condition pass and FOK execution).
 - **Double-Entry Protection (v12.9)**: `analyze_and_trade()` entry + pre-`execute_bet` dual check on `self.positions` + `_sniper_processing`, blocking race condition between sniper thread and normal analysis path (production case: same slug entered by both paths within 0.5s, $10.91 exposed in same direction).
 - **Smart Ambush v2.0 (v13)**: GTD limit order strategy with 5-module enhancement. When sniper detects confirmed direction (Bayesian + gap aligned) but ask exceeds `SNIPER_MAX_PRICE` or WS is stale, places a GTD BUY limit on the confirmed direction only. **Module 1+5 Dynamic EDGE**: Avellaneda-Stoikov time-decay `EDGE = base × √(remaining/300) + min_edge`, multiplied by GLFT volatility-adaptive factor `clamp(atr/avg_atr, 0.5, 2.0)`. Wider spread in high-vol, tighter in calm markets. **Module 2 Bidirectional Repricing**: Backward (price-lowering) reprice only allowed when old order's edge is thinner than `EDGE_MIN` floor (`_old_price >= p_win - min_edge`), preventing profitable limit orders from being pulled back. **Module 3 OFI Detection**: Pre-placement orderbook depth check — `OFI = (bid_depth - ask_depth) / total_depth` at top-5 levels, skips placement when `OFI < -OFI_THRESHOLD` (adverse selection filter). **Module 4 Toxic Fill Detection**: Fill within 2s of current order placement (`last_order_ts`, reset on each reprice) raises `FILL_MIN_CONF` to 0.35, forcing sell on low-confidence toxic fills from informed adversaries. Post-fill direction validation re-checks Bayesian direction and confidence — if direction flipped or confidence < `SNIPER_AMBUSH_FILL_MIN_CONF`, immediately FOK sells. Anti-loop guards, Kelly-sized positions (MIN/MAX_BET_SIZE bounds). Env: `SNIPER_AMBUSH_EDGE_MIN`, `SNIPER_AMBUSH_AVG_ATR`, `SNIPER_AMBUSH_OFI_THRESHOLD`.
+- **Shadow Mode (v14.1)**: Taker sniper and endgame entries default to shadow mode (`SNIPER_TAKER_LIVE=0`, `ENDGAME_LIVE=0`) — signals are logged via `trade_logger` but no orders placed. Allows after-fee EV validation before going live. Ambush maker path remains live (zero maker fee). Toggle to `=1` to restore real trading.
+- **Fast Direction Module (v14.1)**: `ai_trader/fast_direction.py` fuses 3 signals in 3-5s for pre-Bayesian direction estimate: (1) Binance trade-flow OFI (leads Chainlink 10-30s, weight 0.40), (2) cross-exchange price spread BN-CL/ATR (weight 0.35), (3) Polymarket orderbook imbalance OBI (market-maker repositioning signal, weight 0.25). Outputs direction/confidence/prior_bias for Bayesian prior seeding. Optional ambush gate: `AMBUSH_REQUIRE_FAST_DIR=1` requires fast direction alignment before placing ambush orders.
+- **Ambush GTD v14.2 Tuning**: Reprice cap raised 5→8 (`SNIPER_AMBUSH_REPRICE_MAX`), GTD lifetime shortened 90→45s (`SNIPER_AMBUSH_GTD_REPRICE_SEC`, actual expiry=45+60s safety margin=105s). Faster repricing cycle improves fill probability in fast-moving markets. Counter resets only after GTD expires, not on each reprice.
+- **Phased Time-Decay TP/SL (v14)**: Replaces binary hold-to-expiry with 4-phase ambush position management, controlled by `AMBUSH_HOLD_TO_EXPIRY=1`:
+  - **Rapid phase** (held ≤30s): Aggressive `AMBUSH_RAPID_SL` (-25%) with 3-round confirmation (`rapid_sl_confirms`). Direction ❌ path only.
+  - **Mid phase** (30s < held, remaining >60s): `AMBUSH_MID_SL` (-35%) threshold. Direction ✅ adds `AMBUSH_NOISE_TOLERANCE` (+10%, total -45%), linearly decaying from 120s→60s remaining. Direction ❌ uses base threshold only.
+  - **Late phase** (remaining ≤60s): Tighter `AMBUSH_LATE_SL` (-30%). Near settlement, noise is lower so tighter stops are appropriate.
+  - **Absolute hard stop**: `AMBUSH_HARD_STOP` (-70%) fires in ALL phases regardless of direction.
+  - **Phased take-profit**: `AMBUSH_TP_PHASE1_RATIO` (60%) → `PHASE2` (55%) → `PHASE3` (40%) → `PHASE4_FIXED` ($0.05), decaying with remaining time.
+  - **Breakeven lock**: After profit reaches `AMBUSH_BREAKEVEN_TRIGGER` (15%), trailing stop at `AMBUSH_BREAKEVEN_MARGIN` (2%) above entry.
+  - **Direction confirmation window**: First `AMBUSH_CONFIRM_WINDOW` (15s) after fill, confirms direction via `AMBUSH_CONFIRM_THRESHOLD` price movement.
 - **CL-BN Skew Protection (v12.9.3)**: When Chainlink lags Binance by > `EV_SKEW_BLOCK_ATR` (default 1.0 ATR), EV stop-loss is suspended — CL direction judgment is unreliable with $40-50 price discrepancy. Reads directly from CL/BN price snapshots (independent of `ENABLE_ORACLE_STALE_WATCH`). Additionally, when direction is correct and Binance confirms with gap >= 0.3 ATR, EV exit is blocked regardless of CL-based P(win). Absolute hard stop (-40%/-70%) remains as final safety net.
 - **p_win Shrinkage Calibration (v12)**: `P_WIN_SHRINKAGE` parameter shrinks p_win toward 0.5 (default 0.80), correcting systematic overconfidence from Random Walk + Bayesian fusion. `p_win = 0.5 + (raw - 0.5) x shrinkage`. Log outputs `p_win_raw` for calibration comparison. v12.9: sniper thread adds time-decayed shrinkage (`SNIPER_SHRINK_FULL_AT`) — more conservative when more time remains.
 - **Continuous estimated_value (v12)**: ATR-to-token valuation changed from discrete if-elif table to linear interpolation (`_interpolate_estimated_value`), eliminating step jumps where 1.01 ATR and 1.49 ATR had identical valuations.
@@ -177,6 +188,8 @@ watchdog_v3.sh             → process watchdog     (monitors all 3 services)
 | `ai_trader/indicators.py` | Technical indicators (EMA, RSI, ATR, Bollinger Bands) |
 | `ai_trader/price_oracle.py` | On-chain price unified entry: Chainlink/Pyth dual-source fallback |
 | `ai_trader/ws_ssl.py` | WebSocket TLS helpers: explicit CA certificate path |
+| `ai_trader/fast_direction.py` | Fast direction: 3-signal fusion (Binance OFI + CL-BN spread + Polymarket OBI) for pre-Bayesian direction |
+| `ai_trader/trade_logger.py` | Structured decision logger: entry/reprice/TP/SL/shadow events to `logs/trade_decisions.jsonl` |
 | `ai_trader/polymarket_api.py` | Polymarket API + PTB HTML scraper |
 | `ai_trader/playwright_ptb.py` | PTB extraction via headless Chromium |
 | `trading_state.py` | State management: cooldown, daily PnL, win/loss tracking, overnight position isolation |
@@ -217,16 +230,19 @@ Layer 2 — Position Sizing
   ├─ Base Rate reduction (× 0.5 if < 0.55)
   ├─ Correlation reduction (× 0.5 if same-direction open)
   ├─ P3: Liquidity cap (≤ 50% of exit bid depth)
-  ├─ Hard bounds: 5-10 shares
-  └─ Balance constraints (10-20% of balance)
+  ├─ Hard bounds: MIN_BET_SIZE-MAX_BET_SIZE shares (default 2-8)
+  └─ Balance constraints (MAX_ENTRY_BALANCE_PCT of balance, default 20%)
 
 Layer 3 — Position Management
   ├─ PTB Proximity Buffer: crypto near PTB → freeze direction, prevent noise stop-loss
   ├─ -25% hard stop: market sell when direction≠True (proximity: -50% extreme stop)
   ├─ Direction flip exit: True→False + consecutive confirmation → liquidation
   ├─ ATR 3-layer decision: ≥15% drop → dip-buy (ATR≥2) / hold (1-2) / stop-loss (ATR<1)
+  ├─ v14 Ambush Phased TP/SL: rapid(-25%,3-confirm) → mid(-35%±noise) → late(-30%) + -70% hard stop
+  ├─ v14 Ambush Breakeven Lock: profit ≥15% → trailing stop at entry+2%
   ├─ P0: Hyperbolic discounting profit-take (entry_price sell for guaranteed fill)
   ├─ P1: Opposite token hedge (bid < $0.05 → buy opposite for $1 pair)
+  ├─ Maker Exit: stop-loss first tries GTD maker sell (0 fee), timeout → FAK fallback
   ├─ Market-price immediate stop-loss (cancel first, then ladder sell)
   ├─ Wide spread detection (prevents false loss signals)
   ├─ Post-close safety (no trades after market ends)

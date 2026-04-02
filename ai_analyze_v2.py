@@ -16,6 +16,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DECISIONS_FILE = os.path.join(_SCRIPT_DIR, "logs", "decisions_v2.jsonl")
+BETS_FILE = os.path.join(_SCRIPT_DIR, "logs", "bets.jsonl")
+POSITIONS_FILE = os.path.join(_SCRIPT_DIR, "logs", "positions.jsonl")
 
 from ai_trader.ai_model_v2 import analyze_market
 from ai_trader.base_rate import get_base_rate
@@ -110,7 +114,7 @@ def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, det
         "action": action,
     }
 
-    with open("logs/decisions_v2.jsonl", "a") as f:
+    with open(DECISIONS_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
@@ -1349,7 +1353,7 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         "output": output[:200],  # 截断输出
     }
 
-    with open("logs/bets.jsonl", "a") as f:
+    with open(BETS_FILE, "a") as f:
         f.write(json.dumps(log_entry) + "\n")
 
     # 如果下注成功，记录持仓（丰富字段供 position_monitor 使用）
@@ -1395,11 +1399,10 @@ def execute_bet(slug, direction, token_id, confidence=0.65, ev=0, amount=None,
         # allowance刷新异步执行（不阻塞主流程，省~270ms）
         _bet_executor.submit(clob_client.update_token_allowance, token_id)
 
-        _pos_lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "positions.jsonl.lock")
-        _pos_lock_fd = open(_pos_lock_path, "w")
+        _pos_lock_fd = open(POSITIONS_FILE + ".lock", "w")
         try:
             fcntl.flock(_pos_lock_fd, fcntl.LOCK_EX)
-            with open("logs/positions.jsonl", "a") as f:
+            with open(POSITIONS_FILE, "a") as f:
                 f.write(json.dumps(position) + "\n")
         finally:
             fcntl.flock(_pos_lock_fd, fcntl.LOCK_UN)

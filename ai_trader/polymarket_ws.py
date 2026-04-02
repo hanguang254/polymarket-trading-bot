@@ -10,6 +10,7 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 
 from ai_trader.ws_ssl import get_websocket_sslopt
 
@@ -56,6 +57,8 @@ class PolymarketOrderbookStream:
         self._price_event = threading.Event()  # v12.8: 每次收到 BBA 更新时 set，供狙击线程事件驱动
         self._msg_count = 0  # v12.8 诊断：WS 收到的消息总数
         self._last_msg_log = 0  # 上次打印消息计数的时间
+        # v14.1: 成交带缓冲区 — {asset_id: deque([(ts, price, side, size), ...])}
+        self._trade_tape = {}
 
     def start(self):
         """标记就绪，实际连接延迟到第一次 subscribe() 时建立
@@ -243,6 +246,46 @@ class PolymarketOrderbookStream:
             "age_ms": round(age_sec * 1000, 1),
         }
 
+    def get_orderbook_imbalance(self, asset_id, depth=5):
+        """v14.1: 订单簿失衡（OBI）— bid_vol / (bid_vol + ask_vol)
+        返回 float [0,1]: >0.6=看涨, <0.4=看跌, None=数据不可用
+        """
+        bids, asks = self.get_book(asset_id)
+        if not bids or not asks:
+            return None
+        bid_vol = sum(float(b.get("size", 0)) for b in bids[:depth])
+        ask_vol = sum(float(a.get("size", 0)) for a in asks[:depth])
+        total = bid_vol + ask_vol
+        if total < 1:
+            return None
+        return round(bid_vol / total, 4)
+
+    def get_trade_direction(self, asset_id, window_sec=10):
+        """v14.1: 成交带方向 — 滚动窗口内BUY vs SELL净量
+        返回 {"ofi": float, "direction": str|None, "n_trades": int}
+        """
+        with self._lock:
+            tape = self._trade_tape.get(asset_id)
+        if not tape:
+            return {"ofi": 0, "direction": None, "n_trades": 0}
+        now = time.time()
+        cutoff = now - window_sec
+        buy_vol = 0.0
+        sell_vol = 0.0
+        n = 0
+        for ts, price, side, size in tape:
+            if ts < cutoff:
+                continue
+            n += 1
+            if side == "BUY":
+                buy_vol += size
+            else:
+                sell_vol += size
+        total = buy_vol + sell_vol
+        ofi = (buy_vol - sell_vol) / total if total > 0 else 0
+        direction = "UP" if ofi > 0.2 else ("DOWN" if ofi < -0.2 else None)
+        return {"ofi": round(ofi, 4), "direction": direction, "n_trades": n}
+
     # ── WebSocket 内部 ──
 
     def _connect_loop(self):
@@ -417,8 +460,21 @@ class PolymarketOrderbookStream:
             self._price_event.set()
 
     def _handle_last_trade(self, event):
-        # 暂不使用，预留扩展
-        pass
+        """v14.1: 记录成交带 — price/side/size 用于方向判断"""
+        asset_id = event.get("asset_id", "")
+        if not asset_id:
+            return
+        price = _safe_float(event.get("price"))
+        side = event.get("side", "")  # "BUY" or "SELL"
+        size = _safe_float(event.get("size")) or 0
+        if price is None or not side:
+            return
+        with self._lock:
+            tape = self._trade_tape.get(asset_id)
+            if tape is None:
+                tape = deque(maxlen=100)
+                self._trade_tape[asset_id] = tape
+            tape.append((time.time(), price, side, size))
 
     def _on_error(self, ws, error):
         # 频繁断连时减少日志噪音（连接稳定>10s才打印错误）

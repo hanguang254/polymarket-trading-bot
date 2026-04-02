@@ -37,6 +37,37 @@ class TestPositionMonitor(unittest.TestCase):
         self.assertFalse(pm.should_attempt_stop_loss(True))
         self.assertFalse(pm.should_attempt_stop_loss(None))
 
+    def test_evaluate_proximity_guard_freezes_inside_deadzone(self):
+        info = pm.evaluate_proximity_guard(
+            direction_correct=False,
+            true_direction_correct=False,
+            diff_atr=0.20,
+            remaining=150,
+            profit_rate=-0.20,
+            wrong_streak=1,
+            direction_history=[True, False, True, True],
+        )
+
+        self.assertTrue(info["in_proximity"])
+        self.assertTrue(info["freeze"])
+        self.assertFalse(info["released"])
+
+    def test_evaluate_proximity_guard_releases_on_extreme_loss(self):
+        info = pm.evaluate_proximity_guard(
+            direction_correct=False,
+            true_direction_correct=False,
+            diff_atr=0.20,
+            remaining=150,
+            profit_rate=-(pm.PTB_PROXIMITY_EXTREME_STOP + 0.01),
+            wrong_streak=1,
+            direction_history=[True, False, True, True],
+        )
+
+        self.assertTrue(info["in_proximity"])
+        self.assertTrue(info["released"])
+        self.assertTrue(info["release_by_extreme_stop"])
+        self.assertFalse(info["freeze"])
+
     @patch("position_monitor.subprocess.run")
     def test_check_balance_changed_zero_balance(self, mock_run):
         mock_run.return_value = DummyResult(stdout="token_id=abc balance: 0.00")

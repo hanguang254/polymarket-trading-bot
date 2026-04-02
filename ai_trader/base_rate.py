@@ -9,11 +9,13 @@ Base Rate 校准模块 v1.0
 对于5分钟二元市场，base rate = 历史上该 ATR 带的胜率。
 初始使用保守先验，数据积累后（≥30样本/带）自动切换为实证值。
 """
+import fcntl
 import json
 import os
 import time
 
 OUTCOMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "outcomes.jsonl")
+OUTCOMES_LOCK = OUTCOMES_FILE + ".lock"
 BASE_RATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "base_rates.json")
 
 # 保守先验（故意低于 estimated_value 表，避免高估）
@@ -128,12 +130,19 @@ def record_outcome(slug: str, direction: str, diff_in_atr: float, won: bool, ext
     if extra:
         record.update(extra)
 
+    lock_fd = None
     try:
         os.makedirs(os.path.dirname(OUTCOMES_FILE), exist_ok=True)
+        lock_fd = open(OUTCOMES_LOCK, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         with open(OUTCOMES_FILE, "a") as f:
             f.write(json.dumps(record) + "\n")
     except Exception:
         pass
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     # 每50条自动校准一次
     try:

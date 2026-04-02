@@ -34,6 +34,7 @@ class BayesianUpdater:
 
     def __init__(self, prior_up=0.5, atr_val=None):
         self.prior_up = max(0.01, min(0.99, prior_up))
+        self.atr_real = atr_val is not None and atr_val > 0  # v14.1: ATR是否来自真实K线数据且有效
         self.atr_val = atr_val or 1.0
         self.log_posterior_up = math.log(self.prior_up)
         self.log_posterior_down = math.log(1 - self.prior_up)
@@ -46,6 +47,19 @@ class BayesianUpdater:
         self._flip_gap_side = 0
         self._flip_streak = 0
         self.reset_count = 0
+
+    def set_prior_bias(self, p_up_bias):
+        """v14.1: 用快速方向信号设置先验偏置，加速收敛
+
+        只在n_updates==0时生效（首次更新前），避免覆盖已有证据。
+        p_up_bias: float [0.35, 0.65]
+        """
+        if self.n_updates > 0:
+            return  # 已有证据，不覆盖
+        p_up_bias = max(0.35, min(0.65, p_up_bias))
+        self.prior_up = p_up_bias
+        self.log_posterior_up = math.log(p_up_bias)
+        self.log_posterior_down = math.log(1.0 - p_up_bias)
 
     @staticmethod
     def _clip_prob(value):

@@ -26,6 +26,10 @@ for mod in [
 ]:
     sys.modules.setdefault(mod, MagicMock())
 
+# Force-mock: 这些模块可能已被同进程的其他测试文件真实import，setdefault不覆盖
+for mod in ["ai_trader.base_rate", "ai_trader.trade_logger"]:
+    sys.modules[mod] = MagicMock()
+
 # Mock poly_ws.get_best_bid_ask 返回 (bid, ask) 元组
 sys.modules["ai_trader.polymarket_ws"].poly_ws.get_best_bid_ask = MagicMock(return_value=(0.55, 0.60))
 
@@ -42,6 +46,12 @@ import auto_bot_v3 as bot
 # 恢复 stdout
 sys.stdout = sys.__stdout__
 sys.stderr = sys.__stderr__
+
+# 隔离：POSITIONS_FILE 指向临时目录，防止测试污染 repo 根 logs/
+import tempfile as _tmpmod
+_test_logs_dir = _tmpmod.mkdtemp()
+os.makedirs(os.path.join(_test_logs_dir, "logs"), exist_ok=True)
+bot.POSITIONS_FILE = os.path.join(_test_logs_dir, "logs", "positions.jsonl")
 
 
 def make_market(coin="BTC", slug=None, elapsed=0):
@@ -1299,7 +1309,7 @@ class TestAmbushCLOBAwareReprice(unittest.TestCase):
         with patch.dict(os.environ, env_overrides), \
              patch.dict(sys.modules, {"py_clob_client.clob_types": MagicMock()}), \
              patch("auto_bot_v3.time.time", return_value=1001.0), \
-             patch("auto_bot_v3._get_bayesian_signal", return_value={"confidence": 0.60}), \
+             patch("auto_bot_v3._get_bayesian_signal", return_value={"direction": "UP", "confidence": 0.60}), \
              patch.object(bot.clob_client, "get_token_balance", return_value=0.0), \
              patch.object(bot.clob_client, "cancel_all", return_value=True), \
              patch.object(bot.clob_client, "get_order", return_value={"status": "CANCELLED"}), \
@@ -1316,7 +1326,7 @@ class TestAmbushCLOBAwareReprice(unittest.TestCase):
         actual_price = place_mock.call_args[0][2]  # 3rd positional arg = price
         # CLOB price with decay: elapsed=101s, total=221s, decay≈0.457
         # offset = 0.05 - (0.05-0.01)*0.457 ≈ 0.032 → clob_price = 0.75-0.032 = 0.72
-        # model price ≈ 0.56, so CLOB price should dominate → price > 0.60
+        # model price ≈ 0.67, so CLOB price should dominate → price > 0.60
         self.assertGreater(actual_price, 0.60,
                            f"CLOB-aware price {actual_price} should be > 0.60 (model ~0.56)")
 
@@ -1357,7 +1367,7 @@ class TestAmbushCLOBAwareReprice(unittest.TestCase):
 
         with patch.dict(os.environ, env_overrides), \
              patch("auto_bot_v3.time.time", return_value=1001.0), \
-             patch("auto_bot_v3._get_bayesian_signal", return_value={"confidence": 0.50}), \
+             patch("auto_bot_v3._get_bayesian_signal", return_value={"direction": "UP", "confidence": 0.50}), \
              patch.object(bot.clob_client, "get_token_balance", return_value=0.0), \
              patch.object(bot.clob_client, "cancel_all") as cancel_mock, \
              patch.object(bot.clob_client, "place_order") as place_mock, \
@@ -1403,7 +1413,7 @@ class TestAmbushCLOBAwareReprice(unittest.TestCase):
 
         with patch.dict(os.environ, env_overrides), \
              patch("auto_bot_v3.time.time", return_value=1001.0), \
-             patch("auto_bot_v3._get_bayesian_signal", return_value={"confidence": 0.50}), \
+             patch("auto_bot_v3._get_bayesian_signal", return_value={"direction": "UP", "confidence": 0.50}), \
              patch.object(bot.clob_client, "get_token_balance", return_value=0.0), \
              patch.object(bot.clob_client, "cancel_all") as cancel_mock, \
              patch.object(bot.clob_client, "place_order") as place_mock, \
