@@ -14,6 +14,8 @@ v2.1 改进:
 """
 import math
 
+from ai_trader.gbm_p_up import gbm_p_up
+
 
 class BayesianUpdater:
     """
@@ -103,15 +105,15 @@ class BayesianUpdater:
         ):
             return None
 
-        sigma_per_min = self.atr_val / 1.5
-        sigma_total = sigma_per_min * math.sqrt(remaining_seconds / 60.0)
-        if sigma_total <= 0:
-            return None
-
+        # GBM closed-form via shared helper (single source of truth).
+        # See ai_trader/gbm_p_up.py — same formula, calibrated to EV_ATR_SIGMA_RATIO=1.5.
+        p_up = gbm_p_up(
+            price=price,
+            strike=ptb,
+            atr=self.atr_val,
+            remaining_sec=remaining_seconds,
+        )
         gap = price - ptb
-        z = abs(gap) / sigma_total
-        base_p = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-        p_up = base_p if gap >= 0 else (1.0 - base_p)
         state = self._signal_from_p_up(p_up)
         state["gap"] = gap
         state["remaining_seconds"] = remaining_seconds

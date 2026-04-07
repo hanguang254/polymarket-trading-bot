@@ -1,9 +1,47 @@
+import math
+import os
 import unittest
+from unittest.mock import patch
 
 from ai_trader.bayesian_engine import BayesianUpdater
 
 
 class TestBayesianUpdaterSignals(unittest.TestCase):
+    def test_state_signal_matches_inline_gbm_formula_pre_refactor(self):
+        """
+        Equivalence guard for the gbm_p_up refactor (P1-2 hardened).
+
+        Pre-refactor _state_signal hardcoded `sigma_per_min = atr / 1.5`.
+        Post-refactor calls gbm_p_up which reads EV_ATR_SIGMA_RATIO from env
+        (default 1.5). This test PINS the env var to 1.5 so equivalence holds
+        regardless of runtime config. P1-2 disclosure: setting
+        EV_ATR_SIGMA_RATIO != 1.5 will silently change bayesian_engine output.
+        """
+        ptb = 70787.02
+        atr = 55.11714285714489
+        price = 70831.95          # gap > 0
+        remaining_seconds = 264.0
+
+        with patch.dict(os.environ, {"EV_ATR_SIGMA_RATIO": "1.5"}):
+            updater = BayesianUpdater(prior_up=0.5, atr_val=atr)
+            updater.current_price = price
+            updater.current_ptb = ptb
+            state = updater._state_signal(remaining_seconds=remaining_seconds)
+
+        # Reference: inline pre-refactor formula
+        sigma_per_min = atr / 1.5
+        sigma_total = sigma_per_min * math.sqrt(remaining_seconds / 60.0)
+        gap = price - ptb
+        z = abs(gap) / sigma_total
+        base_p = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        expected_p_up = base_p if gap >= 0 else (1.0 - base_p)
+        # _signal_from_p_up clips to [0.07, 0.93]
+        expected_p_up_clipped = max(0.07, min(0.93, expected_p_up))
+
+        self.assertIsNotNone(state)
+        self.assertAlmostEqual(state["p_up"], expected_p_up_clipped, places=12)
+
+
     def test_state_signal_overrides_stale_incremental_direction(self):
         ptb = 70787.02
         atr = 55.11714285714489

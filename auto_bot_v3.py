@@ -1475,6 +1475,47 @@ class MarketTracker:
             self._ambush_stat(slug, coin, skip="信号不足")
             return
 
+        # v15.0: Direction Truth Gate — 三源 GBM 隐含概率交叉验证（balanced 模式 2/3 多数决）
+        # 闸门拦截 → 跳过挂单（shadow 模式只记日志）。详见 docs/superpowers/specs/2026-04-07-direction-truth-gate-design.md
+        try:
+            from ai_trader.direction_truth_gate import check_direction_truth, is_shadow_mode
+            _deadline_ts = _slug_end_timestamp(slug)
+            if _deadline_ts is not None and atr_val and atr_val > 0:
+                _truth = check_direction_truth(
+                    coin=coin, strike=ptb, deadline_ts=_deadline_ts,
+                    atr_val=atr_val, strict=False, call_site="ambush_gate",
+                )
+                if _truth.is_blocked:
+                    _skip_key = f"{slug}_dir_truth"
+                    _last_skip = getattr(self, '_ambush_skip_log', {})
+                    if _last_skip.get(_skip_key) != _truth.mode:
+                        if not hasattr(self, '_ambush_skip_log'):
+                            self._ambush_skip_log = {}
+                        self._ambush_skip_log[_skip_key] = _truth.mode
+                        logger.info(
+                            f"  [伏] 方向闸门拦截: {coin} mode={_truth.mode} "
+                            f"alive={_truth.n_alive_sources} reason={_truth.block_reason} "
+                            f"shadow={'Y' if is_shadow_mode() else 'N'}")
+                    if not is_shadow_mode():
+                        self._ambush_stat(slug, coin, skip="方向闸门")
+                        return
+                elif _truth.direction is not None and _truth.direction != gap_dir:
+                    _skip_key = f"{slug}_dir_truth_conflict"
+                    _last_skip = getattr(self, '_ambush_skip_log', {})
+                    if _last_skip.get(_skip_key) != _truth.direction:
+                        if not hasattr(self, '_ambush_skip_log'):
+                            self._ambush_skip_log = {}
+                        self._ambush_skip_log[_skip_key] = _truth.direction
+                        logger.info(
+                            f"  [伏] 方向闸门冲突: {coin} bayesian={gap_dir} "
+                            f"truth={_truth.direction} conf={_truth.confidence:.2f} "
+                            f"shadow={'Y' if is_shadow_mode() else 'N'}")
+                    if not is_shadow_mode():
+                        self._ambush_stat(slug, coin, skip="方向闸门冲突")
+                        return
+        except Exception:
+            pass  # 闸门失败 fail-open，回退老逻辑
+
         # v14.1: 快速方向 + 贝叶斯一致性硬门槛 — 只在多信号一致时挂单
         _AMBUSH_REQUIRE_FAST = os.environ.get("AMBUSH_REQUIRE_FAST_DIR", "1") == "1"
         if _AMBUSH_REQUIRE_FAST and atr_val and atr_val > 0:
@@ -1695,6 +1736,32 @@ class MarketTracker:
             return True
         if slug in self._endgame_entered:
             return True
+
+        # v15.0: Direction Truth Gate — Endgame 走 strict 模式（3/3 严格一致）
+        try:
+            from ai_trader.direction_truth_gate import check_direction_truth, is_shadow_mode
+            _deadline_ts = _slug_end_timestamp(slug)
+            if _deadline_ts is not None and atr_val and atr_val > 0:
+                _truth = check_direction_truth(
+                    coin=coin, strike=ptb, deadline_ts=_deadline_ts,
+                    atr_val=atr_val, strict=True, call_site="endgame_entry",
+                )
+                if _truth.is_blocked:
+                    logger.info(
+                        f"  [终] Endgame 方向闸门拦截: {coin} mode={_truth.mode} "
+                        f"alive={_truth.n_alive_sources} reason={_truth.block_reason} "
+                        f"shadow={'Y' if is_shadow_mode() else 'N'}")
+                    if not is_shadow_mode():
+                        return False
+                elif _truth.direction is not None and _truth.direction != gap_dir:
+                    logger.info(
+                        f"  [终] Endgame 方向闸门冲突: {coin} mc={gap_dir} "
+                        f"truth={_truth.direction} conf={_truth.confidence:.2f} "
+                        f"shadow={'Y' if is_shadow_mode() else 'N'}")
+                    if not is_shadow_mode():
+                        return False
+        except Exception:
+            pass  # 闸门失败 fail-open
 
         ENDGAME_MIN_P_WIN = float(os.environ.get("ENDGAME_MIN_P_WIN", "0.85"))
         ENDGAME_MIN_EDGE = float(os.environ.get("ENDGAME_MIN_EDGE", "0.02"))
@@ -1959,20 +2026,36 @@ class MarketTracker:
                 _sniper_updater = BayesianUpdater(prior_up=0.5, atr_val=atr_val)
                 # v14.1: 快速方向先验偏置（fail-closed: ATR无效时跳过）
                 if atr_val is not None:
+                    # v15.0: Direction Truth Gate（strict 3/3）— 闸门通过才允许 fast_direction 注入 prior bias
+                    # P1-1 fix: shadow 模式下不阻断 prior 注入；P0-2 fix: is_blocked 区分 disabled vs blocked
+                    _gate_ok = True
                     try:
-                        from ai_trader.fast_direction import get_fast_direction
-                        _tokens = self.token_cache.get(slug)
-                        _fast = get_fast_direction(
-                            coin, ptb, atr_val,
-                            _tokens[0] if _tokens else None,
-                            _tokens[1] if _tokens else None)
-                        if _fast["direction"]:
-                            _sniper_updater.set_prior_bias(_fast["prior_bias"])
-                            logger.info(
-                                f"  [狙] ⚡ 快速方向: {coin} → {_fast['direction']} "
-                                f"prior={_fast['prior_bias']:.3f}")
+                        from ai_trader.direction_truth_gate import check_direction_truth, is_shadow_mode
+                        _deadline_ts = _slug_end_timestamp(slug)
+                        if _deadline_ts is not None:
+                            _truth = check_direction_truth(
+                                coin=coin, strike=ptb, deadline_ts=_deadline_ts,
+                                atr_val=atr_val, strict=True, call_site="sniper_prior_seed",
+                            )
+                            if _truth.is_blocked and not is_shadow_mode():
+                                _gate_ok = False
                     except Exception:
-                        pass
+                        pass  # 闸门失败 fail-open
+                    if _gate_ok:
+                        try:
+                            from ai_trader.fast_direction import get_fast_direction
+                            _tokens = self.token_cache.get(slug)
+                            _fast = get_fast_direction(
+                                coin, ptb, atr_val,
+                                _tokens[0] if _tokens else None,
+                                _tokens[1] if _tokens else None)
+                            if _fast["direction"]:
+                                _sniper_updater.set_prior_bias(_fast["prior_bias"])
+                                logger.info(
+                                    f"  [狙] ⚡ 快速方向: {coin} → {_fast['direction']} "
+                                    f"prior={_fast['prior_bias']:.3f}")
+                        except Exception:
+                            pass
                 self._sniper_updaters[slug] = _sniper_updater
                 logger.info(f"  [狙] 狙击线程: {coin} 创建独立贝叶斯(ATR={atr_val:.2f})")
             updater = self._sniper_updaters[slug]
@@ -2409,20 +2492,37 @@ class MarketTracker:
                                 # v14.1: 首次update前注入快速方向先验（PTB刚就绪时补跑）
                                 if updater.n_updates == 0 and getattr(updater, 'atr_real', False):
                                     # fail-closed: atr_real=False说明ATR来自fallback，不注入先验
+                                    # v15.0: Direction Truth Gate（balanced 2/3）— 闸门通过才允许 prior bias 注入
+                                    # P1-1 fix: shadow 模式下不阻断 prior 注入；P0-2 fix: is_blocked 区分 disabled vs blocked
+                                    _gate_ok = True
                                     try:
-                                        from ai_trader.fast_direction import get_fast_direction
-                                        _tokens = self.token_cache.get(slug)
-                                        _fast = get_fast_direction(
-                                            coin, ptb_now, updater.atr_val,
-                                            _tokens[0] if _tokens else None,
-                                            _tokens[1] if _tokens else None)
-                                        if _fast["direction"]:
-                                            updater.set_prior_bias(_fast["prior_bias"])
-                                            logger.info(
-                                                f"  ⚡ 快速方向(采样注入): {coin} → {_fast['direction']} "
-                                                f"prior={_fast['prior_bias']:.3f} | {_fast['reason']}")
+                                        from ai_trader.direction_truth_gate import check_direction_truth, is_shadow_mode
+                                        _deadline_ts = _slug_end_timestamp(slug)
+                                        if _deadline_ts is not None:
+                                            _truth = check_direction_truth(
+                                                coin=coin, strike=ptb_now, deadline_ts=_deadline_ts,
+                                                atr_val=updater.atr_val, strict=False,
+                                                call_site="sampling_prior_seed",
+                                            )
+                                            if _truth.is_blocked and not is_shadow_mode():
+                                                _gate_ok = False
                                     except Exception:
-                                        pass
+                                        pass  # 闸门失败 fail-open
+                                    if _gate_ok:
+                                        try:
+                                            from ai_trader.fast_direction import get_fast_direction
+                                            _tokens = self.token_cache.get(slug)
+                                            _fast = get_fast_direction(
+                                                coin, ptb_now, updater.atr_val,
+                                                _tokens[0] if _tokens else None,
+                                                _tokens[1] if _tokens else None)
+                                            if _fast["direction"]:
+                                                updater.set_prior_bias(_fast["prior_bias"])
+                                                logger.info(
+                                                    f"  ⚡ 快速方向(采样注入): {coin} → {_fast['direction']} "
+                                                    f"prior={_fast['prior_bias']:.3f} | {_fast['reason']}")
+                                        except Exception:
+                                            pass
                                 updater.update(price, ptb_now)
                                 signal = _get_bayesian_signal(updater, remaining_seconds=remaining)
                                 if signal:
