@@ -39,6 +39,14 @@ _DEFAULT_STALE = {"CL": 30.0, "BN": 5.0, "Pyth": 30.0}
 # P1-3 fix: serialize concurrent JSONL writes — gate is called from multiple threads.
 _log_lock = threading.Lock()
 
+# v15.1 fix: state-change-only logging — 闸门每秒被调用 50+ 次，无脑写 JSONL
+# 一小时产 114MB / 一天 2.7GB / 一月 80GB，93.8% 是连续相同状态。
+# 用 (coin, deadline_int, call_site) 做 key 缓存上一次写入的 state；
+# state 不变且距上次写入未超过心跳间隔时跳过写入。预期日志体积压缩 94%。
+_LOG_HEARTBEAT_SEC = 30.0  # 即使无状态变化，每个 (coin, deadline, call_site) 至少 30s 一条心跳
+_last_logged_state: dict = {}    # key -> state_tuple
+_last_heartbeat_ts: dict = {}    # key -> last write ts
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -382,8 +390,30 @@ def _log_gate_decision(
     coin, strike, deadline_ts, now_ts, atr_val,
     strict, call_site, truth: DirectionTruth,
 ):
-    """Append one JSON line to logs/dir_truth_gate.jsonl."""
+    """Append one JSON line to logs/dir_truth_gate.jsonl.
+
+    v15.1 dedup: 用 (coin, deadline_int, call_site) 做 key，state 没变且距上次
+    写入未到 _LOG_HEARTBEAT_SEC 秒就跳过。被跳过的事件仍然在内存里参与决策，
+    只是不再每 2ms 砸一行到磁盘。所有方向反转 / mode 切换 / 拦截事件都会被
+    立即写入（state_tuple 改变 → bypass dedup）。
+    """
     try:
+        # ── state-change-only dedup with heartbeat ──
+        key = (coin, int(deadline_ts), call_site)
+        state_tuple = (
+            truth.direction,
+            truth.mode,
+            truth.n_alive_sources,
+            tuple((v.vote, v.stale) for v in truth.votes.values()),
+        )
+        with _log_lock:
+            last_state = _last_logged_state.get(key)
+            last_hb = _last_heartbeat_ts.get(key, 0.0)
+            if last_state == state_tuple and (now_ts - last_hb) < _LOG_HEARTBEAT_SEC:
+                return  # 状态没变 + 心跳未到 → 跳过写入
+            _last_logged_state[key] = state_tuple
+            _last_heartbeat_ts[key] = now_ts
+
         log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "dir_truth_gate.jsonl")

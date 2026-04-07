@@ -22,6 +22,11 @@ from ai_trader.pyth_api import pyth_stream as _pyth_stream, get_pyth_price
 from ai_trader.polymarket_ws import poly_ws as _poly_ws
 from ai_trader.polymarket_rtds import chainlink_stream as _chainlink_stream
 from ai_trader.coins import coin_from_slug as _coin_from_slug, get_binance_symbol as _get_binance_symbol
+# v15.1: Exit Truth Gate (top-level import per P2-6 review — fail loudly on import errors)
+from ai_trader.exit_truth_gate import (
+    should_suppress_ev_exit as exit_gate_should_suppress,
+    is_shadow_mode as exit_gate_is_shadow,
+)
 
 # 价格数据源配置: 1=Chainlink优先(官方结算价), 2=Pyth优先(链上预言机)
 PRICE_SOURCE = int(os.environ.get("PRICE_SOURCE", "1"))
@@ -3366,6 +3371,7 @@ def monitor():
     oracle_stale_watch_streak = {}  # (slug, entry_time) -> CL-BN 持续偏离确认轮数（仅告警）
     oracle_stale_watch_active = {}  # (slug, entry_time) -> 是否已进入快市场领先告警态
     ev_exit_confirm = {}  # (slug, entry_time) -> 连续EV退出确认轮数（EV-Gate用）
+    exit_gate_last_log = {}  # v15.1: (slug, entry_time) -> last printed (layer, reason) — 防止刷屏
     bn_price_history = {}  # (slug, entry_time) -> deque of (ts, price) BN价格快照
     high_water_mark = {}  # v12.8: (slug, entry_time) -> 持仓期间最高利润率（trailing TP用）
     rapid_sl_confirms = {}  # v14: 快速止损方向❌连续确认轮数（防单次噪音触发）
@@ -3471,6 +3477,7 @@ def monitor():
             oracle_stale_watch_streak = {k: v for k, v in oracle_stale_watch_streak.items() if k in open_keys}
             oracle_stale_watch_active = {k: v for k, v in oracle_stale_watch_active.items() if k in open_keys}
             ev_exit_confirm = {k: v for k, v in ev_exit_confirm.items() if k in open_keys}
+            exit_gate_last_log = {k: v for k, v in exit_gate_last_log.items() if k in open_keys}  # v15.1
             bn_price_history = {k: v for k, v in bn_price_history.items() if k in open_keys}
             high_water_mark = {k: v for k, v in high_water_mark.items() if k in open_keys}
             trailing_tp_active = {k: v for k, v in trailing_tp_active.items() if k in open_keys}
@@ -4599,6 +4606,40 @@ def monitor():
                                         f"| CL说卖但BN说方向对，跳过")
                                     ev_exit_confirm.pop(attempt_key, None)
                                     continue
+
+                    # --- v15.1: Exit Truth Gate — 三层错杀防护 ---
+                    # 数据驱动结论：4 月 6-7 日数据显示 75% 的完整 EV 止损是错杀
+                    # 详见 ai_trader/exit_truth_gate.py + 仓位日志交叉对照分析
+                    # P2-3: 提前检查 atr/remaining，避免传无效值给 gate
+                    if _ev_should_exit and atr_val and atr_val > 0 and remaining is not None and remaining > 0:
+                        try:
+                            _exit_verdict = exit_gate_should_suppress(
+                                coin=coin,
+                                strike=ptb_price,
+                                atr_val=atr_val,
+                                p_win=_ev_p_win,
+                                direction=direction,
+                                remaining_sec=remaining,
+                            )
+                            if _exit_verdict.suppress:
+                                # v15.1: 状态变化才 print，防止 tick loop 刷屏
+                                # 同一 attempt_key 同一 layer 只 print 第一次，layer 切换才再 print
+                                _gate_state = (_exit_verdict.layer, round(_ev_p_win, 2))
+                                if exit_gate_last_log.get(attempt_key) != _gate_state:
+                                    exit_gate_last_log[attempt_key] = _gate_state
+                                    print(
+                                        f"  🛡️ Exit闸门拦截[{_exit_verdict.layer}]: "
+                                        f"{_exit_verdict.reason} "
+                                        f"shadow={'Y' if exit_gate_is_shadow() else 'N'}")
+                                if not exit_gate_is_shadow():
+                                    ev_exit_confirm.pop(attempt_key, None)
+                                    continue
+                            else:
+                                # 闸门放行 → 清掉 dedup 缓存，下次 suppress 时能再 print
+                                exit_gate_last_log.pop(attempt_key, None)
+                        except Exception as _e:
+                            # P2-2: fail-open + 不静默 — 让运行时 bug 大声暴露
+                            print(f"  ⚠️ Exit闸门异常(fail-open): {_e}")
 
                     # --- EV-Gated 退出 ---
                     if _ev_should_exit:
