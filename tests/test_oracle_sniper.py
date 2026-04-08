@@ -53,3 +53,89 @@ def test_oracle_verdict_buy_maker_phase():
     assert v.action == "BUY"
     assert v.direction == "UP"
     assert v.phase == "MAKER"
+
+
+# ═══ Tests for get_price_delta() helper ═══
+from collections import deque
+from ai_trader.binance_api import BinancePriceStream, get_price_delta
+
+
+def _make_stream_with_trades(coin: str, trades):
+    """Create a BinancePriceStream with pre-seeded _trade_tape for testing.
+
+    trades: list of (ts_offset_sec_from_now, price, qty, is_buyer_maker)
+    """
+    stream = BinancePriceStream.__new__(BinancePriceStream)
+    stream._trade_tape = {}
+    stream.prices = {}
+    stream.last_update = {}
+    stream.event_timestamps = {}
+    stream.trade_timestamps = {}
+    stream.update_count = {}
+    now = time.time()
+    tape = deque(maxlen=500)
+    for offset, price, qty, maker in trades:
+        tape.append((now + offset, price, qty, maker))
+    stream._trade_tape[coin] = tape
+    # Mark price stream as fresh (not stale) so get_snapshot returns non-stale.
+    stream.prices[coin] = trades[-1][1] if trades else None
+    stream.last_update[coin] = now
+    stream.update_count[coin] = len(trades)
+    return stream
+
+
+def test_get_price_delta_up_trend():
+    stream = _make_stream_with_trades("BTC", [
+        (-14.0, 70000.0, 0.1, False),
+        (-7.0, 70050.0, 0.1, False),
+        (-1.0, 70100.0, 0.1, False),
+    ])
+    result = stream.get_price_delta("BTC", window_sec=15)
+    assert result["start_price"] == 70000.0
+    assert result["end_price"] == 70100.0
+    assert result["n_trades"] == 3
+    assert result["stale"] is False
+    assert result["direction"] == "UP"
+    # (70100 / 70000 - 1) * 10000 ≈ 14.28 bps
+    assert 14.0 < result["delta_bps"] < 14.5
+
+
+def test_get_price_delta_down_trend():
+    stream = _make_stream_with_trades("BTC", [
+        (-14.0, 70000.0, 0.1, True),
+        (-7.0, 69950.0, 0.1, True),
+        (-1.0, 69900.0, 0.1, True),
+    ])
+    result = stream.get_price_delta("BTC", window_sec=15)
+    assert result["direction"] == "DOWN"
+    assert result["delta_bps"] < 0
+    assert result["n_trades"] == 3
+
+
+def test_get_price_delta_flat():
+    stream = _make_stream_with_trades("BTC", [
+        (-14.0, 70000.0, 0.1, False),
+        (-1.0, 70000.0, 0.1, False),
+    ])
+    result = stream.get_price_delta("BTC", window_sec=15)
+    assert result["direction"] == "FLAT"
+    assert abs(result["delta_bps"]) < 0.01
+
+
+def test_get_price_delta_empty_window():
+    stream = _make_stream_with_trades("BTC", [
+        (-60.0, 70000.0, 0.1, False),  # outside 15s window
+    ])
+    result = stream.get_price_delta("BTC", window_sec=15)
+    assert result["n_trades"] == 0
+    assert result["stale"] is True
+    assert result["delta_bps"] == 0.0
+    assert result["direction"] == "FLAT"
+
+
+def test_get_price_delta_no_coin_tape():
+    stream = BinancePriceStream.__new__(BinancePriceStream)
+    stream._trade_tape = {}
+    result = stream.get_price_delta("ETH", window_sec=15)
+    assert result["stale"] is True
+    assert result["n_trades"] == 0

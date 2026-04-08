@@ -194,6 +194,60 @@ class BinancePriceStream:
         return {"ofi": round(ofi, 4), "buy_vol": round(buy_vol, 2),
                 "sell_vol": round(sell_vol, 2), "n_trades": n, "direction": direction}
 
+    def get_price_delta(self, coin="BTC", window_sec=15):
+        """v14.4: Return net price change over the last window_sec seconds.
+
+        Used by Oracle Sniper to cross-validate Chainlink direction with
+        an independent Binance trend signal. This is a PRICE metric
+        (net first→last in window), not an order-flow metric like OFI.
+
+        Returns:
+            {
+                "start_price": float,   # first trade in window
+                "end_price": float,     # last trade in window
+                "delta_bps": float,     # (end/start - 1) * 10000
+                "n_trades": int,        # trade count in window
+                "stale": bool,          # True if n_trades == 0
+                "direction": "UP"/"DOWN"/"FLAT"
+            }
+        """
+        tape = self._trade_tape.get(coin)
+        empty = {
+            "start_price": 0.0,
+            "end_price": 0.0,
+            "delta_bps": 0.0,
+            "n_trades": 0,
+            "stale": True,
+            "direction": "FLAT",
+        }
+        if not tape:
+            return empty
+        now = time.time()
+        cutoff = now - window_sec
+        in_window = [(ts, price) for (ts, price, _qty, _maker) in tape if ts >= cutoff]
+        if not in_window:
+            return empty
+        in_window.sort(key=lambda x: x[0])
+        start_price = in_window[0][1]
+        end_price = in_window[-1][1]
+        if start_price <= 0:
+            return empty
+        delta_bps = (end_price / start_price - 1.0) * 10000.0
+        if delta_bps > 0.01:
+            direction = "UP"
+        elif delta_bps < -0.01:
+            direction = "DOWN"
+        else:
+            direction = "FLAT"
+        return {
+            "start_price": round(start_price, 4),
+            "end_price": round(end_price, 4),
+            "delta_bps": round(delta_bps, 4),
+            "n_trades": len(in_window),
+            "stale": False,
+            "direction": direction,
+        }
+
     def stop(self):
         self._running = False
         if self._ws:
@@ -260,3 +314,7 @@ def get_24h_stats(symbol):
     except:
         pass
     return None
+
+def get_price_delta(coin="BTC", window_sec=15):
+    """Module-level convenience wrapper for BinancePriceStream.get_price_delta."""
+    return price_stream.get_price_delta(coin, window_sec)
