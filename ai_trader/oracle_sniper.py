@@ -418,3 +418,225 @@ def log_oracle_verdict(v: OracleVerdict) -> None:
         os.makedirs(parent, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# ─────────── Per-coin state machine state ───────────
+# Holds active order info keyed by coin. Guarded by _orders_lock because
+# the main loop and sniper thread both touch it (I2 fix).
+# Persisted to disk on every change so cleanup_orphan_orders can recover
+# across process restarts (C2 fix).
+_orders_lock = threading.Lock()
+_active_orders: Dict[str, Dict[str, Any]] = {}
+
+
+def _orders_state_path() -> str:
+    return _env_str("ORACLE_SNIPER_STATE_PATH", "logs/oracle_active_orders.json") \
+        or "logs/oracle_active_orders.json"
+
+
+def _persist_active_orders() -> None:
+    """Write _active_orders to disk. Caller must already hold _orders_lock."""
+    path = _orders_state_path()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(_active_orders, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass  # persistence is best-effort; in-memory state is source of truth
+
+
+def _load_persisted_active_orders() -> Dict[str, Dict[str, Any]]:
+    """Read persisted active orders from disk. Returns {} on any error."""
+    path = _orders_state_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _reset_oracle_state() -> None:
+    """Test helper: clear all per-coin state (cooldown, active orders, dedup)."""
+    _reset_cooldown_state()
+    with _orders_lock:
+        _active_orders.clear()
+        _persist_active_orders()
+    _reset_log_dedup_state()
+
+
+def _compute_kelly_size(balance: float, p_win: float, ask_price: float,
+                        min_bet: float, max_bet: float) -> float:
+    """Reuse the same Kelly 1/4 formula as endgame/ambush.
+
+    Returns gross size in shares (already divided by 0.975 for taker fee grossing).
+
+    NOTE: callers must pass the actual best ask (not a maker-discounted price)
+    so Kelly sees the real fill price — otherwise f_star is biased upward (C5 fix).
+    """
+    kr = 1.0
+    f_star = (p_win - ask_price) / max(1.0 - ask_price, 1e-6)
+    if f_star <= 0:
+        return 0.0
+    f_quarter = f_star / 4.0 * kr
+    dollar = balance * f_quarter
+    net_size = round(dollar / ask_price, 1) if ask_price > 0 else 0
+    net_size = max(min_bet, min(max_bet, net_size))
+    return round(net_size / 0.975, 2)
+
+
+def _phase_maker(
+    verdict: OracleVerdict,
+    token: str,
+    ask_price: float,
+    balance: float,
+    deadline_ts: float,
+    clob_client: Any,
+) -> Dict[str, Any]:
+    """Place a GTD maker order at (ask_price - maker_edge).
+
+    Real CLOB signature (C1 fix):
+        clob_client.place_order(
+            token_id, side, price, size,
+            order_type=OrderType.GTD,       # enum from py_clob_client.clob_types
+            expiration=unix_ts,              # Polymarket requires now + 60 + desired_lifetime
+        )
+
+    No `client_order_id` kwarg exists in the real API (C1 fix). Oracle orders
+    are tracked by the server-returned order_id in _active_orders[coin] and
+    persisted to disk for orphan recovery (C2 fix).
+
+    Returns:
+        {"status": "OPEN" | "ABORTED", "order_id": str, "buy_price": float,
+         "size": float, "reason": str}
+    """
+    from py_clob_client.clob_types import OrderType as _OT
+    from py_clob_client.order_builder.constants import BUY as _BUY
+
+    cfg = _get_oracle_config()
+    coin = verdict.details.get("coin", "?")
+
+    # Per-coin lock: reject if there's already an active order for this coin.
+    # This is the *real* per-coin mutual exclusion, protected by _orders_lock (I2).
+    with _orders_lock:
+        if coin in _active_orders:
+            return {
+                "status": "ABORTED",
+                "order_id": None,
+                "buy_price": 0.0,
+                "size": 0.0,
+                "reason": "COIN_LOCKED: active order exists",
+            }
+        # Reserve the slot immediately so a concurrent caller can't race in.
+        _active_orders[coin] = {
+            "order_id": None,
+            "phase": "RESERVED",
+            "opened_ts": verdict.ts,
+        }
+        _persist_active_orders()
+
+    try:
+        # Upper-bound tick guard (M3 fix): Polymarket rejects <=0.01 or >=0.99
+        if ask_price <= 0.01 or ask_price >= 0.99:
+            with _orders_lock:
+                _active_orders.pop(coin, None)
+                _persist_active_orders()
+            return {
+                "status": "ABORTED", "order_id": None,
+                "buy_price": 0.0, "size": 0.0,
+                "reason": f"ASK_OUT_OF_RANGE: {ask_price}",
+            }
+
+        # Price below ask by maker_edge (ambush-style), clamped to valid tick range
+        buy_price = max(0.02, min(0.98, round(ask_price - cfg["maker_edge"], 2)))
+
+        # C5 fix: Kelly sizing uses the REAL ask (not the maker-discounted price).
+        size = _compute_kelly_size(
+            balance=balance,
+            p_win=verdict.p_up or 0.0,
+            ask_price=ask_price,
+            min_bet=cfg["min_bet_size"],
+            max_bet=cfg["max_bet_size"],
+        )
+        if size <= 0:
+            with _orders_lock:
+                _active_orders.pop(coin, None)
+                _persist_active_orders()
+            return {
+                "status": "ABORTED", "order_id": None,
+                "buy_price": buy_price, "size": 0.0,
+                "reason": "KELLY_ZERO: f_star non-positive",
+            }
+
+        # CRIT-2 fix: GTD expiry = max(deadline_ts - 5, now + 60)
+        now_ts = _time_module.time()
+        target_expiry = int(deadline_ts) - 5
+        gtd_expiry = max(target_expiry, int(now_ts) + 60)
+
+        try:
+            result = clob_client.place_order(
+                token, _BUY, buy_price, size,
+                order_type=_OT.GTD,
+                expiration=gtd_expiry,
+            )
+        except Exception as exc:
+            with _orders_lock:
+                _active_orders.pop(coin, None)
+                _persist_active_orders()
+            return {
+                "status": "ABORTED", "order_id": None,
+                "buy_price": buy_price, "size": size,
+                "reason": f"CLOB_EXCEPTION: {exc}",
+            }
+
+        if not result or not result.get("success"):
+            err = (result or {}).get("status") or (result or {}).get("error", "unknown")
+            with _orders_lock:
+                _active_orders.pop(coin, None)
+                _persist_active_orders()
+            return {
+                "status": "ABORTED", "order_id": None,
+                "buy_price": buy_price, "size": size,
+                "reason": f"CLOB_REJECT: {err}",
+            }
+
+        order_id = result.get("order_id") or "?"
+        with _orders_lock:
+            _active_orders[coin] = {
+                "order_id": order_id,
+                "phase": "MAKER",
+                "buy_price": buy_price,
+                "size": size,
+                "token": token,
+                "opened_ts": verdict.ts,
+                "deadline_ts": deadline_ts,
+                "p_up": verdict.p_up,  # IMP-2: store for handle_maker_timeout
+            }
+            _persist_active_orders()
+
+        # C6 fix: cooldown is recorded only on confirmed OPEN
+        _record_cooldown(coin, verdict.ts)
+
+        return {
+            "status": "OPEN",
+            "order_id": order_id,
+            "buy_price": buy_price,
+            "size": size,
+            "reason": "OK",
+        }
+    except Exception as outer_exc:
+        # Belt-and-suspenders: any unexpected error must unlock the coin slot.
+        with _orders_lock:
+            _active_orders.pop(coin, None)
+            _persist_active_orders()
+        return {
+            "status": "ABORTED", "order_id": None,
+            "buy_price": 0.0, "size": 0.0,
+            "reason": f"UNEXPECTED: {outer_exc}",
+        }

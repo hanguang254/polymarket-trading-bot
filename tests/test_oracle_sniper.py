@@ -660,3 +660,195 @@ def test_log_oracle_verdict_dedup_does_not_suppress_buy(tmp_path, monkeypatch):
     lines = log_file.read_text().strip().splitlines()
     # BUY verdicts must never be deduped.
     assert len(lines) == 3
+
+
+# ═══ Tests for _phase_maker ═══
+
+from unittest.mock import MagicMock
+
+# Real _parse_response shape (C1/C3 fix): {success, matched, status, order_id, making, taking, raw}
+def _clob_ok(order_id="OID_abc123", taking=0.0):
+    return {
+        "success": True, "matched": taking > 0,
+        "status": "LIVE" if taking == 0 else "MATCHED",
+        "order_id": order_id, "making": 0.0, "taking": taking, "raw": "",
+    }
+
+
+def _clob_err(status="REJECTED", error="insufficient liquidity"):
+    return {
+        "success": False, "matched": False, "status": status,
+        "order_id": None, "making": 0, "taking": 0, "error": error, "raw": error,
+    }
+
+
+def test_phase_maker_places_gtd_order_success(oracle_env):
+    from ai_trader.oracle_sniper import _phase_maker, OracleVerdict, _reset_oracle_state
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_order.return_value = _clob_ok("OID_abc123")
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER", reason="OK",
+        details={"coin": "BTC", "cl_price": 71000.0, "remaining": 25.0},
+        ts=_time_module.time(),
+    )
+
+    result = _phase_maker(
+        verdict=v, token="0xtoken", ask_price=0.68,
+        balance=20.0, deadline_ts=v.ts + 25.0,
+        clob_client=fake_clob,
+    )
+
+    assert result["status"] == "OPEN"
+    assert result["order_id"] == "OID_abc123"
+    assert result["buy_price"] < 0.68  # maker price is below ask by edge
+
+    # Verify call args: positional + order_type enum + expiration int (no client_order_id)
+    fake_clob.place_order.assert_called_once()
+    args, kwargs = fake_clob.place_order.call_args
+    assert len(args) == 4  # token, side, price, size
+    assert kwargs.get("order_type") is not None
+    assert "expiration" in kwargs
+    assert "client_order_id" not in kwargs  # real API doesn't accept it
+
+
+def test_phase_maker_kelly_uses_real_ask_not_buy_price(oracle_env):
+    """C5 fix: Kelly sizing passes ask_price, not the maker-discounted buy_price."""
+    from ai_trader.oracle_sniper import _phase_maker, OracleVerdict, _reset_oracle_state, _compute_kelly_size
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_order.return_value = _clob_ok("OID1")
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER", reason="OK",
+        details={"coin": "BTC"}, ts=_time_module.time(),
+    )
+    ask = 0.68
+
+    result = _phase_maker(
+        verdict=v, token="0xtoken", ask_price=ask, balance=20.0,
+        deadline_ts=v.ts + 25.0, clob_client=fake_clob,
+    )
+    # Expected: size computed from ask=0.68, not from buy_price=0.668
+    expected_size = _compute_kelly_size(
+        balance=20.0, p_win=0.95, ask_price=ask, min_bet=2.0, max_bet=3.0,
+    )
+    assert result["size"] == expected_size
+
+
+def test_phase_maker_clob_failure_aborts_and_unlocks(oracle_env):
+    from ai_trader.oracle_sniper import _phase_maker, OracleVerdict, _reset_oracle_state, _active_orders
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_order.return_value = _clob_err("FAILED", "insufficient liquidity")
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER", reason="OK",
+        details={"coin": "BTC"}, ts=_time_module.time(),
+    )
+
+    result = _phase_maker(
+        verdict=v, token="0xtoken", ask_price=0.68,
+        balance=20.0, deadline_ts=v.ts + 25.0,
+        clob_client=fake_clob,
+    )
+
+    assert result["status"] == "ABORTED"
+    assert "insufficient" in result["reason"] or "FAILED" in result["reason"]
+    # Crucial: coin slot must be unlocked so the next tick can try again
+    assert "BTC" not in _active_orders
+
+
+def test_phase_maker_coin_locked_rejected(oracle_env):
+    """Per-coin lock (I2): second call while first is RESERVED returns COIN_LOCKED."""
+    from ai_trader.oracle_sniper import _phase_maker, OracleVerdict, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    with _orders_lock:
+        _active_orders["BTC"] = {"order_id": "OID_prev", "phase": "MAKER", "opened_ts": 1000.0}
+
+    fake_clob = MagicMock()
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER", reason="OK",
+        details={"coin": "BTC"}, ts=1001.0,
+    )
+    result = _phase_maker(
+        verdict=v, token="0xtoken", ask_price=0.68, balance=20.0,
+        deadline_ts=1025.0, clob_client=fake_clob,
+    )
+    assert result["status"] == "ABORTED"
+    assert "COIN_LOCKED" in result["reason"]
+    fake_clob.place_order.assert_not_called()
+
+
+def test_phase_maker_ask_out_of_range(oracle_env):
+    """M3: ask <= 0.01 or >= 0.99 → ASK_OUT_OF_RANGE, no order placed."""
+    from ai_trader.oracle_sniper import _phase_maker, OracleVerdict, _reset_oracle_state
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER", reason="OK",
+        details={"coin": "BTC"}, ts=_time_module.time(),
+    )
+    result = _phase_maker(
+        verdict=v, token="0xtoken", ask_price=0.995, balance=20.0,
+        deadline_ts=v.ts + 25.0, clob_client=fake_clob,
+    )
+    assert result["status"] == "ABORTED"
+    assert "ASK_OUT_OF_RANGE" in result["reason"]
+    fake_clob.place_order.assert_not_called()
+
+
+def test_phase_maker_gtd_expiry_bounded(oracle_env):
+    """CRIT-2 fix: GTD expiry = max(deadline_ts - 5, now + 60)."""
+    from ai_trader.oracle_sniper import _phase_maker, OracleVerdict, _reset_oracle_state
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_order.return_value = _clob_ok("OID1")
+
+    now = _time_module.time()
+    deadline = now + 25.0
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER", reason="OK",
+        details={"coin": "BTC"}, ts=now,
+    )
+    _phase_maker(
+        verdict=v, token="0xtoken", ask_price=0.68, balance=20.0,
+        deadline_ts=deadline, clob_client=fake_clob,
+    )
+
+    _, kwargs = fake_clob.place_order.call_args
+    expiration = kwargs["expiration"]
+    # Security threshold satisfied
+    assert expiration >= int(now) + 60
+    # Tight upper bound: expiry <= max(deadline-5, now+60) + tolerance
+    expected_upper = max(int(deadline) - 5, int(now) + 60)
+    assert expiration <= expected_upper + 2  # 2s tolerance for time.time() drift
+
+
+def test_phase_maker_records_cooldown_on_success(oracle_env):
+    """C6 fix: cooldown is recorded only on OPEN, not earlier."""
+    from ai_trader.oracle_sniper import _phase_maker, OracleVerdict, _reset_oracle_state, _cooldown_check
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_order.return_value = _clob_ok("OID1")
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER", reason="OK",
+        details={"coin": "BTC"}, ts=1000.0,
+    )
+    _phase_maker(
+        verdict=v, token="0xtoken", ask_price=0.68, balance=20.0,
+        deadline_ts=1025.0, clob_client=fake_clob,
+    )
+    # Now cooldown should block within 5s
+    ok, reason = _cooldown_check("BTC", 1003.0, cooldown_sec=5.0)
+    assert ok is False
+    assert reason == "COOLDOWN"
