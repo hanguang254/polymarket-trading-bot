@@ -17,6 +17,7 @@ for the full design document.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional
 
@@ -51,3 +52,39 @@ class OracleVerdict:
     reason: str
     details: Dict[str, Any] = field(default_factory=dict)
     ts: float = 0.0
+
+
+# ─────────── Per-coin cooldown state ───────────
+# Module-level dict, process-local. Keyed by coin symbol.
+# Guarded by _cooldown_lock because _cooldown_check is called from both
+# the main loop and the sniper thread.
+_cooldown_lock = threading.Lock()
+_last_trigger_ts: Dict[str, float] = {}
+
+
+def _reset_cooldown_state() -> None:
+    """Test helper: clear all cooldown state."""
+    with _cooldown_lock:
+        _last_trigger_ts.clear()
+
+
+def _record_cooldown(coin: str, now_ts: float) -> None:
+    """Record the timestamp of a successful (non-rejected) trigger.
+
+    Called ONLY from _phase_maker (on OPEN) and _phase_taker (on FILLED).
+    NOT called from check_oracle_sniper — a passed verdict that later fails
+    at the CLOB step must not burn the 5s cooldown budget.
+    """
+    with _cooldown_lock:
+        _last_trigger_ts[coin] = now_ts
+
+
+def _cooldown_check(coin: str, now_ts: float, cooldown_sec: float) -> tuple[bool, Optional[str]]:
+    """Return (ok, reason). ok=True means proceed; reason='COOLDOWN' means blocked."""
+    with _cooldown_lock:
+        last = _last_trigger_ts.get(coin)
+    if last is None:
+        return True, None
+    if now_ts - last >= cooldown_sec:
+        return True, None
+    return False, "COOLDOWN"

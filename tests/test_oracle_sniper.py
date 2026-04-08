@@ -139,3 +139,41 @@ def test_get_price_delta_no_coin_tape():
     result = stream.get_price_delta("ETH", window_sec=15)
     assert result["stale"] is True
     assert result["n_trades"] == 0
+
+
+# ═══ Tests for cooldown gate ═══
+
+
+def test_cooldown_first_call_passes():
+    from ai_trader.oracle_sniper import _cooldown_check, _reset_cooldown_state
+    _reset_cooldown_state()
+    now = 1000.0
+    ok, reason = _cooldown_check("BTC", now, cooldown_sec=5.0)
+    assert ok is True
+    assert reason is None
+
+
+def test_cooldown_blocks_within_window():
+    from ai_trader.oracle_sniper import _cooldown_check, _record_cooldown, _reset_cooldown_state
+    _reset_cooldown_state()
+    _record_cooldown("BTC", 1000.0)
+    ok, reason = _cooldown_check("BTC", 1003.0, cooldown_sec=5.0)
+    assert ok is False
+    assert reason == "COOLDOWN"
+
+
+def test_cooldown_lifts_after_window():
+    from ai_trader.oracle_sniper import _cooldown_check, _record_cooldown, _reset_cooldown_state
+    _reset_cooldown_state()
+    _record_cooldown("BTC", 1000.0)
+    ok, reason = _cooldown_check("BTC", 1006.0, cooldown_sec=5.0)
+    assert ok is True
+    assert reason is None
+
+
+def test_cooldown_per_coin_isolation():
+    from ai_trader.oracle_sniper import _cooldown_check, _record_cooldown, _reset_cooldown_state
+    _reset_cooldown_state()
+    _record_cooldown("BTC", 1000.0)
+    ok, _ = _cooldown_check("ETH", 1001.0, cooldown_sec=5.0)
+    assert ok is True  # ETH is a different coin, not affected by BTC cooldown
