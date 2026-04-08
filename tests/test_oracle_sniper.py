@@ -1004,3 +1004,148 @@ def test_phase_taker_accepts_pre_set_taker_phase(oracle_env):
     )
     assert result["status"] == "FILLED"
     fake_clob.place_fak_order.assert_called_once()
+
+
+def test_maker_timeout_switches_to_taker(oracle_env):
+    from ai_trader.oracle_sniper import handle_maker_timeout, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.cancel_order.return_value = True
+    fake_clob.place_fak_order.return_value = _clob_ok("OID_taker", taking=4.3)
+
+    with _orders_lock:
+        _active_orders["BTC"] = {
+            "order_id": "OID_maker_abc",
+            "phase": "MAKER",
+            "buy_price": 0.67,
+            "size": 4.4,
+            "token": "0xtoken",
+            "opened_ts": 1000.0,
+            "deadline_ts": 1025.0,
+        }
+
+    result = handle_maker_timeout(
+        coin="BTC",
+        token="0xtoken",
+        ask_price=0.68,
+        balance=20.0,
+        now_ts=1012.0,
+        p_up=0.95,
+        clob_client=fake_clob,
+    )
+
+    assert result["action"] == "SWITCHED_TO_TAKER"
+    assert result["taker_result"]["status"] == "FILLED"
+    fake_clob.cancel_order.assert_called_once_with("OID_maker_abc")
+    fake_clob.place_fak_order.assert_called_once()
+
+
+def test_maker_timeout_cancel_failure_aborts_without_taker(oracle_env):
+    from ai_trader.oracle_sniper import handle_maker_timeout, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.cancel_order.return_value = False
+
+    with _orders_lock:
+        _active_orders["BTC"] = {
+            "order_id": "OID_maker_abc",
+            "phase": "MAKER",
+            "buy_price": 0.67,
+            "size": 4.4,
+            "token": "0xtoken",
+            "opened_ts": 1000.0,
+            "deadline_ts": 1025.0,
+        }
+
+    result = handle_maker_timeout(
+        coin="BTC", token="0xtoken", ask_price=0.68, balance=20.0,
+        now_ts=1012.0, p_up=0.95, clob_client=fake_clob,
+    )
+
+    assert result["action"] == "ABORTED"
+    assert "CANCEL_FAILED" in result["reason"]
+    fake_clob.place_fak_order.assert_not_called()
+    assert "BTC" not in _active_orders
+
+
+def test_maker_timeout_above_switch_is_noop(oracle_env):
+    from ai_trader.oracle_sniper import handle_maker_timeout, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+
+    with _orders_lock:
+        _active_orders["BTC"] = {
+            "order_id": "OID_maker_abc",
+            "phase": "MAKER",
+            "buy_price": 0.67,
+            "size": 4.4,
+            "token": "0xtoken",
+            "opened_ts": 1000.0,
+            "deadline_ts": 1025.0,
+        }
+
+    result = handle_maker_timeout(
+        coin="BTC", token="0xtoken", ask_price=0.68, balance=20.0,
+        now_ts=1005.0, p_up=0.95, clob_client=fake_clob,
+    )
+
+    assert result["action"] == "HOLD"
+    fake_clob.cancel_order.assert_not_called()
+
+
+def test_maker_timeout_exactly_at_15s_switches(oracle_env):
+    """I6 boundary: remaining == taker_switch_sec → switch to taker."""
+    from ai_trader.oracle_sniper import handle_maker_timeout, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.cancel_order.return_value = True
+    fake_clob.place_fak_order.return_value = _clob_ok("OID_taker", taking=4.3)
+
+    with _orders_lock:
+        _active_orders["BTC"] = {
+            "order_id": "OID_maker_abc",
+            "phase": "MAKER",
+            "buy_price": 0.67,
+            "size": 4.4,
+            "token": "0xtoken",
+            "opened_ts": 1000.0,
+            "deadline_ts": 1025.0,
+        }
+
+    result = handle_maker_timeout(
+        coin="BTC", token="0xtoken", ask_price=0.68, balance=20.0,
+        now_ts=1010.0, p_up=0.95, clob_client=fake_clob,
+    )
+
+    assert result["action"] == "SWITCHED_TO_TAKER"
+
+
+def test_maker_timeout_taker_exception_still_unlocks_coin(oracle_env):
+    """I3 fix: if _phase_taker raises, coin must still be unlocked."""
+    from ai_trader.oracle_sniper import handle_maker_timeout, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.cancel_order.return_value = True
+    fake_clob.place_fak_order.side_effect = RuntimeError("simulated crash")
+
+    with _orders_lock:
+        _active_orders["BTC"] = {
+            "order_id": "OID_maker_abc",
+            "phase": "MAKER",
+            "buy_price": 0.67,
+            "size": 4.4,
+            "token": "0xtoken",
+            "opened_ts": 1000.0,
+            "deadline_ts": 1025.0,
+        }
+
+    result = handle_maker_timeout(
+        coin="BTC", token="0xtoken", ask_price=0.68, balance=20.0,
+        now_ts=1012.0, p_up=0.95, clob_client=fake_clob,
+    )
+    assert "BTC" not in _active_orders

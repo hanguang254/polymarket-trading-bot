@@ -734,3 +734,78 @@ def _phase_taker(
         with _orders_lock:
             _active_orders.pop(coin, None)
             _persist_active_orders()
+
+
+def handle_maker_timeout(
+    coin: str,
+    token: str,
+    ask_price: float,
+    balance: float,
+    now_ts: float,
+    p_up: float,
+    clob_client: Any,
+) -> Dict[str, Any]:
+    """Switch an active maker order to taker once the cutoff window is reached."""
+    cfg = _get_oracle_config()
+
+    with _orders_lock:
+        order = _active_orders.get(coin)
+        if not order or order.get("phase") != "MAKER":
+            return {"action": "HOLD", "reason": "NO_ACTIVE_MAKER", "taker_result": None}
+
+        deadline_ts = order.get("deadline_ts", now_ts)
+        remaining = deadline_ts - now_ts
+        if remaining > cfg["taker_switch_sec"]:
+            return {"action": "HOLD", "reason": f"REMAINING_{remaining:.1f}s", "taker_result": None}
+
+        order_id = order.get("order_id")
+        order["phase"] = "CANCELLING"
+        _persist_active_orders()
+
+    try:
+        cancelled = clob_client.cancel_order(order_id)
+    except Exception as exc:
+        with _orders_lock:
+            _active_orders.pop(coin, None)
+            _persist_active_orders()
+        return {"action": "ABORTED", "reason": f"CANCEL_EXCEPTION: {exc}", "taker_result": None}
+
+    if not cancelled:
+        with _orders_lock:
+            _active_orders.pop(coin, None)
+            _persist_active_orders()
+        return {"action": "ABORTED", "reason": "CANCEL_FAILED", "taker_result": None}
+
+    with _orders_lock:
+        if coin in _active_orders:
+            _active_orders[coin]["phase"] = "TAKER"
+            _persist_active_orders()
+
+    synthetic_verdict = OracleVerdict(
+        action="BUY",
+        direction=None,
+        p_up=p_up,
+        phase="TAKER",
+        reason="OK",
+        details={"coin": coin},
+        ts=now_ts,
+    )
+    try:
+        taker_result = _phase_taker(
+            verdict=synthetic_verdict,
+            token=token,
+            ask_price=ask_price,
+            balance=balance,
+            clob_client=clob_client,
+        )
+    except Exception as exc:
+        with _orders_lock:
+            _active_orders.pop(coin, None)
+            _persist_active_orders()
+        return {"action": "ABORTED", "reason": f"TAKER_EXCEPTION: {exc}", "taker_result": None}
+
+    return {
+        "action": "SWITCHED_TO_TAKER",
+        "reason": "OK",
+        "taker_result": taker_result,
+    }
