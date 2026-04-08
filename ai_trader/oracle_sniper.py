@@ -17,6 +17,7 @@ for the full design document.
 
 from __future__ import annotations
 
+import json as _json
 import os
 import threading
 import time as _time_module
@@ -357,7 +358,6 @@ def check_oracle_sniper(
 
 
 # ─────────── Log writer ───────────
-import json as _json
 
 # ─────────── Log dedup state ───────────
 # Per-coin "last REJECT reason" map. On state change (new REJECT reason OR
