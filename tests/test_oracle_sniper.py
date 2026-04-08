@@ -24,6 +24,14 @@ def _reset_binance_singleton():
         pass
 
 
+@pytest.fixture
+def oracle_env(monkeypatch):
+    """Explicit env fixture. Each test opts in and sets its own LIVE flag."""
+    monkeypatch.setenv("ORACLE_SNIPER_ENABLED", "1")
+    monkeypatch.setenv("ORACLE_SNIPER_LIVE", "1")  # override in tests that need shadow
+    return monkeypatch
+
+
 def test_oracle_verdict_dataclass_minimal():
     v = OracleVerdict(
         action="REJECT",
@@ -282,3 +290,234 @@ def test_binance_reversal_sparse_window_allow_with_warn():
     assert ok is True
     assert reason is None
     assert warn is True  # freshness-bottom fallback
+
+
+# ─────────── check_oracle_sniper() main entry ───────────
+
+from unittest.mock import patch
+from ai_trader.oracle_sniper import check_oracle_sniper
+
+
+class _StubSnapshot:
+    """Helper to build a chainlink snapshot dict."""
+    @staticmethod
+    def ok(price=71000.0, age_ms=500):
+        return {"price": price, "age_ms": age_ms, "stale": False}
+
+    @staticmethod
+    def missing():
+        return None
+
+    @staticmethod
+    def stale():
+        return {"price": 71000.0, "age_ms": 2500, "stale": False}
+
+
+def _stub_bn_allow(direction="UP"):
+    return {"delta_bps": 5.0, "n_trades": 40, "stale": False, "direction": direction}
+
+
+def _stub_bn_reverse(direction="DOWN"):
+    return {"delta_bps": -5.0, "n_trades": 40, "stale": False, "direction": direction}
+
+
+def _stub_bn_sparse():
+    return {"delta_bps": 0.0, "n_trades": 0, "stale": True, "direction": "FLAT"}
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_out_of_window(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok()
+    bn_mock.return_value = _stub_bn_allow()
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 45.0, now_ts=1000.0,
+    )
+    assert v.action == "REJECT"
+    assert v.reason == "OUT_OF_WINDOW"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_too_late(bn_mock, cl_mock, oracle_env):
+    """remaining < TOO_LATE_SEC (default 1.0s) → REJECT(TOO_LATE)."""
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok()
+    bn_mock.return_value = _stub_bn_allow()
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 0.5, now_ts=1000.0,
+    )
+    assert v.action == "REJECT"
+    assert v.reason == "TOO_LATE"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_cl_missing(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = None
+    bn_mock.return_value = _stub_bn_allow()
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v.action == "REJECT"
+    assert v.reason == "CL_MISSING"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_cl_stale(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.stale()
+    bn_mock.return_value = _stub_bn_allow()
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v.reason == "CL_STALE"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_accept_up_maker_phase(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=71000.0)
+    bn_mock.return_value = _stub_bn_allow("UP")
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v.action == "BUY"
+    assert v.direction == "UP"
+    assert v.phase == "MAKER"
+    assert v.p_up > 0.93
+    assert v.reason == "OK"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_accept_up_taker_phase(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=71000.0)
+    bn_mock.return_value = _stub_bn_allow("UP")
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 10.0, now_ts=1000.0,
+    )
+    assert v.action == "BUY"
+    assert v.direction == "UP"
+    assert v.phase == "TAKER"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_phase_boundary_exactly_15s(bn_mock, cl_mock, oracle_env):
+    """I6: At exactly remaining=15.0, phase should be TAKER (> is strict)."""
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=71000.0)
+    bn_mock.return_value = _stub_bn_allow("UP")
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 15.0, now_ts=1000.0,
+    )
+    assert v.action == "BUY"
+    assert v.phase == "TAKER"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_bn_contradict(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=71000.0)
+    bn_mock.return_value = _stub_bn_reverse("DOWN")
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v.action == "REJECT"
+    assert v.reason == "BN_CONTRADICT"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_bn_sparse_allow_with_warn(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=71000.0)
+    bn_mock.return_value = _stub_bn_sparse()
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v.action == "BUY"
+    assert v.details.get("bn_sparse_warn") is True
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_low_confidence(bn_mock, cl_mock, oracle_env):
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=70000.1)
+    bn_mock.return_value = _stub_bn_allow()
+    v = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=500.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v.action == "REJECT"
+    assert v.reason == "LOW_CONFIDENCE"
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_cooldown_not_recorded_on_verdict_alone(bn_mock, cl_mock, oracle_env):
+    """C6 fix: check_oracle_sniper no longer burns cooldown on a BUY verdict."""
+    from ai_trader.oracle_sniper import _reset_cooldown_state
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=71000.0)
+    bn_mock.return_value = _stub_bn_allow("UP")
+    v1 = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v1.action == "BUY"
+    v2 = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 22.0, now_ts=1003.0,
+    )
+    assert v2.action == "BUY"  # cooldown was NOT recorded
+
+
+@patch("ai_trader.oracle_sniper._get_chainlink_snapshot")
+@patch("ai_trader.oracle_sniper._get_binance_delta")
+def test_check_cooldown_blocks_after_explicit_record(bn_mock, cl_mock, oracle_env):
+    """After _record_cooldown is called (simulating a successful phase_maker),
+    the next check within 5s is blocked."""
+    from ai_trader.oracle_sniper import _reset_cooldown_state, _record_cooldown
+    _reset_cooldown_state()
+    cl_mock.return_value = _StubSnapshot.ok(price=71000.0)
+    bn_mock.return_value = _stub_bn_allow("UP")
+    v1 = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 25.0, now_ts=1000.0,
+    )
+    assert v1.action == "BUY"
+    _record_cooldown("BTC", 1000.0)
+    v2 = check_oracle_sniper(
+        coin="BTC", strike=70000.0, atr=50.0,
+        deadline_ts=1000.0 + 22.0, now_ts=1003.0,
+    )
+    assert v2.action == "REJECT"
+    assert v2.reason == "COOLDOWN"

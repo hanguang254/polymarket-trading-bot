@@ -169,3 +169,189 @@ def _binance_reversal_check(
     if direction == "DOWN" and delta_bps > reverse_bps_threshold:
         return False, "BN_CONTRADICT", False
     return True, None, False
+
+
+import os
+import time as _time_module
+
+
+# ─────────── Source accessors (seam for mocking) ───────────
+
+def _get_chainlink_snapshot(coin: str) -> Optional[Dict[str, Any]]:
+    """Thin wrapper over chainlink_stream.get_snapshot so tests can mock at module level."""
+    try:
+        from ai_trader.polymarket_rtds import chainlink_stream
+        return chainlink_stream.get_snapshot(coin)
+    except Exception:
+        return None
+
+
+def _get_binance_delta(coin: str, window_sec: int) -> Dict[str, Any]:
+    """Thin wrapper over binance_api.get_price_delta so tests can mock at module level."""
+    try:
+        from ai_trader.binance_api import get_price_delta
+        return get_price_delta(coin, window_sec)
+    except Exception:
+        return {"delta_bps": 0.0, "n_trades": 0, "stale": True, "direction": "FLAT"}
+
+
+# ─────────── Config loader with fallbacks ───────────
+
+def _env_str(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Read an env var, treating whitespace-only as unset (I7 fix)."""
+    v = os.environ.get(key, default)
+    if v is None:
+        return default
+    v = str(v).strip()
+    return v if v else default
+
+
+def _env_float(key: str, default: str) -> float:
+    return float(_env_str(key, default) or default)
+
+
+def _env_int(key: str, default: str) -> int:
+    return int(float(_env_str(key, default) or default))
+
+
+def _env_bool(key: str, default: str) -> bool:
+    return (_env_str(key, default) or default) == "1"
+
+
+def _get_oracle_config() -> Dict[str, Any]:
+    """Read all ORACLE_SNIPER_* env vars with defaults. Called per check (cheap).
+
+    Falls back to global MIN_BET_SIZE / MAX_BET_SIZE when ORACLE_SNIPER_MIN/MAX_BET_SIZE
+    are unset or whitespace (I7).
+    """
+    return {
+        "enabled": _env_bool("ORACLE_SNIPER_ENABLED", "1"),
+        "live": _env_bool("ORACLE_SNIPER_LIVE", "0"),
+        "tail_sec": _env_float("ORACLE_SNIPER_TAIL_SEC", "30"),
+        "taker_switch_sec": _env_float("ORACLE_SNIPER_TAKER_SWITCH_SEC", "15"),
+        "p_up_threshold": _env_float("ORACLE_SNIPER_P_UP_THRESHOLD", "0.93"),
+        "cl_stale_sec": _env_float("ORACLE_SNIPER_CL_STALE_SEC", "1.0"),
+        "bn_window_sec": _env_int("ORACLE_SNIPER_BN_WINDOW_SEC", "15"),
+        "bn_reverse_bps": _env_float("ORACLE_SNIPER_BN_REVERSE_BPS", "2"),
+        "cooldown_sec": _env_float("ORACLE_SNIPER_COOLDOWN_SEC", "5"),
+        "maker_edge": _env_float("ORACLE_SNIPER_MAKER_EDGE", "0.012"),
+        "too_late_sec": _env_float("ORACLE_SNIPER_TOO_LATE_SEC", "1.0"),
+        "min_bet_size": float(
+            _env_str("ORACLE_SNIPER_MIN_BET_SIZE") or _env_str("MIN_BET_SIZE", "2") or "2"
+        ),
+        "max_bet_size": float(
+            _env_str("ORACLE_SNIPER_MAX_BET_SIZE") or _env_str("MAX_BET_SIZE", "3") or "3"
+        ),
+    }
+
+
+# ─────────── Main entry ───────────
+
+def check_oracle_sniper(
+    coin: str,
+    strike: float,
+    atr: float,
+    deadline_ts: float,
+    now_ts: Optional[float] = None,
+) -> OracleVerdict:
+    """Run the Oracle Sniper validation pipeline and return an OracleVerdict.
+
+    Pipeline (fail-fast):
+      1. Cooldown check     → REJECT(COOLDOWN)
+      2. Window check       → REJECT(OUT_OF_WINDOW)
+      3. Chainlink freshness → REJECT(CL_MISSING / CL_STALE)
+      4. Confidence compute  → REJECT(LOW_CONFIDENCE / COMPUTE_ERROR)
+      5. Binance reversal    → REJECT(BN_CONTRADICT)
+      6. Phase routing       → BUY (MAKER or TAKER)
+
+    Does NOT place any orders — returns a verdict for the caller to act on.
+    Does NOT record cooldown — that fires only on confirmed OPEN/FILLED in phase handlers.
+    """
+    cfg = _get_oracle_config()
+    if now_ts is None:
+        now_ts = _time_module.time()
+
+    remaining = deadline_ts - now_ts
+    base_details: Dict[str, Any] = {
+        "coin": coin,
+        "strike": strike,
+        "atr": atr,
+        "remaining": round(remaining, 3),
+        "deadline_ts": deadline_ts,
+    }
+
+    # ── 1. Cooldown ─────────────────────────────────────────────
+    ok, reason = _cooldown_check(coin, now_ts, cfg["cooldown_sec"])
+    if not ok:
+        return OracleVerdict(
+            action="REJECT", direction=None, p_up=None, phase=None,
+            reason=reason or "COOLDOWN", details=dict(base_details), ts=now_ts,
+        )
+
+    # ── 2. Window (0, tail_sec] ─────────────────────────────────
+    if not (0 < remaining <= cfg["tail_sec"]):
+        return OracleVerdict(
+            action="REJECT", direction=None, p_up=None, phase=None,
+            reason="OUT_OF_WINDOW", details=dict(base_details), ts=now_ts,
+        )
+
+    # ── 2b. TOO_LATE guard ──────────────────────────────────────
+    if remaining < cfg["too_late_sec"]:
+        return OracleVerdict(
+            action="REJECT", direction=None, p_up=None, phase=None,
+            reason="TOO_LATE", details=dict(base_details), ts=now_ts,
+        )
+
+    # ── 3. Chainlink freshness ──────────────────────────────────
+    cl_snapshot = _get_chainlink_snapshot(coin)
+    ok, reason, cl_details = _chainlink_freshness_check(cl_snapshot, cfg["cl_stale_sec"])
+    base_details.update(cl_details)
+    if not ok:
+        return OracleVerdict(
+            action="REJECT", direction=None, p_up=None, phase=None,
+            reason=reason or "CL_MISSING", details=dict(base_details), ts=now_ts,
+        )
+
+    # ── 4. Confidence ───────────────────────────────────────────
+    conf = _compute_confidence(
+        price=cl_details["cl_price"],
+        strike=strike,
+        atr=atr,
+        remaining_sec=remaining,
+        threshold=cfg["p_up_threshold"],
+    )
+    if conf["reason"] is not None:
+        return OracleVerdict(
+            action="REJECT", direction=None, p_up=conf["p_up"], phase=None,
+            reason=conf["reason"], details=dict(base_details), ts=now_ts,
+        )
+    direction = conf["direction"]
+    p_up = conf["p_up"]
+    base_details["p_up"] = round(p_up, 6)
+
+    # ── 5. Binance reversal ─────────────────────────────────────
+    bn_delta = _get_binance_delta(coin, cfg["bn_window_sec"])
+    base_details["bn_delta_bps"] = bn_delta.get("delta_bps", 0.0)
+    base_details["bn_n_trades"] = bn_delta.get("n_trades", 0)
+    ok, reason, warn = _binance_reversal_check(bn_delta, direction, cfg["bn_reverse_bps"])
+    if warn:
+        base_details["bn_sparse_warn"] = True
+    if not ok:
+        return OracleVerdict(
+            action="REJECT", direction=direction, p_up=p_up, phase=None,
+            reason=reason or "BN_CONTRADICT", details=dict(base_details), ts=now_ts,
+        )
+
+    # ── 6. Phase routing ────────────────────────────────────────
+    phase: Literal["MAKER", "TAKER"] = (
+        "MAKER" if remaining > cfg["taker_switch_sec"] else "TAKER"
+    )
+    # NOTE: cooldown is NOT recorded here. It fires only on confirmed
+    # order placement success inside _phase_maker (OPEN) or _phase_taker
+    # (FILLED). A passed verdict that later fails at CLOB must not
+    # burn the 5s cooldown budget (C6 fix).
+    action: Literal["BUY", "SHADOW"] = "BUY" if cfg["live"] else "SHADOW"
+    return OracleVerdict(
+        action=action, direction=direction, p_up=p_up, phase=phase,
+        reason="OK", details=dict(base_details), ts=now_ts,
+    )
