@@ -521,3 +521,142 @@ def test_check_cooldown_blocks_after_explicit_record(bn_mock, cl_mock, oracle_en
     )
     assert v2.action == "REJECT"
     assert v2.reason == "COOLDOWN"
+
+
+# ═══ Tests for log writer ═══
+
+import json
+import os
+from pathlib import Path
+
+
+def test_log_oracle_verdict_writes_jsonl(tmp_path, monkeypatch):
+    from ai_trader.oracle_sniper import log_oracle_verdict, OracleVerdict
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.9563, phase="MAKER",
+        reason="OK",
+        details={"coin": "BTC", "cl_price": 70432.5, "remaining": 19.88},
+        ts=1712345678.123,
+    )
+    log_oracle_verdict(v)
+
+    assert log_file.exists()
+    lines = log_file.read_text().strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["action"] == "BUY"
+    assert record["direction"] == "UP"
+    assert record["p_up"] == 0.9563
+    assert record["phase"] == "MAKER"
+    assert record["reason"] == "OK"
+    assert record["details"]["coin"] == "BTC"
+    assert record["ts"] == 1712345678.123
+
+
+def test_log_oracle_verdict_dedups_repeated_reject(tmp_path, monkeypatch):
+    from ai_trader.oracle_sniper import log_oracle_verdict, OracleVerdict, _reset_log_dedup_state
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+    _reset_log_dedup_state()
+
+    for i in range(5):
+        v = OracleVerdict(
+            action="REJECT", direction=None, p_up=None, phase=None,
+            reason="COOLDOWN",
+            details={"coin": "BTC", "remaining": 20.0 - i},
+            ts=1712345678.0 + i,
+        )
+        log_oracle_verdict(v)
+
+    lines = log_file.read_text().strip().splitlines()
+    # Only the first COOLDOWN reject should be written; subsequent ones deduped.
+    assert len(lines) == 1
+
+
+def test_log_oracle_verdict_dedups_cl_stale_flood(tmp_path, monkeypatch):
+    """I1 fix: CL_STALE must dedup too (was flooding at 50ms cadence)."""
+    from ai_trader.oracle_sniper import log_oracle_verdict, OracleVerdict, _reset_log_dedup_state
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+    _reset_log_dedup_state()
+
+    for i in range(20):
+        v = OracleVerdict(
+            action="REJECT", direction=None, p_up=None, phase=None,
+            reason="CL_STALE",
+            details={"coin": "BTC", "age_ms": 2500 + i * 50},
+            ts=1712345678.0 + i * 0.05,
+        )
+        log_oracle_verdict(v)
+
+    lines = log_file.read_text().strip().splitlines()
+    assert len(lines) == 1  # 20 calls → 1 logged line
+
+
+def test_log_oracle_verdict_dedup_clears_on_buy(tmp_path, monkeypatch):
+    """After a BUY, the per-coin dedup state clears so next REJECT writes once."""
+    from ai_trader.oracle_sniper import log_oracle_verdict, OracleVerdict, _reset_log_dedup_state
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+    _reset_log_dedup_state()
+
+    reject = OracleVerdict(
+        action="REJECT", direction=None, p_up=None, phase=None,
+        reason="COOLDOWN", details={"coin": "BTC"}, ts=1000.0,
+    )
+    buy = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="MAKER",
+        reason="OK", details={"coin": "BTC"}, ts=1001.0,
+    )
+    reject2 = OracleVerdict(
+        action="REJECT", direction=None, p_up=None, phase=None,
+        reason="COOLDOWN", details={"coin": "BTC"}, ts=1002.0,
+    )
+
+    log_oracle_verdict(reject)
+    log_oracle_verdict(buy)
+    log_oracle_verdict(reject2)
+
+    lines = log_file.read_text().strip().splitlines()
+    # REJECT → 1 line, BUY → 1 line (clears dedup), REJECT → 1 line again
+    assert len(lines) == 3
+
+
+def test_log_oracle_verdict_per_coin_isolation(tmp_path, monkeypatch):
+    """Dedup is per-coin: BTC COOLDOWN doesn't suppress ETH COOLDOWN."""
+    from ai_trader.oracle_sniper import log_oracle_verdict, OracleVerdict, _reset_log_dedup_state
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+    _reset_log_dedup_state()
+
+    for coin in ("BTC", "ETH", "BTC", "ETH"):
+        v = OracleVerdict(
+            action="REJECT", direction=None, p_up=None, phase=None,
+            reason="COOLDOWN", details={"coin": coin}, ts=1000.0,
+        )
+        log_oracle_verdict(v)
+
+    lines = log_file.read_text().strip().splitlines()
+    # BTC writes once (first), ETH writes once (first), BTC/ETH deduped after
+    assert len(lines) == 2
+
+
+def test_log_oracle_verdict_dedup_does_not_suppress_buy(tmp_path, monkeypatch):
+    from ai_trader.oracle_sniper import log_oracle_verdict, OracleVerdict, _reset_log_dedup_state
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+    _reset_log_dedup_state()
+
+    for i in range(3):
+        v = OracleVerdict(
+            action="BUY", direction="UP", p_up=0.95, phase="MAKER",
+            reason="OK", details={"coin": "BTC"}, ts=1712345678.0 + i,
+        )
+        log_oracle_verdict(v)
+
+    lines = log_file.read_text().strip().splitlines()
+    # BUY verdicts must never be deduped.
+    assert len(lines) == 3

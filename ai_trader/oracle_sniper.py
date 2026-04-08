@@ -354,3 +354,67 @@ def check_oracle_sniper(
         action=action, direction=direction, p_up=p_up, phase=phase,
         reason="OK", details=dict(base_details), ts=now_ts,
     )
+
+
+# ─────────── Log writer ───────────
+import json as _json
+
+# ─────────── Log dedup state ───────────
+# Per-coin "last REJECT reason" map. On state change (new REJECT reason OR
+# any BUY/SHADOW action), one log line is written and the dedup clears.
+# BUY / SHADOW actions ALWAYS write (never deduped).
+_log_lock = threading.Lock()
+_log_last_reason_by_coin: Dict[str, str] = {}
+
+# All REJECT reasons dedup — not just COOLDOWN/OUT_OF_WINDOW (I1 fix).
+# The reason for dedup is log-volume containment during the 30s tail window
+# which can be polled at 50ms cadence.
+_DEDUP_ACTIONS = {"REJECT"}
+
+
+def _reset_log_dedup_state() -> None:
+    """Test helper."""
+    with _log_lock:
+        _log_last_reason_by_coin.clear()
+
+
+def _log_path() -> str:
+    return _env_str("ORACLE_SNIPER_LOG_PATH", "logs/oracle_sniper.jsonl") or "logs/oracle_sniper.jsonl"
+
+
+def log_oracle_verdict(v: OracleVerdict) -> None:
+    """Write a verdict as a JSONL record.
+
+    Dedup semantics (I1 + M8 fix):
+      - REJECT verdicts are deduped per-coin: only write if the reason
+        differs from the previous REJECT for that coin.
+      - BUY / SHADOW verdicts ALWAYS write and clear the per-coin dedup
+        state so the next REJECT (if any) writes once.
+    """
+    coin = v.details.get("coin", "?")
+
+    with _log_lock:
+        last_reason = _log_last_reason_by_coin.get(coin)
+        if v.action in _DEDUP_ACTIONS:
+            if last_reason == v.reason:
+                return  # same REJECT reason, silent
+            _log_last_reason_by_coin[coin] = v.reason
+        else:
+            # BUY / SHADOW → always write, clear per-coin dedup state
+            _log_last_reason_by_coin.pop(coin, None)
+
+    record = {
+        "ts": v.ts,
+        "action": v.action,
+        "direction": v.direction,
+        "p_up": v.p_up,
+        "phase": v.phase,
+        "reason": v.reason,
+        "details": v.details,
+    }
+    path = _log_path()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(_json.dumps(record, ensure_ascii=False) + "\n")
