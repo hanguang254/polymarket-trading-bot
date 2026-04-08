@@ -640,3 +640,97 @@ def _phase_maker(
             "buy_price": 0.0, "size": 0.0,
             "reason": f"UNEXPECTED: {outer_exc}",
         }
+
+
+def _phase_taker(
+    verdict: OracleVerdict,
+    token: str,
+    ask_price: float,
+    balance: float,
+    clob_client: Any,
+) -> Dict[str, Any]:
+    """Place a FAK taker order at ask_price.
+
+    Uses clob_client.place_fak_order: partial fills are accepted as-is and
+    the remainder is cancelled by the exchange.
+
+    Clears the per-coin lock in finally so a failed taker path never leaves
+    the coin stuck.
+    """
+    from py_clob_client.order_builder.constants import BUY as _BUY
+
+    cfg = _get_oracle_config()
+    coin = verdict.details.get("coin", "?")
+
+    if ask_price <= 0.01 or ask_price >= 0.99:
+        return {
+            "status": "ABORTED",
+            "filled_size": 0.0,
+            "partial": False,
+            "reason": f"ASK_OUT_OF_RANGE: {ask_price}",
+        }
+
+    with _orders_lock:
+        existing = _active_orders.get(coin)
+        if existing is not None and existing.get("phase") != "TAKER":
+            return {
+                "status": "ABORTED",
+                "filled_size": 0.0,
+                "partial": False,
+                "reason": "COIN_LOCKED: active order exists",
+            }
+        _active_orders[coin] = {
+            "order_id": None,
+            "phase": "TAKER",
+            "opened_ts": verdict.ts,
+        }
+        _persist_active_orders()
+
+    try:
+        size = _compute_kelly_size(
+            balance=balance,
+            p_win=verdict.p_up or 0.0,
+            ask_price=ask_price,
+            min_bet=cfg["min_bet_size"],
+            max_bet=cfg["max_bet_size"],
+        )
+        if size <= 0:
+            return {
+                "status": "ABORTED",
+                "filled_size": 0.0,
+                "partial": False,
+                "reason": "KELLY_ZERO: f_star non-positive",
+            }
+
+        try:
+            result = clob_client.place_fak_order(token, _BUY, ask_price, size)
+        except Exception as exc:
+            return {
+                "status": "ABORTED",
+                "filled_size": 0.0,
+                "partial": False,
+                "reason": f"CLOB_EXCEPTION: {exc}",
+            }
+
+        if not result or not result.get("success"):
+            err = (result or {}).get("error") or (result or {}).get("status") or "unknown"
+            return {
+                "status": "ABORTED",
+                "filled_size": 0.0,
+                "partial": False,
+                "reason": f"CLOB_REJECT: {err}",
+            }
+
+        filled = float(result.get("taking", size) or 0.0)
+        partial = filled < size
+        _record_cooldown(coin, verdict.ts)
+        return {
+            "status": "FILLED",
+            "filled_size": filled,
+            "partial": partial,
+            "reason": "OK",
+        }
+    finally:
+        with _orders_lock:
+            _active_orders.pop(coin, None)
+            _persist_active_orders()

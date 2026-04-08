@@ -852,3 +852,155 @@ def test_phase_maker_records_cooldown_on_success(oracle_env):
     ok, reason = _cooldown_check("BTC", 1003.0, cooldown_sec=5.0)
     assert ok is False
     assert reason == "COOLDOWN"
+
+
+def test_phase_taker_fak_full_fill(oracle_env):
+    from ai_trader.oracle_sniper import _phase_taker, OracleVerdict, _reset_oracle_state
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_fak_order.return_value = _clob_ok("OID_taker", taking=4.3)
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="TAKER", reason="OK",
+        details={"coin": "BTC", "cl_price": 71000.0, "remaining": 10.0},
+        ts=1000.0,
+    )
+
+    result = _phase_taker(
+        verdict=v, token="0xtoken", ask_price=0.68,
+        balance=20.0, clob_client=fake_clob,
+    )
+
+    assert result["status"] == "FILLED"
+    assert result["filled_size"] == 4.3
+    fake_clob.place_fak_order.assert_called_once()
+    args, _ = fake_clob.place_fak_order.call_args
+    assert len(args) == 4
+
+
+def test_phase_taker_fak_partial_fill(oracle_env):
+    from ai_trader.oracle_sniper import _phase_taker, OracleVerdict, _reset_oracle_state
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_fak_order.return_value = _clob_ok("OID_taker", taking=2.0)
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="TAKER", reason="OK",
+        details={"coin": "BTC", "cl_price": 71000.0, "remaining": 10.0},
+        ts=1000.0,
+    )
+
+    result = _phase_taker(
+        verdict=v, token="0xtoken", ask_price=0.68,
+        balance=20.0, clob_client=fake_clob,
+    )
+
+    assert result["status"] == "FILLED"
+    assert result["filled_size"] == 2.0
+    assert result["partial"] is True
+
+
+def test_phase_taker_clob_failure_aborts(oracle_env):
+    from ai_trader.oracle_sniper import _phase_taker, OracleVerdict, _reset_oracle_state
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_fak_order.return_value = _clob_err("REJECTED", "no liquidity")
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="TAKER", reason="OK",
+        details={"coin": "BTC"}, ts=1000.0,
+    )
+
+    result = _phase_taker(
+        verdict=v, token="0xtoken", ask_price=0.68,
+        balance=20.0, clob_client=fake_clob,
+    )
+
+    assert result["status"] == "ABORTED"
+    assert "no liquidity" in result["reason"] or "REJECTED" in result["reason"]
+
+
+def test_phase_taker_records_cooldown_on_fill(oracle_env):
+    """C6 fix: cooldown is recorded only on FILLED."""
+    from ai_trader.oracle_sniper import _phase_taker, OracleVerdict, _reset_oracle_state, _cooldown_check
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_fak_order.return_value = _clob_ok("OID1", taking=4.3)
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="TAKER", reason="OK",
+        details={"coin": "BTC"}, ts=1000.0,
+    )
+    _phase_taker(
+        verdict=v, token="0xtoken", ask_price=0.68, balance=20.0, clob_client=fake_clob,
+    )
+    ok, reason = _cooldown_check("BTC", 1003.0, cooldown_sec=5.0)
+    assert ok is False
+    assert reason == "COOLDOWN"
+
+
+def test_phase_taker_does_not_record_cooldown_on_abort(oracle_env):
+    """C6 fix: a failed taker must NOT burn the 5s cooldown."""
+    from ai_trader.oracle_sniper import _phase_taker, OracleVerdict, _reset_oracle_state, _cooldown_check
+    _reset_oracle_state()
+
+    fake_clob = MagicMock()
+    fake_clob.place_fak_order.return_value = _clob_err()
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="TAKER", reason="OK",
+        details={"coin": "BTC"}, ts=1000.0,
+    )
+    _phase_taker(
+        verdict=v, token="0xtoken", ask_price=0.68, balance=20.0, clob_client=fake_clob,
+    )
+    ok, reason = _cooldown_check("BTC", 1003.0, cooldown_sec=5.0)
+    assert ok is True
+    assert reason is None
+
+
+def test_phase_taker_coin_locked_rejected(oracle_env):
+    """CRIT-1 fix: _phase_taker reserves coin slot, rejects if MAKER is in-flight."""
+    from ai_trader.oracle_sniper import _phase_taker, OracleVerdict, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    with _orders_lock:
+        _active_orders["BTC"] = {"order_id": "OID_prev", "phase": "MAKER", "opened_ts": 1000.0}
+
+    fake_clob = MagicMock()
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="TAKER", reason="OK",
+        details={"coin": "BTC"}, ts=1001.0,
+    )
+    result = _phase_taker(
+        verdict=v, token="0xtoken", ask_price=0.68, balance=20.0, clob_client=fake_clob,
+    )
+    assert result["status"] == "ABORTED"
+    assert "COIN_LOCKED" in result["reason"]
+    fake_clob.place_fak_order.assert_not_called()
+
+
+def test_phase_taker_accepts_pre_set_taker_phase(oracle_env):
+    """CRIT-1 carve-out: handle_maker_timeout transitions phase to TAKER first."""
+    from ai_trader.oracle_sniper import _phase_taker, OracleVerdict, _reset_oracle_state, _active_orders, _orders_lock
+    _reset_oracle_state()
+
+    with _orders_lock:
+        _active_orders["BTC"] = {"order_id": None, "phase": "TAKER", "opened_ts": 1000.0}
+
+    fake_clob = MagicMock()
+    fake_clob.place_fak_order.return_value = _clob_ok("OID_taker", taking=4.3)
+
+    v = OracleVerdict(
+        action="BUY", direction="UP", p_up=0.95, phase="TAKER", reason="OK",
+        details={"coin": "BTC"}, ts=1001.0,
+    )
+    result = _phase_taker(
+        verdict=v, token="0xtoken", ask_price=0.68, balance=20.0, clob_client=fake_clob,
+    )
+    assert result["status"] == "FILLED"
+    fake_clob.place_fak_order.assert_called_once()
