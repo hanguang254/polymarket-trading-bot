@@ -17,7 +17,9 @@ for the full design document.
 
 from __future__ import annotations
 
+import os
 import threading
+import time as _time_module
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional
 
@@ -171,10 +173,6 @@ def _binance_reversal_check(
     return True, None, False
 
 
-import os
-import time as _time_module
-
-
 # ─────────── Source accessors (seam for mocking) ───────────
 
 def _get_chainlink_snapshot(coin: str) -> Optional[Dict[str, Any]]:
@@ -257,8 +255,9 @@ def check_oracle_sniper(
     """Run the Oracle Sniper validation pipeline and return an OracleVerdict.
 
     Pipeline (fail-fast):
-      1. Cooldown check     → REJECT(COOLDOWN)
-      2. Window check       → REJECT(OUT_OF_WINDOW)
+      1. Cooldown check      → REJECT(COOLDOWN)
+      2. Window check        → REJECT(OUT_OF_WINDOW)
+      2b. TOO_LATE guard     → REJECT(TOO_LATE)
       3. Chainlink freshness → REJECT(CL_MISSING / CL_STALE)
       4. Confidence compute  → REJECT(LOW_CONFIDENCE / COMPUTE_ERROR)
       5. Binance reversal    → REJECT(BN_CONTRADICT)
