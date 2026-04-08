@@ -1149,3 +1149,78 @@ def test_maker_timeout_taker_exception_still_unlocks_coin(oracle_env):
         now_ts=1012.0, p_up=0.95, clob_client=fake_clob,
     )
     assert "BTC" not in _active_orders
+
+
+def test_cleanup_orphan_orders_cancels_persisted_ids(tmp_path, monkeypatch):
+    """C2 + C4 fix: startup cleanup uses persisted Oracle state."""
+    import json
+    from ai_trader.oracle_sniper import cleanup_orphan_orders
+
+    state_file = tmp_path / "oracle_active_orders.json"
+    monkeypatch.setenv("ORACLE_SNIPER_STATE_PATH", str(state_file))
+
+    state_file.write_text(json.dumps({
+        "BTC": {"order_id": "OID_btc_1", "phase": "MAKER", "token": "0xbtc",
+                "buy_price": 0.67, "size": 4.4, "opened_ts": 1000.0, "deadline_ts": 1025.0},
+        "ETH": {"order_id": "OID_eth_1", "phase": "MAKER", "token": "0xeth",
+                "buy_price": 0.55, "size": 5.2, "opened_ts": 1000.0, "deadline_ts": 1025.0},
+    }))
+
+    fake_clob = MagicMock()
+    fake_clob.cancel_order.return_value = True
+
+    cancelled = cleanup_orphan_orders(fake_clob)
+
+    assert set(cancelled) == {"OID_btc_1", "OID_eth_1"}
+    assert fake_clob.cancel_order.call_count == 2
+    assert json.loads(state_file.read_text()) == {}
+
+
+def test_cleanup_orphan_orders_handles_missing_state_file(tmp_path, monkeypatch):
+    from ai_trader.oracle_sniper import cleanup_orphan_orders
+
+    state_file = tmp_path / "oracle_active_orders.json"
+    monkeypatch.setenv("ORACLE_SNIPER_STATE_PATH", str(state_file))
+
+    fake_clob = MagicMock()
+    cancelled = cleanup_orphan_orders(fake_clob)
+    assert cancelled == []
+    fake_clob.cancel_order.assert_not_called()
+
+
+def test_cleanup_orphan_orders_skips_missing_ids(tmp_path, monkeypatch):
+    """Entries without order_id are skipped."""
+    import json
+    from ai_trader.oracle_sniper import cleanup_orphan_orders
+
+    state_file = tmp_path / "oracle_active_orders.json"
+    monkeypatch.setenv("ORACLE_SNIPER_STATE_PATH", str(state_file))
+    state_file.write_text(json.dumps({
+        "BTC": {"order_id": None, "phase": "RESERVED", "opened_ts": 1000.0},
+        "ETH": {"order_id": "OID_eth_1", "phase": "MAKER", "opened_ts": 1000.0, "deadline_ts": 1025.0},
+    }))
+
+    fake_clob = MagicMock()
+    fake_clob.cancel_order.return_value = True
+    cancelled = cleanup_orphan_orders(fake_clob)
+    assert cancelled == ["OID_eth_1"]
+    assert fake_clob.cancel_order.call_count == 1
+
+
+def test_cleanup_orphan_orders_partial_cancel_failure(tmp_path, monkeypatch):
+    """If some cancels fail, return only successful ones and still clear state."""
+    import json
+    from ai_trader.oracle_sniper import cleanup_orphan_orders
+
+    state_file = tmp_path / "oracle_active_orders.json"
+    monkeypatch.setenv("ORACLE_SNIPER_STATE_PATH", str(state_file))
+    state_file.write_text(json.dumps({
+        "BTC": {"order_id": "OID_btc_1", "phase": "MAKER", "opened_ts": 1000.0, "deadline_ts": 1025.0},
+        "ETH": {"order_id": "OID_eth_1", "phase": "MAKER", "opened_ts": 1000.0, "deadline_ts": 1025.0},
+    }))
+
+    fake_clob = MagicMock()
+    fake_clob.cancel_order.side_effect = [True, False]
+
+    cancelled = cleanup_orphan_orders(fake_clob)
+    assert len(cancelled) == 1

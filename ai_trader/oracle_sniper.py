@@ -809,3 +809,30 @@ def handle_maker_timeout(
         "reason": "OK",
         "taker_result": taker_result,
     }
+
+
+def cleanup_orphan_orders(clob_client: Any) -> list:
+    """Cancel persisted Oracle maker orders on startup and clear local state."""
+    persisted = _load_persisted_active_orders()
+    if not persisted:
+        return []
+
+    cancelled = []
+    for info in persisted.values():
+        if not isinstance(info, dict):
+            continue
+        order_id = info.get("order_id")
+        if not order_id:
+            continue
+        try:
+            ok = clob_client.cancel_order(order_id)
+            if ok:
+                cancelled.append(order_id)
+        except Exception:
+            pass
+
+    with _orders_lock:
+        _active_orders.clear()
+        _persist_active_orders()
+
+    return cancelled
