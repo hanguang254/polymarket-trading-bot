@@ -1712,6 +1712,106 @@ class MarketTracker:
         elif result.get("error"):
             logger.debug(f"  [伏] 挂单失败: {coin} {gap_dir} {str(result.get('error',''))[:50]}")
 
+    def _try_oracle_sniper_entry(self, slug, coin, tokens, ptb, atr_val,
+                                 remaining, price, gap_dir, diff_atr, bayesian_conf):
+        """v14.4: Oracle Sniper — tail 30s high-confidence channel.
+
+        Mirrors the _try_endgame_entry(...) -> bool protocol:
+          return True  -> this channel handled the market (caller should `continue`)
+          return False -> let downstream sniper logic run
+        """
+        if os.environ.get("ORACLE_SNIPER_ENABLED", "1") != "1":
+            return False
+        if not atr_val or atr_val <= 0:
+            return False
+
+        _deadline_ts = _slug_end_timestamp(slug)
+        if _deadline_ts is None:
+            return False
+
+        _oracle_tail = float(os.environ.get("ORACLE_SNIPER_TAIL_SEC", "30"))
+        _remaining_to_deadline = _deadline_ts - time.time()
+        if not (0 < _remaining_to_deadline <= _oracle_tail):
+            return False
+
+        try:
+            from ai_trader.oracle_sniper import (
+                check_oracle_sniper, log_oracle_verdict,
+                _phase_maker, _phase_taker, handle_maker_timeout,
+            )
+        except Exception as _exc:
+            logger.debug(f"[oracle-sniper] import failed: {_exc}")
+            return False
+
+        if slug in self.positions or slug in self._ambush_orders:
+            return True
+
+        _target_token = tokens[0] if gap_dir == "UP" else tokens[1]
+        from ai_trader.polymarket_ws import poly_ws as _o_ws
+        _, _o_ask = _o_ws.get_best_bid_ask(_target_token)
+        if not _o_ask or _o_ask <= 0.01 or _o_ask >= 0.99:
+            return False
+
+        _bal = self._cached_balance if self._cached_balance and self._cached_balance > 0 else 20.0
+
+        from ai_trader.oracle_sniper import _active_orders as _oracle_active
+        from ai_trader.oracle_sniper import _orders_lock as _oracle_lock
+        _inflight_p_up = None
+        with _oracle_lock:
+            _existing_order = _oracle_active.get(coin)
+            if _existing_order and _existing_order.get("phase") == "MAKER":
+                _inflight_p_up = _existing_order.get("p_up")
+
+        try:
+            handle_maker_timeout(
+                coin=coin, token=_target_token, ask_price=_o_ask,
+                balance=_bal, now_ts=time.time(),
+                p_up=_inflight_p_up if _inflight_p_up is not None else 0.95,
+                clob_client=clob_client,
+            )
+        except Exception as _exc:
+            logger.debug(f"[oracle-sniper] handle_maker_timeout failed: {_exc}")
+
+        try:
+            _verdict = check_oracle_sniper(
+                coin=coin, strike=ptb, atr=atr_val, deadline_ts=_deadline_ts,
+            )
+            log_oracle_verdict(_verdict)
+        except Exception as _exc:
+            logger.debug(f"[oracle-sniper] check failed: {_exc}")
+            return False
+
+        if _verdict.action == "BUY":
+            try:
+                if _verdict.phase == "MAKER":
+                    _res = _phase_maker(
+                        verdict=_verdict, token=_target_token,
+                        ask_price=_o_ask, balance=_bal,
+                        deadline_ts=_deadline_ts, clob_client=clob_client,
+                    )
+                    if _res.get("status") == "OPEN":
+                        logger.info(
+                            f"  [oracle] MAKER 挂单 {coin} {_verdict.direction} "
+                            f"@${_res['buy_price']} ×{_res['size']}份 "
+                            f"p_up={_verdict.p_up:.3f}"
+                        )
+                else:
+                    _res = _phase_taker(
+                        verdict=_verdict, token=_target_token,
+                        ask_price=_o_ask, balance=_bal,
+                        clob_client=clob_client,
+                    )
+                    if _res.get("status") == "FILLED":
+                        logger.info(
+                            f"  [oracle] TAKER 成交 {coin} {_verdict.direction} "
+                            f"@${_o_ask} ×{_res['filled_size']}份 "
+                            f"p_up={_verdict.p_up:.3f}"
+                        )
+            except Exception as _exc:
+                logger.warning(f"[oracle-sniper] order placement failed: {_exc}")
+
+        return True
+
     def _try_endgame_entry(self, slug, coin, tokens, ptb, atr_val, remaining,
                            price, gap_dir, diff_atr, bayesian_conf):
         """v13.1 M2: Endgame entry — T-40s到T-10s高确定性尾盘入场
@@ -1726,10 +1826,38 @@ class MarketTracker:
         if not ENDGAME_ENABLED:
             return False
 
-        ENDGAME_START = float(os.environ.get("ENDGAME_BET_START", "260"))
-        ENDGAME_END = float(os.environ.get("ENDGAME_BET_END", "290"))
-        elapsed = 300 - remaining
-        if elapsed < ENDGAME_START or elapsed > ENDGAME_END:
+        # v14.4: deadline-anchored window (replaces round-start-anchored ENDGAME_BET_*).
+        # Endgame runs when (ENDGAME_TAIL_CUTOFF_SEC, ENDGAME_TAIL_SEC] seconds remain.
+        # I8 fix: auto-migrate legacy ENDGAME_BET_START/END for one release cycle.
+        # Legacy math: elapsed = 300 - remaining; legacy window was
+        #   ENDGAME_BET_START <= elapsed <= ENDGAME_BET_END
+        # In deadline terms:
+        #   (300 - ENDGAME_BET_END) <= remaining <= (300 - ENDGAME_BET_START)
+        ENDGAME_TAIL_SEC = float(os.environ.get("ENDGAME_TAIL_SEC", "60"))
+        ENDGAME_TAIL_CUTOFF_SEC = float(os.environ.get("ENDGAME_TAIL_CUTOFF_SEC", "30"))
+        _legacy_start = os.environ.get("ENDGAME_BET_START")
+        _legacy_end = os.environ.get("ENDGAME_BET_END")
+        if _legacy_start or _legacy_end:
+            logger.warning(
+                "[endgame] ENDGAME_BET_START/END are DEPRECATED in v14.4. "
+                "Migrate to ENDGAME_TAIL_SEC / ENDGAME_TAIL_CUTOFF_SEC. "
+                "Auto-migrating legacy values for this release cycle."
+            )
+            try:
+                if _legacy_start is not None:
+                    _migrated_tail_sec = 300.0 - float(_legacy_start)
+                    if _migrated_tail_sec > 0:
+                        ENDGAME_TAIL_SEC = _migrated_tail_sec
+                if _legacy_end is not None:
+                    _migrated_cutoff = 300.0 - float(_legacy_end)
+                    if _migrated_cutoff >= 0:
+                        ENDGAME_TAIL_CUTOFF_SEC = _migrated_cutoff
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[endgame] legacy ENDGAME_BET_* values are malformed, "
+                    "falling back to ENDGAME_TAIL_* defaults"
+                )
+        if not (ENDGAME_TAIL_CUTOFF_SEC < remaining <= ENDGAME_TAIL_SEC):
             return False
 
         if slug in self.positions or slug in self._ambush_orders or slug in self.analyzed:
@@ -2102,7 +2230,12 @@ class MarketTracker:
                     f"方向不一致(gap={gap_dir} 贝叶斯={bayesian_dir} conf={bayesian_conf:.3f})")
                 continue
 
-            # ── v13.1 M2: Endgame entry — 尾盘高确定性入场 ──
+            # ── v14.4: Oracle Sniper — 尾 30s 独立高确信通道 ──
+            if self._try_oracle_sniper_entry(slug, coin, tokens, ptb, atr_val, remaining,
+                                             price, gap_dir, diff_atr, bayesian_conf):
+                continue
+
+            # ── v13.1 M2: Endgame entry — 尾盘高确定性入场（60s-30s 窗口）──
             if self._try_endgame_entry(slug, coin, tokens, ptb, atr_val, remaining,
                                        price, gap_dir, diff_atr, bayesian_conf):
                 continue
@@ -3457,6 +3590,16 @@ def main():
 
     # 初始化 CLOB SDK 客户端（全局单例，全程复用）
     clob_client.init_client()
+
+    # v14.4: Oracle Sniper orphan cleanup — recover any pre-crash MAKER orders
+    try:
+        from ai_trader.oracle_sniper import cleanup_orphan_orders
+        from ai_trader import clob_client as _cleanup_clob
+        _cancelled = cleanup_orphan_orders(_cleanup_clob)
+        if _cancelled:
+            logger.info(f"[oracle-sniper] cleaned up {len(_cancelled)} orphan orders: {_cancelled}")
+    except Exception as _cleanup_exc:
+        logger.warning(f"[oracle-sniper] orphan cleanup failed: {_cleanup_exc}")
 
     # 启动 Pyth 链上价格流（持仓监控主数据源）
     from ai_trader.pyth_api import pyth_stream

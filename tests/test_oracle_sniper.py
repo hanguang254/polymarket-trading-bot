@@ -1224,3 +1224,66 @@ def test_cleanup_orphan_orders_partial_cancel_failure(tmp_path, monkeypatch):
 
     cancelled = cleanup_orphan_orders(fake_clob)
     assert len(cancelled) == 1
+
+
+def test_shadow_mode_end_to_end(tmp_path, monkeypatch):
+    """Full pipeline in shadow mode: accepts verdict but action=SHADOW, no order placed."""
+    from ai_trader.oracle_sniper import (
+        check_oracle_sniper, log_oracle_verdict, _reset_oracle_state,
+    )
+
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+    monkeypatch.setenv("ORACLE_SNIPER_LIVE", "0")
+    monkeypatch.setenv("ORACLE_SNIPER_ENABLED", "1")
+    _reset_oracle_state()
+
+    with patch("ai_trader.oracle_sniper._get_chainlink_snapshot") as cl_mock, \
+         patch("ai_trader.oracle_sniper._get_binance_delta") as bn_mock:
+        cl_mock.return_value = {"price": 71000.0, "age_ms": 500, "stale": False}
+        bn_mock.return_value = {
+            "delta_bps": 5.0, "n_trades": 40, "stale": False, "direction": "UP",
+        }
+        v = check_oracle_sniper(
+            coin="BTC", strike=70000.0, atr=50.0,
+            deadline_ts=1000.0 + 20.0, now_ts=1000.0,
+        )
+        log_oracle_verdict(v)
+
+    assert v.action == "SHADOW"
+    assert v.direction == "UP"
+    assert v.p_up > 0.93
+    assert v.phase == "MAKER"
+    assert v.reason == "OK"
+
+    assert log_file.exists()
+    record = json.loads(log_file.read_text().strip().splitlines()[0])
+    assert record["action"] == "SHADOW"
+    assert record["direction"] == "UP"
+
+
+def test_shadow_mode_reject_still_logs(tmp_path, monkeypatch):
+    """Even in shadow mode, rejection reasons are logged for audit."""
+    from ai_trader.oracle_sniper import (
+        check_oracle_sniper, log_oracle_verdict, _reset_oracle_state,
+    )
+
+    log_file = tmp_path / "oracle_sniper.jsonl"
+    monkeypatch.setenv("ORACLE_SNIPER_LOG_PATH", str(log_file))
+    monkeypatch.setenv("ORACLE_SNIPER_LIVE", "0")
+    monkeypatch.setenv("ORACLE_SNIPER_ENABLED", "1")
+    _reset_oracle_state()
+
+    with patch("ai_trader.oracle_sniper._get_chainlink_snapshot") as cl_mock, \
+         patch("ai_trader.oracle_sniper._get_binance_delta") as bn_mock:
+        cl_mock.return_value = None
+        bn_mock.return_value = {"delta_bps": 0, "n_trades": 0, "stale": True, "direction": "FLAT"}
+        v = check_oracle_sniper(
+            coin="BTC", strike=70000.0, atr=50.0,
+            deadline_ts=1000.0 + 20.0, now_ts=1000.0,
+        )
+        log_oracle_verdict(v)
+
+    assert v.action == "REJECT"
+    assert v.reason == "CL_MISSING"
+    assert log_file.exists()
