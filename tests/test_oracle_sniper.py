@@ -177,3 +177,108 @@ def test_cooldown_per_coin_isolation():
     _record_cooldown("BTC", 1000.0)
     ok, _ = _cooldown_check("ETH", 1001.0, cooldown_sec=5.0)
     assert ok is True  # ETH is a different coin, not affected by BTC cooldown
+
+
+# ─────────── Chainlink freshness gate ───────────
+
+def test_chainlink_freshness_ok():
+    from ai_trader.oracle_sniper import _chainlink_freshness_check
+    snapshot = {"price": 70000.0, "age_ms": 500, "stale": False}
+    ok, reason, details = _chainlink_freshness_check(snapshot, max_age_sec=1.0)
+    assert ok is True
+    assert reason is None
+    assert details["cl_price"] == 70000.0
+
+
+def test_chainlink_freshness_missing():
+    from ai_trader.oracle_sniper import _chainlink_freshness_check
+    ok, reason, details = _chainlink_freshness_check(None, max_age_sec=1.0)
+    assert ok is False
+    assert reason == "CL_MISSING"
+
+
+def test_chainlink_freshness_stale_by_age():
+    from ai_trader.oracle_sniper import _chainlink_freshness_check
+    snapshot = {"price": 70000.0, "age_ms": 2500, "stale": False}
+    ok, reason, details = _chainlink_freshness_check(snapshot, max_age_sec=1.0)
+    assert ok is False
+    assert reason == "CL_STALE"
+    assert details["age_ms"] == 2500
+
+
+def test_chainlink_freshness_stale_flag():
+    from ai_trader.oracle_sniper import _chainlink_freshness_check
+    snapshot = {"price": 70000.0, "age_ms": 500, "stale": True}
+    ok, reason, details = _chainlink_freshness_check(snapshot, max_age_sec=1.0)
+    assert ok is False
+    assert reason == "CL_STALE"
+
+
+# ─────────── Confidence gate (gbm_p_up threshold) ───────────
+
+def test_confidence_up_high():
+    from ai_trader.oracle_sniper import _compute_confidence
+    verdict = _compute_confidence(
+        price=71000.0, strike=70000.0, atr=50.0, remaining_sec=25.0, threshold=0.93
+    )
+    assert verdict["direction"] == "UP"
+    assert verdict["p_up"] > 0.93
+    assert verdict["reason"] is None
+
+
+def test_confidence_down_high():
+    from ai_trader.oracle_sniper import _compute_confidence
+    verdict = _compute_confidence(
+        price=69000.0, strike=70000.0, atr=50.0, remaining_sec=25.0, threshold=0.93
+    )
+    assert verdict["direction"] == "DOWN"
+    assert verdict["p_up"] < 0.07
+    assert verdict["reason"] is None
+
+
+def test_confidence_middle_rejected():
+    from ai_trader.oracle_sniper import _compute_confidence
+    verdict = _compute_confidence(
+        price=70000.1, strike=70000.0, atr=500.0, remaining_sec=25.0, threshold=0.93
+    )
+    # price ≈ strike with large ATR → p_up ≈ 0.5 → LOW_CONFIDENCE
+    assert verdict["direction"] is None
+    assert verdict["reason"] == "LOW_CONFIDENCE"
+    assert 0.07 < verdict["p_up"] < 0.93
+
+
+# ─────────── Binance reversal gate ───────────
+
+def test_binance_reversal_allow_same_direction():
+    from ai_trader.oracle_sniper import _binance_reversal_check
+    bn = {"delta_bps": 5.0, "n_trades": 40, "stale": False, "direction": "UP"}
+    ok, reason, warn = _binance_reversal_check(bn, direction="UP", reverse_bps_threshold=2.0)
+    assert ok is True
+    assert reason is None
+    assert warn is False
+
+
+def test_binance_reversal_block_opposite():
+    from ai_trader.oracle_sniper import _binance_reversal_check
+    bn = {"delta_bps": -3.0, "n_trades": 40, "stale": False, "direction": "DOWN"}
+    ok, reason, warn = _binance_reversal_check(bn, direction="UP", reverse_bps_threshold=2.0)
+    assert ok is False
+    assert reason == "BN_CONTRADICT"
+
+
+def test_binance_reversal_below_threshold_allowed():
+    from ai_trader.oracle_sniper import _binance_reversal_check
+    # -1 bps reverse, threshold is 2 bps → allowed
+    bn = {"delta_bps": -1.0, "n_trades": 40, "stale": False, "direction": "DOWN"}
+    ok, reason, warn = _binance_reversal_check(bn, direction="UP", reverse_bps_threshold=2.0)
+    assert ok is True
+    assert reason is None
+
+
+def test_binance_reversal_sparse_window_allow_with_warn():
+    from ai_trader.oracle_sniper import _binance_reversal_check
+    bn = {"delta_bps": 0.0, "n_trades": 0, "stale": True, "direction": "FLAT"}
+    ok, reason, warn = _binance_reversal_check(bn, direction="UP", reverse_bps_threshold=2.0)
+    assert ok is True
+    assert reason is None
+    assert warn is True  # freshness-bottom fallback
