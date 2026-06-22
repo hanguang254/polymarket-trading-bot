@@ -308,6 +308,56 @@ def calculate_spread_snapshot(
     }
 
 
+def build_sampling_price_from_spread(spread: Optional[dict]) -> Optional[dict]:
+    """Map Binance lead into the settlement-price coordinate for sampling."""
+    if not isinstance(spread, dict):
+        return None
+    if str(spread.get("offset_method") or "").lower() == "snapshot_fallback":
+        return None
+    binance_price = _coerce_price(spread.get("binance_price"))
+    ptb = _coerce_price(spread.get("ptb"))
+    try:
+        offset = float(spread.get("offset"))
+    except (TypeError, ValueError):
+        offset = None
+    if binance_price is None or ptb is None or offset is None:
+        return None
+
+    price = binance_price + offset
+    gap = price - ptb
+    return {
+        "price": price,
+        "gap": gap,
+        "source": "BN_SPREAD",
+        "raw_binance_price": binance_price,
+        "offset": offset,
+        "adjusted_ptb": spread.get("adjusted_ptb"),
+        "diff": spread.get("diff", gap),
+        "diff_atr": spread.get("diff_atr"),
+        "diff_atr_signed": spread.get("diff_atr_signed"),
+        "offset_method": spread.get("offset_method"),
+        "offset_reliable": spread.get("offset_reliable"),
+    }
+
+
+def get_sampling_price(
+    coin: str,
+    ptb: float,
+    atr_val: float,
+    *,
+    allow_latest_fallback: Optional[bool] = None,
+) -> Optional[dict]:
+    """Return offset-adjusted Binance sampling price, or None if unavailable."""
+    spread = get_spread_snapshot(
+        coin,
+        ptb,
+        atr_val,
+        allow_latest_fallback=allow_latest_fallback,
+        min_diff_atr=0.0,
+    )
+    return build_sampling_price_from_spread(spread)
+
+
 def get_spread_snapshot(
     coin: str,
     ptb: float,

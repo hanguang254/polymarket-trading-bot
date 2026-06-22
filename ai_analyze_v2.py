@@ -430,34 +430,28 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
             discount = estimated_value - exec_price
             details["exec_discount"] = round(discount, 4)
 
-    # ── EV 计算：按提前平仓概率折算 spread 成本 ──
-    # 持有到期结算(0或1)不付spread，只有提前平仓才付bid-ask差价
-    EARLY_EXIT_RATIO = float(os.environ.get("EARLY_EXIT_RATIO", "0.3"))  # 提前平仓概率
+    # Entry EV only deducts real taker entry fees.
+    # Bid/ask spread is a liquidity reference, not a Polymarket protocol fee.
     raw_spread = liquidity_info["spread"] if liquidity_info and liquidity_info.get("spread") else 0.02
-    spread_cost = raw_spread * EARLY_EXIT_RATIO
+    spread_cost = 0.0
     entry_fee_rate = effective_fee_rate(target_odds, fee_rate_bps)
     net_entry_denominator = max(1.0 - entry_fee_rate, 1e-9)
     effective_entry_price = target_odds / net_entry_denominator if fee_rate_bps > 0 else target_odds
     entry_fee_cost = max(0.0, effective_entry_price - target_odds)
-    exit_fee_basis = None
-    if liquidity_info and liquidity_info.get("best_bid"):
-        exit_fee_basis = liquidity_info["best_bid"]
-    elif 0.01 < target_odds < 0.99:
-        exit_fee_basis = max(round(target_odds - raw_spread, 4), 0.01)
-    exit_fee_rate = effective_fee_rate(exit_fee_basis, fee_rate_bps) if exit_fee_basis else 0.0
-    exit_fee_cost = (exit_fee_basis * exit_fee_rate * EARLY_EXIT_RATIO) if exit_fee_basis else 0.0
+    exit_fee_rate = 0.0
+    exit_fee_cost = 0.0
     ev_gross = p_win - target_odds
-    ev = ev_gross - spread_cost - entry_fee_cost - exit_fee_cost
+    ev = ev_gross - entry_fee_cost
     details["expected_value"] = round(ev, 4)
     details["ev_gross"] = round(ev_gross, 4)
+    details["liquidity_spread"] = round(raw_spread, 4)
     details["spread_cost"] = round(spread_cost, 4)
     details["entry_fee_cost"] = round(entry_fee_cost, 4)
     details["entry_fee_rate"] = round(entry_fee_rate, 6)
     details["effective_entry_price"] = round(effective_entry_price, 4)
     details["expected_exit_fee_cost"] = round(exit_fee_cost, 4)
     details["expected_exit_fee_rate"] = round(exit_fee_rate, 6)
-    if exit_fee_basis:
-        details["expected_exit_fee_basis"] = round(exit_fee_basis, 4)
+    details.pop("expected_exit_fee_basis", None)
     details["p_win_final"] = round(p_win, 4)
     details["ev_positive"] = ev > 0
 
@@ -525,7 +519,7 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     details["bet_reason"] = (
         f"atr={diff_in_atr:.2f}({'✅' if diff_in_atr>=MIN_ATR_DEVIATION else '❌'}≥{MIN_ATR_DEVIATION}) "
         f"ev={ev:+.4f}({'✅' if ev>ev_threshold else '❌'}>{ev_threshold:.3f}[adapt],"
-        f"gross={ev_gross:+.3f},spread={spread_cost:.3f},fee_in={entry_fee_cost:.3f},fee_out={exit_fee_cost:.3f}) "
+        f"gross={ev_gross:+.3f},fee_in={entry_fee_cost:.3f},spread_ref={raw_spread:.3f}) "
         f"p_win={p_win:.3f} rw={rw_p_win:.3f} base={base_rate:.3f} "
         f"odds={target_odds:.3f}({'✅' if target_odds<MAX_PRICE else '❌'}<{MAX_PRICE}) "
         f"conf={confidence:.0%}({'✅' if confidence>=MIN_CONFIDENCE else '❌'}≥{MIN_CONFIDENCE:.0%}) "

@@ -150,6 +150,58 @@ class TestAdaptiveEntryHelpers(unittest.TestCase):
         self.assertEqual(result["exec_price"], 0.99)
         self.assertLess(result["expected_value"], 0)
 
+    def test_entry_ev_excludes_spread_and_expected_exit_costs(self):
+        details = {
+            "target_odds": 0.495,
+            "discount": 0.075,
+            "diff_in_atr": 1.2,
+            "price_diff": -40.0,
+            "atr": 35.0,
+            "estimated_value": 0.62,
+        }
+
+        with patch.dict(os.environ, {
+            "MAX_BUY_PRICE": "0.99",
+            "MIN_ATR_DEVIATION": "0.5",
+            "MIN_EV": "0.0",
+            "MIN_CONFIDENCE": "0.40",
+            "P_WIN_SHRINKAGE": "1.0",
+            "P_WIN_CAP": "0.92",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "analyze_market", return_value=("DOWN", 0.8, details.copy())):
+                with patch.object(ai_analyze_v2, "get_base_rate", return_value=0.5):
+                    with patch.object(ai_analyze_v2.clob_client, "get_fee_rate_bps", return_value=2500):
+                        with patch.object(ai_analyze_v2, "_random_walk_p_win", return_value=0.70):
+                            with patch.object(ai_analyze_v2, "log_decision"):
+                                with patch("ai_trader.lmsr_liquidity.estimate_lmsr_b", side_effect=RuntimeError("no rest")):
+                                    with patch("ai_trader.lmsr_liquidity.lmsr_fair_price", return_value=None):
+                                        should_bet, direction, confidence, result = ai_analyze_v2.analyze_and_decide(
+                                            "BTC",
+                                            64000.0,
+                                            0.505,
+                                            0.495,
+                                            "btc-updown-5m-test",
+                                            extra_info={
+                                                "up_token": "up-token",
+                                                "down_token": "down-token",
+                                                "remaining_seconds": 120,
+                                                "clob": {
+                                                    "up_bid": 0.32,
+                                                    "up_ask": 0.34,
+                                                    "down_bid": 0.66,
+                                                    "down_ask": 0.68,
+                                                },
+                                            },
+                                        )
+
+        expected_entry_ev = 0.70 - 0.68 - result["entry_fee_cost"]
+        self.assertEqual(direction, "DOWN")
+        self.assertTrue(should_bet)
+        self.assertEqual(result["exec_price"], 0.68)
+        self.assertEqual(result["spread_cost"], 0.0)
+        self.assertEqual(result["expected_exit_fee_cost"], 0.0)
+        self.assertAlmostEqual(result["expected_value"], expected_entry_ev, places=4)
+
     def test_plan_fok_entry_reduces_size_when_cap_depth_is_too_shallow(self):
         asks = [
             {"price": "0.85", "size": "2"},

@@ -2599,25 +2599,62 @@ class MarketTracker:
                 )
                 if len(samples) == 0 or (time.time() - samples[-1]["ts"]) >= sample_interval:
                     try:
-                        # v12.7.2: 预热采样改回 Chainlink 优先（和结算同源）
-                        # Binance vs Chainlink 价差可达 $26(0.5+ATR)，
-                        # Binance 训练的贝叶斯方向可能和 Chainlink 结算方向相反
-                        from ai_trader.price_oracle import get_onchain_price
+                        # Warmup samples prefer offset-adjusted Binance because it moves faster.
+                        # The price is mapped back to Chainlink/PTB coordinates via BN_SPREAD.
                         coin = market['coin']
-                        price, price_src = get_onchain_price(coin, with_source=True)
-                        price_src = price_src or "CL"
+                        updater = self.bayesian_updaters.get(slug)
+                        price = None
+                        price_src = None
+                        sample_meta = {}
+                        sampling_source = os.environ.get("WARMUP_SAMPLING_SOURCE", "BINANCE_SPREAD").upper()
+                        atr_for_sampling = getattr(updater, "atr_val", None)
+                        if (
+                                sampling_source in ("BINANCE_SPREAD", "BN_SPREAD")
+                                and ptb_now and atr_for_sampling and atr_for_sampling > 0):
+                            try:
+                                from ai_trader.binance_spread import get_sampling_price
+                                sample_meta = get_sampling_price(
+                                    coin,
+                                    ptb_now,
+                                    atr_for_sampling,
+                                    allow_latest_fallback=True,
+                                ) or {}
+                                if sample_meta:
+                                    price = sample_meta.get("price")
+                                    price_src = sample_meta.get("source") or "BN_SPREAD"
+                            except Exception as _bn_sample_e:
+                                logger.debug(f"  [BN-SPREAD] sampling unavailable: {_bn_sample_e}")
+
+                        if not price and sampling_source in ("BINANCE", "BN"):
+                            from ai_trader.binance_api import price_stream as _bn_stream
+                            price = _bn_stream.get_price(coin)
+                            price_src = "BN" if price else None
+
+                        if not price:
+                            from ai_trader.price_oracle import get_onchain_price
+                            price, price_src = get_onchain_price(coin, with_source=True)
+                            price_src = price_src or "CL"
                         if not price:
                             # Chainlink 无数据时回退 Binance
                             from ai_trader.binance_api import price_stream as _bn_stream
                             price = _bn_stream.get_price(coin)
                             price_src = "BN"
                         if price and ptb_now:
-                            gap = round(price - ptb_now, 2)
-                            samples.append({"price": price, "gap": gap, "ts": time.time()})
+                            gap_raw = sample_meta.get("gap") if sample_meta else None
+                            gap = round(gap_raw if gap_raw is not None else price - ptb_now, 2)
+                            sample_record = {"price": price, "gap": gap, "ts": time.time(), "source": price_src}
+                            if sample_meta:
+                                sample_record.update({
+                                    "raw_binance_price": sample_meta.get("raw_binance_price"),
+                                    "offset": sample_meta.get("offset"),
+                                    "adjusted_ptb": sample_meta.get("adjusted_ptb"),
+                                    "offset_method": sample_meta.get("offset_method"),
+                                    "offset_reliable": sample_meta.get("offset_reliable"),
+                                })
+                            samples.append(sample_record)
                             self.warmup_data[slug] = samples
 
                             # 贝叶斯更新
-                            updater = self.bayesian_updaters.get(slug)
                             if updater:
                                 # v14.1: 首次update前注入快速方向先验（PTB刚就绪时补跑）
                                 if updater.n_updates == 0 and getattr(updater, 'atr_real', False):
@@ -2667,6 +2704,14 @@ class MarketTracker:
                                         extra = f" src={source}"
                                     if incremental_conf is not None and state_conf is not None:
                                         extra += f" inc={incremental_conf:.3f} state={state_conf:.3f}"
+                                    if sample_meta:
+                                        raw_bn = sample_meta.get("raw_binance_price")
+                                        offset = sample_meta.get("offset")
+                                        method = sample_meta.get("offset_method")
+                                        if raw_bn is not None and offset is not None:
+                                            extra += f" rawBN={raw_bn:.2f} offset={offset:+.2f}"
+                                            if method:
+                                                extra += f" method={method}"
                                     logger.info(
                                         f"  📍 采样#{len(samples)}: price={price:.2f}({price_src}) gap={gap} "
                                         f"| 贝叶斯: {direction} p̂={p_hat:.4f} conf={conf:.3f}{extra}"
@@ -3256,10 +3301,9 @@ class MarketTracker:
         if 'ev_gross' in details:
             logger.info(
                 f"  📐 EV拆解: gross={details.get('ev_gross',0):+.3f}"
-                f" - spread={details.get('spread_cost',0):.3f}"
-                f" - 入场费={details.get('entry_fee_cost',0):.3f}"
-                f" - 预期出场费={details.get('expected_exit_fee_cost',0):.3f}"
+                f" - 入场taker费={details.get('entry_fee_cost',0):.3f}"
                 f" = {details.get('expected_value',0):+.3f}"
+                f" | spread参考={details.get('liquidity_spread', details.get('spread',0)):.3f}"
             )
         if details.get("clob_empty_book"):
             logger.info(f"  📡 空簿校准: 执行价=${details.get('exec_price',0):.3f} (原ask=${details.get('clob_raw_ask',0):.3f})")

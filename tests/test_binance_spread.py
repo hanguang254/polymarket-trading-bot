@@ -2,8 +2,10 @@ import pytest
 from collections import deque
 
 from ai_trader.binance_spread import (
+    build_sampling_price_from_spread,
     calculate_binance_offset,
     calculate_spread_snapshot,
+    get_sampling_price,
 )
 
 
@@ -57,6 +59,56 @@ def test_spread_snapshot_uses_offset_adjusted_price_to_beat():
     assert snapshot["direction"] == "UP"
     assert snapshot["supports_up"] is True
     assert snapshot["supports_down"] is False
+
+
+def test_sampling_price_maps_binance_to_settlement_coordinate():
+    snapshot = calculate_spread_snapshot(
+        coin="BTC",
+        ptb=100_000.0,
+        atr_val=100.0,
+        binance_price=100_020.0,
+        offset=20.0,
+        min_diff_atr=0.0,
+    )
+
+    sampling = build_sampling_price_from_spread(snapshot)
+
+    assert sampling["price"] == pytest.approx(100_040.0)
+    assert sampling["gap"] == pytest.approx(snapshot["diff"])
+    assert sampling["source"] == "BN_SPREAD"
+    assert sampling["raw_binance_price"] == pytest.approx(100_020.0)
+
+
+def test_sampling_price_maps_negative_gap_to_settlement_coordinate():
+    snapshot = calculate_spread_snapshot(
+        coin="BTC",
+        ptb=100_000.0,
+        atr_val=100.0,
+        binance_price=99_940.0,
+        offset=-10.0,
+        min_diff_atr=0.0,
+    )
+
+    sampling = build_sampling_price_from_spread(snapshot)
+
+    assert snapshot["direction"] == "DOWN"
+    assert sampling["price"] == pytest.approx(99_930.0)
+    assert sampling["gap"] == pytest.approx(snapshot["diff"])
+    assert sampling["gap"] < 0
+
+
+def test_sampling_price_rejects_chainlink_snapshot_fallback(monkeypatch):
+    def fake_spread_snapshot(*args, **kwargs):
+        return {
+            "binance_price": 100_020.0,
+            "ptb": 100_000.0,
+            "offset": 20.0,
+            "offset_method": "snapshot_fallback",
+        }
+
+    monkeypatch.setattr("ai_trader.binance_spread.get_spread_snapshot", fake_spread_snapshot)
+
+    assert get_sampling_price("BTC", 100_000.0, 100.0, allow_latest_fallback=True) is None
 
 
 def test_binance_stream_price_history_includes_recent_trades_and_latest(monkeypatch):
