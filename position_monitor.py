@@ -3,7 +3,7 @@
 持仓止盈监控 - 5分钟市场专用
 在市场关闭前的80-100秒窗口内监控价格，达到+15%即止盈
 """
-import fcntl
+from ai_trader import file_lock as fcntl
 import json
 import math
 import os
@@ -14,7 +14,7 @@ from collections import deque
 from datetime import datetime, timezone
 from statistics import median
 import requests
-from ai_trader.polymarket_api import normalize_orderbook, get_price_to_beat_api
+from ai_trader.polymarket_api import extract_orderbook_levels, normalize_orderbook, get_price_to_beat_api
 from ai_trader import clob_client
 from ai_trader.fees import effective_fee_rate, estimate_buy_fill, estimate_sell_fill
 from ai_trader.binance_api import price_stream as _price_stream
@@ -30,7 +30,7 @@ from ai_trader.exit_truth_gate import (
 
 # 价格数据源配置: 1=Chainlink优先(官方结算价), 2=Pyth优先(链上预言机)
 PRICE_SOURCE = int(os.environ.get("PRICE_SOURCE", "1"))
-from py_clob_client.order_builder.constants import BUY, SELL
+from ai_trader.clob_client import BUY, SELL
 
 # ═══ 日志：print 同时写入 logs/monitor.log ═══
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -289,6 +289,17 @@ def calc_signed_direction_gap(direction, crypto_price, ptb_price):
     if direction == "DOWN":
         return ptb_price - crypto_price
     return None
+
+
+def get_binance_spread_for_position(coin, ptb_price, atr_val):
+    """Return Binance lead against offset-adjusted PTB for position checks."""
+    if not coin or not ptb_price or not atr_val or atr_val <= 0:
+        return None
+    try:
+        from ai_trader.binance_spread import get_spread_snapshot
+        return get_spread_snapshot(coin, ptb_price, atr_val, allow_latest_fallback=True)
+    except Exception:
+        return None
 
 
 def get_tail_oracle_confirmations(remaining):
@@ -712,10 +723,9 @@ def _get_orderbook_bids_asks(token_id):
     # REST 回退
     try:
         book = clob_client.get_orderbook(token_id)
-        if book and book.bids is not None and book.asks is not None:
-            raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
-            raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
-            return normalize_orderbook(raw_bids, raw_asks)
+        bids, asks = extract_orderbook_levels(book)
+        if bids or asks:
+            return bids, asks
     except Exception:
         pass
     return [], []
@@ -746,7 +756,7 @@ def get_market_price(token_id):
         pass
     # WS 新鲜但无有效 bid/ask → 跳过慢 REST，直接用 LTP
     ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
-    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+    if isinstance(ws_snap, dict) and ws_snap.get("age_ms", 9999) < 50:
         ltp = get_last_trade_price(token_id)
         if ltp:
             return ltp
@@ -790,7 +800,7 @@ def get_best_bid_raw(token_id):
         return ws_bid
     # WS 新鲜但无 bid → 用 LTP，跳过 REST
     ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
-    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+    if isinstance(ws_snap, dict) and ws_snap.get("age_ms", 9999) < 50:
         ltp = get_last_trade_price(token_id)
         if ltp:
             return ltp
@@ -822,7 +832,7 @@ def get_best_bid(token_id):
         return ws_bid * 0.99
     # WS 新鲜但无 bid → 用 LTP，跳过 REST
     ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
-    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+    if isinstance(ws_snap, dict) and ws_snap.get("age_ms", 9999) < 50:
         ltp = get_last_trade_price(token_id)
         if ltp:
             fallback = max(round(ltp - SLIPPAGE, 2), 0.01)
@@ -855,7 +865,7 @@ def get_best_ask(token_id):
         return ws_ask
     # WS 新鲜但无 ask → 用 LTP，跳过 REST
     ws_snap = _poly_ws.get_best_bid_ask_snapshot(token_id)
-    if ws_snap and ws_snap.get("age_ms", 9999) < 50:
+    if isinstance(ws_snap, dict) and ws_snap.get("age_ms", 9999) < 50:
         ltp = get_last_trade_price(token_id)
         if ltp:
             fallback = min(round(ltp + SLIPPAGE, 2), 0.99)
@@ -1575,7 +1585,7 @@ def market_sell_immediate(token_id, size, price=None, position=None, skip_cancel
         if _maker_bid and _maker_bid > 0.05:
             # 在best_bid上方1tick挂卖 → 确保不立即match → maker身份(0手续费+返佣)
             _maker_price = round(_maker_bid + 0.01, 2)
-            from py_clob_client.clob_types import OrderType as _MakerOT
+            from ai_trader.clob_client import OrderType as _MakerOT
             _maker_exp = int(time.time()) + 60 + int(_MAKER_EXIT_WAIT)
             print(
                 f"    🏷️ Maker退出: GTD SELL @${_maker_price:.2f} ×{size:.2f} "
@@ -1932,7 +1942,11 @@ def try_reverse_entry(position, remaining, crypto_debug=None, atr_val=None, ptb_
             return
 
         # BN 也要确认反转
-        if bn_price:
+        spread_snap = get_binance_spread_for_position(coin, ptb_price, atr_val)
+        if spread_snap:
+            if spread_snap.get("direction") != new_dir:
+                return
+        elif bn_price:
             bn_gap = bn_price - ptb_price
             bn_dir = "UP" if bn_gap > 0 else "DOWN"
             if bn_dir != new_dir:
@@ -1970,7 +1984,7 @@ def try_reverse_entry(position, remaining, crypto_debug=None, atr_val=None, ptb_
         gross_size = round(net_size / 0.975, 2)
 
         # FOK 买入反方向
-        from py_clob_client.order_builder.constants import BUY
+        from ai_trader.clob_client import BUY
         clob_client.update_token_allowance(opposite_token)
         info = clob_client.place_fok_order(opposite_token, BUY, buy_price, gross_size)
 
@@ -3751,7 +3765,7 @@ def monitor():
                     # v12: 强制升级 — 连续失败 5 次后用地板价 FOK 清仓
                     if prior_attempts >= 5:
                         print(f"  🚨 强制清仓: {reason} | 连续{prior_attempts}次失败 → 地板价$0.01退出")
-                        from py_clob_client.order_builder.constants import SELL
+                        from ai_trader.clob_client import SELL
                         floor_info = clob_client.place_fok_order(token_id, SELL, 0.01, size)
                         if floor_info.get("matched"):
                             floor_price = round(floor_info.get("taking", 0) / size, 4) if size > 0 else 0.01
@@ -4140,8 +4154,8 @@ def monitor():
 
                         if _do_place_tp:
                             try:
-                                from py_clob_client.order_builder.constants import SELL as _SELL_TP
-                                from py_clob_client.clob_types import OrderType as _OT_TP
+                                from ai_trader.clob_client import SELL as _SELL_TP
+                                from ai_trader.clob_client import OrderType as _OT_TP
                                 _new_exp = int(end_timestamp) - 15 + 60
                                 if _new_exp > int(time.time()) + 30:
                                     _tp_size = min(size, int(size * 10000) / 10000)
@@ -4574,6 +4588,22 @@ def monitor():
                     # --- v12.9.2: CL-BN skew 过大时暂停 EV 止损 ---
                     # CL 滞后 BN > 1ATR 时，CL 的方向判断不可信，EV 的 P(win) 被严重低估
                     # 直接从 crypto_debug 快照读取（不依赖 oracle_watch 开关）
+                    _spread_snap_ev = None
+                    if _ev_should_exit and atr_val and atr_val > 0 and ptb_price:
+                        _spread_snap_ev = get_binance_spread_for_position(coin, ptb_price, atr_val)
+                        if _spread_snap_ev and _spread_snap_ev.get("offset") is not None:
+                            _spread_skew_atr = abs(_spread_snap_ev["offset"]) / atr_val
+                            _EV_SKEW_BLOCK = float(os.environ.get("EV_SKEW_BLOCK_ATR", "1.0"))
+                            if _spread_skew_atr >= _EV_SKEW_BLOCK:
+                                print(
+                                    f"  [BN-SPREAD] pause EV: offset={_spread_snap_ev['offset']:+.2f} "
+                                    f"({_spread_skew_atr:.2f}ATR >= {_EV_SKEW_BLOCK}ATR) "
+                                    f"BN=${_spread_snap_ev['binance_price']:.2f} "
+                                    f"adjPTB=${_spread_snap_ev['adjusted_ptb']:.2f} "
+                                    f"method={_spread_snap_ev.get('offset_method')}")
+                                ev_exit_confirm.pop(attempt_key, None)
+                                continue
+
                     if _ev_should_exit and isinstance(crypto_debug, dict) and atr_val and atr_val > 0:
                         _cl_snap = crypto_debug.get("chainlink")
                         _bn_snap = crypto_debug.get("binance")
@@ -4591,7 +4621,23 @@ def monitor():
                                     continue
 
                     # --- P1: 方向正确+CL滞后时，用BN重算P(win)二次确认 ---
-                    if _ev_should_exit and direction_correct and isinstance(crypto_debug, dict) and atr_val and atr_val > 0:
+                    if _ev_should_exit and direction_correct and atr_val and atr_val > 0 and _spread_snap_ev:
+                        _spread_dir_correct = _spread_snap_ev.get("direction") == direction
+                        if _spread_dir_correct:
+                            _spread_gap_atr = _spread_snap_ev.get("diff_atr")
+                            if _spread_gap_atr is None:
+                                _spread_gap_atr = abs(_spread_snap_ev.get("diff", 0.0)) / atr_val
+                            if _spread_gap_atr >= 0.3:
+                                print(
+                                    f"  [BN-SPREAD] pause EV: direction ok "
+                                    f"diff={_spread_snap_ev.get('diff', 0.0):+.2f} "
+                                    f"({_spread_gap_atr:.2f}ATR) "
+                                    f"BN=${_spread_snap_ev['binance_price']:.2f} "
+                                    f"adjPTB=${_spread_snap_ev['adjusted_ptb']:.2f}")
+                                ev_exit_confirm.pop(attempt_key, None)
+                                continue
+
+                    if _ev_should_exit and direction_correct and _spread_snap_ev is None and isinstance(crypto_debug, dict) and atr_val and atr_val > 0:
                         _bn_snap_p1 = crypto_debug.get("binance")
                         if isinstance(_bn_snap_p1, dict) and _bn_snap_p1.get("price") and ptb_price:
                             _bn_price_p1 = _bn_snap_p1["price"]

@@ -14,7 +14,7 @@ CLOB 不是 LMSR AMM，但 LMSR 理论价格可作为"公允价格"参考线，
 """
 import math
 import requests
-from ai_trader.polymarket_api import normalize_orderbook
+from ai_trader.polymarket_api import extract_orderbook_levels
 from ai_trader import clob_client
 
 
@@ -158,11 +158,9 @@ def lmsr_fair_price(token_id, timeout=3):
     """
     try:
         book = clob_client.get_orderbook(token_id)
-        if not book or not book.bids or not book.asks:
+        bids, asks = extract_orderbook_levels(book)
+        if not bids or not asks:
             return None
-        raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
-        raw_asks = [{"price": a.price, "size": a.size} for a in book.asks]
-        bids, asks = normalize_orderbook(raw_bids, raw_asks)
 
         if not bids or not asks:
             return None
@@ -239,9 +237,7 @@ def estimate_lmsr_b(token_id, timeout=3):
             print(f"  📡 SDK订单簿请求失败: token={str(token_id)[:16]}...")
             return _default_result()
 
-        raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
-        raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
-        bids, asks = normalize_orderbook(raw_bids, raw_asks)
+        bids, asks = extract_orderbook_levels(book)
 
         # 调试日志: 打印规范化后的订单簿数据
         bid_summary = [(float(b["price"]), float(b["size"])) for b in bids[:5]]

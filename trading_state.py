@@ -4,9 +4,9 @@
 """
 import json
 import os
-import fcntl
 import threading
 from datetime import datetime, timezone, date
+from ai_trader import file_lock as fcntl
 
 MAX_DAILY_LOSS = float(os.environ.get("MAX_DAILY_LOSS", "10.0"))  # 每日最大亏损额（USDC）
 

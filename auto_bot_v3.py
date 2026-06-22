@@ -25,7 +25,7 @@ import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from ai_trader.polymarket_api import normalize_orderbook
+from ai_trader.polymarket_api import extract_orderbook_levels
 from ai_trader.fees import estimate_sell_fill
 
 # --- 新增日志配置 ---
@@ -403,9 +403,7 @@ def get_realtime_odds(up_token, down_token):
         try:
             book = clob_client.get_orderbook(token_id)
             if book:
-                raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
-                raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
-                bids, asks = normalize_orderbook(raw_bids, raw_asks)
+                bids, asks = extract_orderbook_levels(book)
                 if bids:
                     result[f"{prefix}_bid"] = round(float(bids[0]["price"]), 4)
                 if asks:
@@ -488,7 +486,7 @@ def close_position(token_id, size=5, time_remaining=None):
     """
     FOK平仓 — SDK直连，逐级降价
     """
-    from py_clob_client.order_builder.constants import SELL
+    from ai_trader.clob_client import SELL
 
     # 根据剩余时间决定重试次数
     if time_remaining is not None and time_remaining < 20:
@@ -508,9 +506,8 @@ def close_position(token_id, size=5, time_remaining=None):
         best_bid = None
         try:
             book = clob_client.get_orderbook(token_id)
-            if book and book.bids:
-                raw_bids = [{"price": b.price, "size": b.size} for b in book.bids]
-                bids, _ = normalize_orderbook(raw_bids, [])
+            bids, _ = extract_orderbook_levels(book)
+            if bids:
                 best_bid = float(bids[0]['price']) if bids else None
         except:
             pass
@@ -857,7 +854,7 @@ class MarketTracker:
                         f"conf={_fill_conf:.0%} → 立即卖出 {_sell_size:.1f}份 (实际余额{_real_bal:.1f})")
                     try:
                         clob_client.update_token_allowance(_token)
-                        from py_clob_client.order_builder.constants import SELL
+                        from ai_trader.clob_client import SELL
                         _sell_result = clob_client.place_fok_order(
                             _token, SELL, 0.01, _sell_size)
                         # SELL: making=给出token份额, taking=收到USDC
@@ -937,7 +934,7 @@ class MarketTracker:
                                 "exit_reason": "direction_flip",
                             }
                             try:
-                                import fcntl as _fc
+                                from ai_trader import file_lock as _fc
                                 _fl = open(POSITIONS_FILE + ".lock", "w")
                                 _fc.flock(_fl, _fc.LOCK_EX)
                                 with open(POSITIONS_FILE, "a") as _pf:
@@ -988,7 +985,7 @@ class MarketTracker:
                     pass
 
                 # 写 positions.jsonl
-                import fcntl
+                from ai_trader import file_lock as fcntl
                 _pos_record = {
                     "token_id": _token, "slug": slug,
                     "direction": _dir, "entry_price": entry_price,
@@ -1034,8 +1031,8 @@ class MarketTracker:
                             _end_dt = datetime.fromisoformat(_end_str.replace("Z", "+00:00"))
                             _tp_exp = int(_end_dt.timestamp()) - _TP_DEADLINE + 60  # +60 Polymarket安全阈值
                         if _tp_exp > int(time.time()) + 60:
-                            from py_clob_client.order_builder.constants import SELL as _SELL_TP
-                            from py_clob_client.clob_types import OrderType as _OT_TP
+                            from ai_trader.clob_client import SELL as _SELL_TP
+                            from ai_trader.clob_client import OrderType as _OT_TP
                             # 安全兜底：用实际余额夹顶，防止微量进位导致 balance 不足
                             _tp_size = min(filled_size, int((_real_bal_ok or filled_size) * 10000) / 10000)
                             _tp_result = clob_client.place_order(
@@ -1332,8 +1329,8 @@ class MarketTracker:
                                 # 旧单确认终结（CANCELLED/MATCHED/EXPIRED） + 余额无变化 → 安全下新单
                                 ambush["all_order_ids"] = []
 
-                                from py_clob_client.order_builder.constants import BUY
-                                from py_clob_client.clob_types import OrderType as _OT
+                                from ai_trader.clob_client import BUY
+                                from ai_trader.clob_client import OrderType as _OT
                                 GTD_REPRICE_SEC = int(os.environ.get("SNIPER_AMBUSH_GTD_REPRICE_SEC", "4"))
                                 _gtd_exp_rp = int(time.time()) + 60 + GTD_REPRICE_SEC  # +60 Polymarket安全阈值
                                 _new_result = clob_client.place_order(
@@ -1659,8 +1656,8 @@ class MarketTracker:
         bal_before = clob_client.get_token_balance(token) or 0
 
         # GTD: 市场结束前30s自动过期（不需要手动撤单）
-        from py_clob_client.order_builder.constants import BUY
-        from py_clob_client.clob_types import OrderType as _OT
+        from ai_trader.clob_client import BUY
+        from ai_trader.clob_client import OrderType as _OT
         AMBUSH_END_SEC = float(os.environ.get("SNIPER_AMBUSH_END", "30"))
         _market = self.tracked.get(slug, {})
         _end_str = _market.get("end_time", "")
@@ -1947,8 +1944,8 @@ class MarketTracker:
         endgame_size = round(_net_size / 0.975, 2)
 
         # GTD BUY — 到期前5s过期
-        from py_clob_client.order_builder.constants import BUY as _EG_BUY
-        from py_clob_client.clob_types import OrderType as _EG_OT
+        from ai_trader.clob_client import BUY as _EG_BUY
+        from ai_trader.clob_client import OrderType as _EG_OT
         _market = self.tracked.get(slug, {})
         _end_str = _market.get("end_time", "")
         _gtd_exp = 0
@@ -2015,7 +2012,7 @@ class MarketTracker:
             from trading_state import record_bet_cost
             record_bet_cost(slug, cost)
             try:
-                import fcntl
+                from ai_trader import file_lock as fcntl
                 _pos_record = {
                     "token_id": target_token, "slug": slug,
                     "direction": gap_dir, "entry_price": entry_price,
@@ -3235,6 +3232,7 @@ class MarketTracker:
             # CLOB 订单簿数据：mid 供参考，best_ask 在 analyze_and_decide 中用于执行价校准
             # Gamma 赔率用于方向/概率判断，CLOB best_ask 用于 EV/折价的执行价校准(C1)
             clob = get_realtime_odds(up_token, down_token)
+            extra_info["clob"] = clob
             if clob["up_mid"] and clob["down_mid"]:
                 logger.info(
                     f"  📡 CLOB: UP bid={clob['up_bid']} ask={clob['up_ask']} mid={clob['up_mid']:.3f}"

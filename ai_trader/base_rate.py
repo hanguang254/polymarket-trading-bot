@@ -9,10 +9,10 @@ Base Rate 校准模块 v1.0
 对于5分钟二元市场，base rate = 历史上该 ATR 带的胜率。
 初始使用保守先验，数据积累后（≥30样本/带）自动切换为实证值。
 """
-import fcntl
 import json
 import os
 import time
+from ai_trader import file_lock as fcntl
 
 OUTCOMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "outcomes.jsonl")
 OUTCOMES_LOCK = OUTCOMES_FILE + ".lock"

@@ -165,6 +165,22 @@ class BinancePriceStream:
             "updates": self.update_count.get(coin, 0),
         }
 
+    def get_price_history(self, coin="BTC", window_sec=60):
+        """Return recent (ts, price) Binance trade points for spread alignment."""
+        now = time.time()
+        cutoff = now - float(window_sec)
+        tape = self._trade_tape.get(coin)
+        points = []
+        if tape:
+            points.extend((ts, price) for ts, price, _qty, _maker in tape if ts >= cutoff)
+        latest_price = self.prices.get(coin)
+        latest_ts = self.last_update.get(coin, 0)
+        if latest_price is not None and latest_ts >= cutoff:
+            if not points or points[-1][0] != latest_ts:
+                points.append((latest_ts, latest_price))
+        points.sort(key=lambda item: item[0])
+        return points
+
     def get_tick_momentum(self, coin="BTC", window_sec=10):
         """v14.1: 计算滚动窗口内的交易流动量
 

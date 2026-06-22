@@ -12,6 +12,7 @@ import threading
 import time
 from collections import deque
 
+from ai_trader.polymarket_api import extract_orderbook_levels
 from ai_trader.ws_ssl import get_websocket_sslopt
 
 logger = logging.getLogger(__name__)
@@ -140,10 +141,7 @@ class PolymarketOrderbookStream:
                 book = clob_client.get_orderbook(token_id)
                 if not book:
                     continue
-                raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
-                raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
-                sorted_bids = sorted(raw_bids, key=lambda x: float(x.get("price", 0)), reverse=True)
-                sorted_asks = sorted(raw_asks, key=lambda x: float(x.get("price", 0)))
+                sorted_bids, sorted_asks = extract_orderbook_levels(book)
                 if not sorted_bids or not sorted_asks:
                     continue
                 bb = float(sorted_bids[0]["price"])

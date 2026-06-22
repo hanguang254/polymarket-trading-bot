@@ -9,6 +9,7 @@ import math
 import os
 import sys
 import tempfile
+import types
 import unittest
 from collections import deque
 from datetime import datetime, timezone
@@ -26,25 +27,100 @@ _fees_module = importlib.util.module_from_spec(_fees_spec)
 assert _fees_spec.loader is not None
 _fees_spec.loader.exec_module(_fees_module)
 
-sys.modules.setdefault("ai_trader", MagicMock())
-sys.modules.setdefault("ai_trader.polymarket_api", MagicMock())
-sys.modules.setdefault("ai_trader.clob_client", MagicMock())
-sys.modules.setdefault("ai_trader.binance_api", MagicMock())
-sys.modules.setdefault("ai_trader.binance_api.price_stream", MagicMock())
-sys.modules.setdefault("ai_trader.pyth_api", MagicMock())
-sys.modules.setdefault("ai_trader.polymarket_ws", MagicMock())
-sys.modules.setdefault("ai_trader.polymarket_ws.poly_ws", MagicMock())
-sys.modules.setdefault("ai_trader.polymarket_rtds", MagicMock())
-sys.modules.setdefault("ai_trader.coins", MagicMock())
-sys.modules.setdefault("ai_trader.base_rate", MagicMock())
-sys.modules.setdefault("ai_trader.fees", _fees_module)
-sys.modules.setdefault("py_clob_client", MagicMock())
-sys.modules.setdefault("py_clob_client.order_builder", MagicMock())
-sys.modules.setdefault("py_clob_client.order_builder.constants", MagicMock(BUY="BUY", SELL="SELL"))
-sys.modules.setdefault("dotenv", MagicMock())
-sys.modules.setdefault("trading_state", MagicMock())
+_MISSING = object()
+_IMPORT_STUB_ORIGINALS = {}
+_PACKAGE_ATTR_ORIGINALS = {}
 
-import position_monitor as pm
+
+def _fake_module(name, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    return module
+
+
+def _install_import_stub(name, module):
+    if name not in _IMPORT_STUB_ORIGINALS:
+        _IMPORT_STUB_ORIGINALS[name] = sys.modules.get(name, _MISSING)
+    sys.modules[name] = module
+
+    parent_name, _, child_name = name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if parent is not None and child_name:
+        key = (parent_name, child_name)
+        if key not in _PACKAGE_ATTR_ORIGINALS:
+            _PACKAGE_ATTR_ORIGINALS[key] = getattr(parent, child_name, _MISSING)
+        setattr(parent, child_name, module)
+
+
+def _restore_import_stubs():
+    for (parent_name, child_name), original in reversed(list(_PACKAGE_ATTR_ORIGINALS.items())):
+        parent = sys.modules.get(parent_name)
+        if parent is None:
+            continue
+        if original is _MISSING:
+            try:
+                delattr(parent, child_name)
+            except AttributeError:
+                pass
+        else:
+            setattr(parent, child_name, original)
+
+    for name, original in reversed(list(_IMPORT_STUB_ORIGINALS.items())):
+        if original is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
+
+_clob_stub = _fake_module(
+    "ai_trader.clob_client",
+    BUY="BUY",
+    SELL="SELL",
+    OrderType=types.SimpleNamespace(GTC="GTC", FOK="FOK", GTD="GTD", FAK="FAK"),
+    get_fee_rate_bps=MagicMock(return_value=0),
+    get_balance=MagicMock(return_value=100),
+    get_orderbook=MagicMock(return_value=None),
+    get_midpoint=MagicMock(return_value=None),
+    get_last_trade_price=MagicMock(return_value=None),
+    get_order=MagicMock(return_value=None),
+    update_token_allowance=MagicMock(return_value=True),
+    place_fok_order=MagicMock(return_value={"matched": False}),
+    precache_token=MagicMock(),
+)
+_install_import_stub("ai_trader.clob_client", _clob_stub)
+_install_import_stub("ai_trader.binance_api", _fake_module("ai_trader.binance_api", price_stream=MagicMock()))
+_install_import_stub(
+    "ai_trader.pyth_api",
+    _fake_module("ai_trader.pyth_api", pyth_stream=MagicMock(), get_pyth_price=MagicMock(return_value=None)),
+)
+_install_import_stub("ai_trader.polymarket_ws", _fake_module("ai_trader.polymarket_ws", poly_ws=MagicMock()))
+_install_import_stub("ai_trader.polymarket_rtds", _fake_module("ai_trader.polymarket_rtds", chainlink_stream=MagicMock()))
+_install_import_stub(
+    "ai_trader.coins",
+    _fake_module(
+        "ai_trader.coins",
+        coin_from_slug=MagicMock(return_value="BTC"),
+        get_binance_symbol=MagicMock(return_value="BTCUSDT"),
+    ),
+)
+_install_import_stub("ai_trader.base_rate", _fake_module("ai_trader.base_rate", get_base_rate=MagicMock(return_value=0.5)))
+_install_import_stub(
+    "ai_trader.exit_truth_gate",
+    _fake_module(
+        "ai_trader.exit_truth_gate",
+        should_suppress_ev_exit=MagicMock(return_value=False),
+        is_shadow_mode=MagicMock(return_value=True),
+    ),
+)
+_install_import_stub("ai_trader.fees", _fees_module)
+_install_import_stub("dotenv", _fake_module("dotenv", load_dotenv=MagicMock()))
+_install_import_stub("trading_state", _fake_module("trading_state"))
+
+try:
+    import position_monitor as pm
+finally:
+    _restore_import_stubs()
 
 # 恢复 stdout/stderr（position_monitor 会替换成 _TeeWriter）
 sys.stdout = sys.__stdout__
@@ -657,14 +733,16 @@ class TestGetMarketPrice(unittest.TestCase):
 
     @patch.object(pm, "_poly_ws")
     @patch.object(pm, "clob_client")
-    @patch.object(pm, "normalize_orderbook")
-    def test_sdk_fallback(self, mock_norm, mock_clob, mock_ws):
+    @patch.object(pm, "extract_orderbook_levels")
+    def test_sdk_fallback(self, mock_extract, mock_clob, mock_ws):
         mock_ws.get_best_bid_ask.side_effect = Exception("WS down")
+        mock_ws.get_best_bid_ask_snapshot.return_value = None
+        mock_ws.get_book_snapshot.return_value = None
         book = MagicMock()
         book.bids = [MagicMock(price="0.48", size="10")]
         book.asks = [MagicMock(price="0.52", size="10")]
         mock_clob.get_orderbook.return_value = book
-        mock_norm.return_value = (
+        mock_extract.return_value = (
             [{"price": "0.48", "size": "10"}],
             [{"price": "0.52", "size": "10"}],
         )
@@ -675,6 +753,8 @@ class TestGetMarketPrice(unittest.TestCase):
     @patch.object(pm, "clob_client")
     def test_midpoint_fallback(self, mock_clob, mock_ws):
         mock_ws.get_best_bid_ask.return_value = (None, None)
+        mock_ws.get_best_bid_ask_snapshot.return_value = None
+        mock_ws.get_book_snapshot.return_value = None
         mock_clob.get_orderbook.return_value = None
         mock_clob.get_midpoint.return_value = 0.55
         result = pm.get_market_price("token1")
@@ -684,6 +764,8 @@ class TestGetMarketPrice(unittest.TestCase):
     @patch.object(pm, "clob_client")
     def test_ltp_fallback(self, mock_clob, mock_ws):
         mock_ws.get_best_bid_ask.return_value = (None, None)
+        mock_ws.get_best_bid_ask_snapshot.return_value = None
+        mock_ws.get_book_snapshot.return_value = None
         mock_clob.get_orderbook.return_value = None
         mock_clob.get_midpoint.return_value = None
         mock_clob.get_last_trade_price.return_value = 0.60
@@ -694,6 +776,8 @@ class TestGetMarketPrice(unittest.TestCase):
     @patch.object(pm, "clob_client")
     def test_all_fail_returns_none(self, mock_clob, mock_ws):
         mock_ws.get_best_bid_ask.return_value = (None, None)
+        mock_ws.get_best_bid_ask_snapshot.return_value = None
+        mock_ws.get_book_snapshot.return_value = None
         mock_clob.get_orderbook.return_value = None
         mock_clob.get_midpoint.return_value = None
         mock_clob.get_last_trade_price.return_value = None
@@ -1003,6 +1087,13 @@ class TestSellPosition(unittest.TestCase):
 class TestMarketSellImmediate(unittest.TestCase):
     """market_sell_immediate: 止损专用市价卖"""
 
+    def setUp(self):
+        self._env_patch = patch.dict(os.environ, {"STOP_LOSS_USE_FAK": "0"}, clear=False)
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+
     @patch.object(pm, "cancel_all_orders")
     @patch.object(pm, "_check_and_adjust_size", return_value=10.0)
     @patch.object(pm, "clob_client")
@@ -1267,11 +1358,14 @@ class TestMonitorExpiryCleanup(unittest.TestCase):
         }
         mock_positions.return_value = [stale_pos]
 
-        with patch.object(pm._chainlink_stream, "start"), \
+        with patch.dict(os.environ, {"PROXY_WALLET": ""}, clear=False), \
+             patch.object(pm, "_periodic_outcomes_backfill"), \
+             patch.object(pm._chainlink_stream, "start"), \
              patch.object(pm._chainlink_stream, "wait_for_update", side_effect=KeyboardInterrupt), \
              patch.object(pm._pyth_stream, "start"), \
              patch.object(pm._price_stream, "start"), \
-             patch.object(pm._poly_ws, "start"):
+             patch.object(pm._poly_ws, "start"), \
+             patch.object(pm._poly_ws, "wait_for_update", return_value=False):
             with self.assertRaises(KeyboardInterrupt):
                 pm.monitor()
 

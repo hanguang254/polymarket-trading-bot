@@ -34,6 +34,122 @@ class _ImmediateExecutor:
 
 
 class TestAdaptiveEntryHelpers(unittest.TestCase):
+    def test_extract_orderbook_levels_accepts_dict_book_from_v2_sdk(self):
+        book = {
+            "bids": [
+                {"price": "0.47", "size": "2"},
+                {"price": "0.48", "size": "10"},
+            ],
+            "asks": [
+                {"price": "0.53", "size": "3"},
+                {"price": "0.52", "size": "8"},
+            ],
+        }
+
+        bids, asks = ai_analyze_v2._extract_orderbook_levels(book)
+
+        self.assertEqual(bids[0], {"price": "0.48", "size": "10"})
+        self.assertEqual(asks[0], {"price": "0.52", "size": "8"})
+
+    def test_analyze_uses_realtime_clob_price_for_discount_gate(self):
+        details = {
+            "target_odds": 0.505,
+            "discount": 0.145,
+            "diff_in_atr": 2.0,
+            "price_diff": 100.0,
+            "atr": 100.0,
+            "estimated_value": 0.65,
+        }
+
+        with patch.dict(os.environ, {
+            "MAX_BUY_PRICE": "0.99",
+            "MIN_ATR_DEVIATION": "1.5",
+            "MIN_EV": "0.05",
+            "MIN_CONFIDENCE": "0.60",
+            "P_WIN_SHRINKAGE": "1.0",
+            "P_WIN_CAP": "0.92",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "analyze_market", return_value=("UP", 0.9, details.copy())):
+                with patch.object(ai_analyze_v2, "get_base_rate", return_value=0.5):
+                    with patch.object(ai_analyze_v2.clob_client, "get_fee_rate_bps", return_value=0):
+                        with patch.object(ai_analyze_v2, "_random_walk_p_win", return_value=0.65):
+                            with patch.object(ai_analyze_v2, "log_decision"):
+                                with patch("ai_trader.lmsr_liquidity.estimate_lmsr_b", side_effect=RuntimeError("no rest")):
+                                    with patch("ai_trader.lmsr_liquidity.lmsr_fair_price", return_value=None):
+                                        should_bet, direction, confidence, result = ai_analyze_v2.analyze_and_decide(
+                                            "ETH",
+                                            100.0,
+                                            0.505,
+                                            0.495,
+                                            "eth-updown-5m-test",
+                                            extra_info={
+                                                "up_token": "up-token",
+                                                "down_token": "down-token",
+                                                "remaining_seconds": 120,
+                                                "clob": {
+                                                    "up_bid": 0.84,
+                                                    "up_ask": 0.85,
+                                                    "down_bid": 0.15,
+                                                    "down_ask": 0.16,
+                                                },
+                                            },
+                                        )
+
+        self.assertEqual(direction, "UP")
+        self.assertFalse(should_bet)
+        self.assertEqual(result["exec_price"], 0.85)
+        self.assertAlmostEqual(result["exec_discount"], -0.2)
+
+    def test_analyze_treats_realtime_099_ask_as_too_expensive(self):
+        details = {
+            "target_odds": 0.505,
+            "discount": 0.145,
+            "diff_in_atr": 2.0,
+            "price_diff": 100.0,
+            "atr": 100.0,
+            "estimated_value": 0.65,
+        }
+
+        with patch.dict(os.environ, {
+            "MAX_BUY_PRICE": "0.99",
+            "MIN_ATR_DEVIATION": "1.5",
+            "MIN_EV": "0.05",
+            "MIN_CONFIDENCE": "0.60",
+            "P_WIN_SHRINKAGE": "1.0",
+            "P_WIN_CAP": "0.92",
+        }, clear=False):
+            with patch.object(ai_analyze_v2, "analyze_market", return_value=("UP", 0.9, details.copy())):
+                with patch.object(ai_analyze_v2, "get_base_rate", return_value=0.5):
+                    with patch.object(ai_analyze_v2.clob_client, "get_fee_rate_bps", return_value=0):
+                        with patch.object(ai_analyze_v2.clob_client, "get_last_trade_price", return_value=0.92):
+                            with patch.object(ai_analyze_v2, "_random_walk_p_win", return_value=0.65):
+                                with patch.object(ai_analyze_v2, "log_decision"):
+                                    with patch("ai_trader.lmsr_liquidity.estimate_lmsr_b", side_effect=RuntimeError("no rest")):
+                                        with patch("ai_trader.lmsr_liquidity.lmsr_fair_price", return_value=None):
+                                            should_bet, direction, confidence, result = ai_analyze_v2.analyze_and_decide(
+                                                "ETH",
+                                                100.0,
+                                                0.505,
+                                                0.495,
+                                                "eth-updown-5m-test",
+                                                extra_info={
+                                                    "up_token": "up-token",
+                                                    "down_token": "down-token",
+                                                    "remaining_seconds": 120,
+                                                    "clob": {
+                                                        "up_bid": 0.98,
+                                                        "up_ask": 0.99,
+                                                        "down_bid": 0.01,
+                                                        "down_ask": 0.02,
+                                                    },
+                                                },
+                                            )
+
+        self.assertEqual(direction, "UP")
+        self.assertFalse(should_bet)
+        self.assertEqual(result["exec_price"], 0.99)
+        self.assertLess(result["expected_value"], 0)
+
     def test_plan_fok_entry_reduces_size_when_cap_depth_is_too_shallow(self):
         asks = [
             {"price": "0.85", "size": "2"},
@@ -55,6 +171,42 @@ class TestAdaptiveEntryHelpers(unittest.TestCase):
         self.assertEqual(plan["mode"], "reduced")
         self.assertEqual(plan["size"], 5.9)
         self.assertEqual(plan["limit_price"], 0.88)
+
+    def test_log_decision_persists_execution_grid_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            decisions_file = os.path.join(tmp, "decisions.jsonl")
+            with patch.object(ai_analyze_v2, "DECISIONS_FILE", decisions_file):
+                ai_analyze_v2.log_decision(
+                    "eth-updown-5m-test",
+                    "ETH",
+                    100.0,
+                    "UP",
+                    0.61,
+                    0.52,
+                    0.48,
+                    {
+                        "expected_value": 0.04,
+                        "exec_price": 0.62,
+                        "target_odds": 0.52,
+                        "p_win_final": 0.67,
+                        "diff_in_atr": 1.2,
+                        "max_buy_price_threshold": 0.72,
+                        "min_ev_threshold": 0.02,
+                        "min_confidence_threshold": 0.3,
+                        "bet_reason": "ok",
+                    },
+                    action="BET",
+                )
+
+            record = json.loads(Path(decisions_file).read_text(encoding="utf-8"))
+
+        self.assertEqual(record["exec_price"], 0.62)
+        self.assertEqual(record["target_odds"], 0.52)
+        self.assertEqual(record["p_win_final"], 0.67)
+        self.assertEqual(record["max_buy_price_threshold"], 0.72)
+        self.assertEqual(record["min_ev_threshold"], 0.02)
+        self.assertEqual(record["min_confidence_threshold"], 0.3)
+        self.assertEqual(record["bet_reason"], "ok")
 
 
 class TestExecuteBetAdaptiveRetry(unittest.TestCase):

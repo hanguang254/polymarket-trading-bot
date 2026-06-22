@@ -8,13 +8,40 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    OrderArgs, MarketOrderArgs, OrderType,
-    BalanceAllowanceParams, AssetType,
-    PartialCreateOrderOptions,
-)
-from py_clob_client.order_builder.constants import BUY, SELL
+try:
+    from py_clob_client_v2 import (
+        ApiCreds,
+        ClobClient,
+        OrderArgs,
+        MarketOrderArgs,
+        OrderType,
+        BalanceAllowanceParams,
+        AssetType,
+        PartialCreateOrderOptions,
+        OpenOrderParams,
+        OrderPayload,
+        OrderMarketCancelParams,
+    )
+
+    BUY = "BUY"
+    SELL = "SELL"
+    SDK_FLAVOR = "py-clob-client-v2"
+    _SDK_V2 = True
+except ImportError:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import (
+        OrderArgs, MarketOrderArgs, OrderType,
+        BalanceAllowanceParams, AssetType,
+        PartialCreateOrderOptions,
+        OpenOrderParams,
+    )
+    from py_clob_client.order_builder.constants import BUY, SELL
+
+    ApiCreds = None
+    OrderPayload = None
+    OrderMarketCancelParams = None
+    SDK_FLAVOR = "py-clob-client"
+    _SDK_V2 = False
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +77,12 @@ def init_client():
         signature_type=sig_type,
         funder=funder,
     )
-    creds = _client.create_or_derive_api_creds()
+    if _SDK_V2:
+        creds = _client.create_or_derive_api_key()
+    else:
+        creds = _client.create_or_derive_api_creds()
     _client.set_api_creds(creds)
-    logger.info(f"✅ CLOB SDK 初始化完成 | funder={funder[:10]}...")
+    logger.info(f"✅ CLOB SDK 初始化完成 | sdk={SDK_FLAVOR} funder={funder[:10]}...")
 
     # Initialize User WS with same credentials
     try:
@@ -62,11 +92,17 @@ def init_client():
         logger.warning(f"User WS init skipped: {e}")
 
     # 缩短 httpx 超时（默认5s太长，止损时每秒都在亏钱）
-    import httpx
-    from py_clob_client.http_helpers import helpers as _h
-    fok_timeout = float(os.environ.get("FOK_TIMEOUT", "3"))
-    _h._http_client = httpx.Client(http2=True, timeout=httpx.Timeout(fok_timeout))
-    logger.info(f"⏱️ HTTP超时设置为 {fok_timeout}s")
+    try:
+        import httpx
+        if _SDK_V2:
+            from py_clob_client_v2.http_helpers import helpers as _h
+        else:
+            from py_clob_client.http_helpers import helpers as _h
+        fok_timeout = float(os.environ.get("FOK_TIMEOUT", "3"))
+        _h._http_client = httpx.Client(http2=True, timeout=httpx.Timeout(fok_timeout))
+        logger.info(f"⏱️ HTTP超时设置为 {fok_timeout}s")
+    except Exception as e:
+        logger.warning(f"HTTP client timeout patch skipped for {SDK_FLAVOR}: {e}")
 
     # 预热：用假单预加载 coincurve 签名库 + TLS 连接池
     # 原理：首次签名+HTTPS请求很慢（~200ms），预热后复用连接只需 ~26ms
@@ -225,6 +261,41 @@ def get_fee_rate_bps(token_id, refresh=False):
         return 0
 
 
+def _seed_client_token_cache(token_id, tick_size="0.01", neg_risk=False, fee_rate_bps=0):
+    """Best-effort SDK internals warmup cache seed; old/v2 clients differ slightly."""
+    cache_values = {
+        "_ClobClient__tick_sizes": tick_size,
+        "_ClobClient__tick_size_timestamps": time.monotonic(),
+        "_ClobClient__neg_risk": neg_risk,
+        "_ClobClient__fee_rates": fee_rate_bps,
+    }
+    for attr, value in cache_values.items():
+        cache = getattr(_client, attr, None)
+        if isinstance(cache, dict):
+            cache[token_id] = value
+
+
+def _market_order_args(token_id, amount, side, price, order_type):
+    if _SDK_V2:
+        return MarketOrderArgs(
+            token_id=token_id,
+            amount=amount,
+            side=side,
+            price=float(price),
+            order_type=order_type,
+        )
+    return MarketOrderArgs(
+        token_id=token_id,
+        amount=amount,
+        side=side,
+        price=float(price),
+        fee_rate_bps=0,
+        nonce=0,
+        taker="0x0000000000000000000000000000000000000000",
+        order_type=order_type,
+    )
+
+
 def _warmup():
     """预热签名库 + TLS/HTTP2连接池
 
@@ -243,14 +314,11 @@ def _warmup():
         # 1. 预热签名库（纯本地，0 HTTP 请求）
         #    SDK 的 create_order 内部 __resolve_tick_size / get_neg_risk / get_fee_rate_bps
         #    即使传了 options 也会查询。解决：直接写入 SDK 内部缓存，绕过 HTTP。
-        _client._ClobClient__tick_sizes[FAKE_TOKEN] = "0.01"
-        _client._ClobClient__tick_size_timestamps[FAKE_TOKEN] = time.monotonic()
-        _client._ClobClient__neg_risk[FAKE_TOKEN] = False
-        _client._ClobClient__fee_rates[FAKE_TOKEN] = 0
+        _seed_client_token_cache(FAKE_TOKEN, tick_size="0.01", neg_risk=False, fee_rate_bps=0)
 
         _client.create_order(
             OrderArgs(token_id=FAKE_TOKEN, price=0.01, size=1.0, side=BUY),
-            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=True),
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
         )
         t1 = time.time()
         sign_ms = (t1 - t0) * 1000
@@ -265,7 +333,7 @@ def _warmup():
         try:
             fake_order = _client.create_order(
                 OrderArgs(token_id=FAKE_TOKEN, price=0.01, size=1.0, side=BUY),
-                options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=True),
+                options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
             )
             _client.post_order(fake_order, OrderType.GTC)
         except Exception:
@@ -358,14 +426,11 @@ def place_fok_order(token_id, side, price, size):
         # 1. 签名（纯本地计算，不加锁）
         amount = float(price) * float(size) if side == BUY else float(size)
         order = _client.create_market_order(
-            MarketOrderArgs(
+            _market_order_args(
                 token_id=token_id,
                 amount=amount,
                 side=side,
-                price=float(price),
-                fee_rate_bps=0,
-                nonce=0,
-                taker="0x0000000000000000000000000000000000000000",
+                price=price,
                 order_type=OrderType.FOK,
             ),
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
@@ -417,14 +482,11 @@ def place_fak_order(token_id, side, price, size):
     try:
         amount = float(price) * float(size) if side == BUY else float(size)
         order = _client.create_market_order(
-            MarketOrderArgs(
+            _market_order_args(
                 token_id=token_id,
                 amount=amount,
                 side=side,
-                price=float(price),
-                fee_rate_bps=0,
-                nonce=0,
-                taker="0x0000000000000000000000000000000000000000",
+                price=price,
                 order_type=OrderType.FAK,
             ),
             options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk),
@@ -464,7 +526,10 @@ def cancel_order(order_id):
     """Cancel a single order by order_id"""
     try:
         with _client_lock:
-            resp = _client.cancel(order_id=str(order_id))
+            if _SDK_V2:
+                resp = _client.cancel_order(OrderPayload(orderID=str(order_id)))
+            else:
+                resp = _client.cancel(order_id=str(order_id))
         return True
     except Exception as e:
         logger.warning(f"Cancel order failed ({str(order_id)[:12]}): {e}")
@@ -498,7 +563,12 @@ def cancel_all(token_id=None):
     try:
         with _client_lock:
             if token_id:
-                resp = _client.cancel_market_orders(asset_id=str(token_id))
+                if _SDK_V2:
+                    resp = _client.cancel_market_orders(
+                        OrderMarketCancelParams(asset_id=str(token_id))
+                    )
+                else:
+                    resp = _client.cancel_market_orders(asset_id=str(token_id))
             else:
                 resp = _client.cancel_all()
         return True
@@ -675,9 +745,10 @@ def get_order(order_id):
 def get_orders(asset_id=None):
     """查询所有订单（可按 asset_id 过滤）"""
     try:
-        from py_clob_client.clob_types import OpenOrderParams
         params = OpenOrderParams(asset_id=str(asset_id)) if asset_id else None
         with _client_lock:
+            if _SDK_V2:
+                return _client.get_open_orders(params)
             return _client.get_orders(params)
     except Exception as e:
         logger.warning(f"查询订单列表失败: {e}")

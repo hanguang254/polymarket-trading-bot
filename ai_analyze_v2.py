@@ -7,7 +7,7 @@ AI 分析和下注决策 v2
 import sys
 import os
 import json
-import fcntl
+from ai_trader import file_lock as fcntl
 import math
 import time
 import logging
@@ -25,7 +25,7 @@ from ai_trader.ai_model_v2 import analyze_market
 from ai_trader.base_rate import get_base_rate
 from ai_trader import clob_client
 from ai_trader.fees import effective_fee_rate, estimate_buy_fill
-from py_clob_client.order_builder.constants import BUY
+from ai_trader.clob_client import BUY
 
 _bet_executor = ThreadPoolExecutor(max_workers=3)
 
@@ -92,6 +92,37 @@ def _random_walk_p_win(gap, atr_val, remaining_seconds):
     return p_win                             # cap 由 P_WIN_CAP env 统一控制
 
 
+def _float_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _realtime_clob_liquidity(extra_info, direction):
+    clob = (extra_info or {}).get("clob") or {}
+    prefix = "up" if direction == "UP" else "down" if direction == "DOWN" else None
+    if not prefix:
+        return None
+
+    best_ask = _float_or_none(clob.get(f"{prefix}_ask"))
+    best_bid = _float_or_none(clob.get(f"{prefix}_bid"))
+    if best_ask is None or not (0.01 < best_ask <= 0.99):
+        return None
+    if best_bid is not None and (best_bid <= 0 or best_bid >= best_ask):
+        best_bid = None
+
+    spread = best_ask - best_bid if best_bid is not None else 0.02
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": max(spread, 0.0),
+        "liquidity_score": 0.5,
+        "slippage_5": 0.0,
+        "source": "realtime_clob",
+    }
+
+
 def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, details, action="SKIP"):
     """记录决策到统计文件"""
     record = {
@@ -111,6 +142,16 @@ def log_decision(slug, coin, ptb, direction, confidence, up_odds, down_odds, det
         "diff_in_atr": details.get("diff_in_atr", 0),
         "current_price": details.get("current_price", 0),
         "total_score": details.get("total_score", 0),
+        "exec_price": details.get("exec_price"),
+        "target_odds": details.get("target_odds"),
+        "exec_discount": details.get("exec_discount"),
+        "p_win_final": details.get("p_win_final"),
+        "max_buy_price_threshold": details.get("max_buy_price_threshold"),
+        "min_ev_threshold": details.get("min_ev_threshold"),
+        "min_confidence_threshold": details.get("min_confidence_threshold"),
+        "discount_threshold": details.get("discount_threshold"),
+        "liquidity": details.get("liquidity"),
+        "bet_reason": details.get("bet_reason"),
         "action": action,
     }
 
@@ -237,6 +278,20 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
         is_liquid = odds_spread < 0.15
         discount_threshold = 0.10 if is_liquid else 0.15
 
+    realtime_liquidity = _realtime_clob_liquidity(extra_info, direction)
+    if realtime_liquidity:
+        if liquidity_info:
+            for key in ("best_bid", "best_ask", "spread"):
+                if realtime_liquidity.get(key) is not None:
+                    liquidity_info[key] = realtime_liquidity[key]
+            liquidity_info["source"] = "realtime_clob"
+        else:
+            liquidity_info = realtime_liquidity
+        details["realtime_clob_best_ask"] = round(realtime_liquidity["best_ask"], 4)
+        if realtime_liquidity.get("best_bid") is not None:
+            details["realtime_clob_best_bid"] = round(realtime_liquidity["best_bid"], 4)
+        details["spread"] = round(liquidity_info.get("spread", 0.02), 4)
+
     # 预热gap趋势覆盖（只能提高阈值，不能降低）
     if extra_info and "min_discount" in extra_info:
         discount_threshold = max(discount_threshold, extra_info["min_discount"])
@@ -362,12 +417,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
                 # v12 fix: last-trade-price 也 >= 0.90 说明市场真的定价到极端，不是空簿
                 # 这时候不应该用更低的价格覆盖，而是承认"没有入场机会"
                 if last_price >= 0.90:
+                    details["clob_extreme_priced"] = True
                     print(f"  📡 C1校准：市场已极端定价 ask=${exec_price:.3f} last=${last_price:.3f}，非空簿")
                 else:
                     exec_price = last_price
                     liquidity_info["best_ask"] = last_price
                     print(f"  📡 C1校准：CLOB空簿，使用last-trade-price=${last_price:.3f}替代best_ask")
-        if 0.01 < exec_price < 0.99:
+        if 0.01 < exec_price <= 0.99:
             details["gamma_odds"] = round(target_odds, 4)
             details["exec_price"] = round(exec_price, 4)
             target_odds = exec_price
@@ -452,7 +508,12 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     )
 
     details["should_bet"] = should_bet
-    liq_label = f"LMSR:{liquidity_info['liquidity_score']:.2f}" if liquidity_info else "fallback"
+    if liquidity_info and liquidity_info.get("source") == "realtime_clob":
+        liq_label = "CLOB:realtime"
+    elif liquidity_info:
+        liq_label = f"LMSR:{liquidity_info['liquidity_score']:.2f}"
+    else:
+        liq_label = "fallback"
     details["liquidity"] = liq_label
     details["discount_threshold"] = discount_threshold
     details["max_buy_price_threshold"] = round(MAX_PRICE, 4)
@@ -472,7 +533,7 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
     )
 
     # 空簿二次机会：C1校准拉负了折价，但Gamma指标本身OK → 放行，用校准价下单
-    if not should_bet and details.get("clob_empty_book"):
+    if not should_bet and details.get("clob_empty_book") and not details.get("clob_extreme_priced"):
         gamma_odds = details.get("gamma_odds", target_odds)
         gamma_discount = estimated_value - gamma_odds
         gamma_ev = p_win - gamma_odds
@@ -494,11 +555,13 @@ def analyze_and_decide(coin, price_to_beat, up_odds, down_odds, slug, extra_info
 
 
 def check_bid_depth(token_id):
-    """P2: 检查token的买方深度（SDK直连）"""
+    """Return aggregate bid depth from the current orderbook."""
     try:
+        from ai_trader.polymarket_api import extract_orderbook_levels
         book = clob_client.get_orderbook(token_id)
-        if book and book.bids:
-            return sum(float(b.size) for b in book.bids)
+        bids, _ = extract_orderbook_levels(book)
+        if bids:
+            return sum(float(b["size"]) for b in bids)
     except:
         pass
     return None
@@ -678,10 +741,8 @@ def _is_valid_clob_price(price):
 def _extract_orderbook_levels(book):
     if not book:
         return [], []
-    from ai_trader.polymarket_api import normalize_orderbook
-    raw_bids = [{"price": b.price, "size": b.size} for b in (book.bids or [])]
-    raw_asks = [{"price": a.price, "size": a.size} for a in (book.asks or [])]
-    return normalize_orderbook(raw_bids, raw_asks)
+    from ai_trader.polymarket_api import extract_orderbook_levels
+    return extract_orderbook_levels(book)
 
 
 def _build_quote_from_levels(bids, asks, source, age_ms=None):

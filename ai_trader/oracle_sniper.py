@@ -504,7 +504,7 @@ def _phase_maker(
     Real CLOB signature (C1 fix):
         clob_client.place_order(
             token_id, side, price, size,
-            order_type=OrderType.GTD,       # enum from py_clob_client.clob_types
+            order_type=OrderType.GTD,       # enum from ai_trader.clob_client
             expiration=unix_ts,              # Polymarket requires now + 60 + desired_lifetime
         )
 
@@ -516,8 +516,8 @@ def _phase_maker(
         {"status": "OPEN" | "ABORTED", "order_id": str, "buy_price": float,
          "size": float, "reason": str}
     """
-    from py_clob_client.clob_types import OrderType as _OT
-    from py_clob_client.order_builder.constants import BUY as _BUY
+    from ai_trader.clob_client import OrderType as _OT
+    from ai_trader.clob_client import BUY as _BUY
 
     cfg = _get_oracle_config()
     coin = verdict.details.get("coin", "?")
@@ -657,7 +657,7 @@ def _phase_taker(
     Clears the per-coin lock in finally so a failed taker path never leaves
     the coin stuck.
     """
-    from py_clob_client.order_builder.constants import BUY as _BUY
+    from ai_trader.clob_client import BUY as _BUY
 
     cfg = _get_oracle_config()
     coin = verdict.details.get("coin", "?")

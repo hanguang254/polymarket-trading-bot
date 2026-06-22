@@ -58,16 +58,21 @@ def get_fast_direction(coin, ptb, atr_val, up_token=None, down_token=None):
     # ── 信号2: 跨交易所价差领先 (权重0.35) ──
     W_CROSS = 0.35
     try:
-        from ai_trader.binance_api import BinancePriceStream
-        bn = BinancePriceStream()
-        binance_price = bn.get_price(coin)
-        if binance_price and binance_price > 0:
+        from ai_trader.binance_spread import get_spread_snapshot
+        spread = get_spread_snapshot(coin, ptb, atr_val, allow_latest_fallback=True)
+        if spread:
             # Binance领先Chainlink: 差值 > 0 表示Binance已经涨了但Chainlink还没跟上
-            lead = (binance_price - ptb) / atr_val
+            lead = spread["diff_atr_signed"]
             signals["cross_exchange_lead"] = {
-                "binance_price": round(binance_price, 2),
+                "source": "binance_spread_offset",
+                "binance_price": round(spread["binance_price"], 2),
                 "ptb": round(ptb, 2),
+                "adjusted_ptb": round(spread["adjusted_ptb"], 2),
+                "offset": round(spread["offset"], 4),
+                "diff": round(spread["diff"], 4),
                 "lead_atr": round(lead, 4),
+                "offset_method": spread.get("offset_method"),
+                "offset_reliable": spread.get("offset_reliable"),
             }
             if abs(lead) > 0.3:  # 至少0.3个ATR的领先才有意义
                 if lead > 0:
@@ -76,7 +81,26 @@ def get_fast_direction(coin, ptb, atr_val, up_token=None, down_token=None):
                     votes_down += W_CROSS * min(abs(lead) / 2.0, 1.0)
                 total_weight += W_CROSS
     except Exception:
-        pass
+        try:
+            from ai_trader.binance_api import BinancePriceStream
+            bn = BinancePriceStream()
+            binance_price = bn.get_price(coin)
+            if binance_price and binance_price > 0:
+                lead = (binance_price - ptb) / atr_val
+                signals["cross_exchange_lead"] = {
+                    "source": "raw_binance_ptb_fallback",
+                    "binance_price": round(binance_price, 2),
+                    "ptb": round(ptb, 2),
+                    "lead_atr": round(lead, 4),
+                }
+                if abs(lead) > 0.3:
+                    if lead > 0:
+                        votes_up += W_CROSS * min(abs(lead) / 2.0, 1.0)
+                    else:
+                        votes_down += W_CROSS * min(abs(lead) / 2.0, 1.0)
+                    total_weight += W_CROSS
+        except Exception:
+            pass
 
     # ── 信号3: Polymarket订单簿失衡 (权重0.25) ──
     W_OBI = 0.25

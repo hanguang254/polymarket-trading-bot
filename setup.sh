@@ -34,7 +34,7 @@ fi
 echo ""
 echo "🔍 验证依赖..."
 python3 -c "import playwright; print(f'  ✅ Playwright {playwright.__version__}')"
-python3 -c "import py_clob_client; print('  ✅ py-clob-client')"
+python3 -c "import py_clob_client_v2; print('  ✅ py-clob-client-v2')"
 python3 -c "import websocket; print('  ✅ websocket-client')"
 python3 -c "import dotenv; print('  ✅ python-dotenv')"
 

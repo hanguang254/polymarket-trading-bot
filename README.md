@@ -260,7 +260,7 @@ Layer 4 — System Protection
 
 ## CLOB SDK Integration
 
-This bot uses [py-clob-client](https://github.com/Polymarket/py-clob-client) Python SDK for all trading operations (order placement, cancellation, balance queries, orderbook data). SDK direct calls achieve **<50ms latency** vs 2-8s with CLI subprocess.
+This bot uses the official [py-clob-client-v2](https://github.com/Polymarket/py-clob-client-v2) Python SDK for all trading operations (order placement, cancellation, balance queries, orderbook data). `ai_trader/clob_client.py` keeps a stable wrapper API for the strategy code while adapting SDK v2 method names and order types. SDK direct calls achieve **<50ms latency** vs 2-8s with CLI subprocess.
 
 ```python
 # SDK initialization (once at startup, with TLS + signing library + cache warmup)
@@ -301,7 +301,7 @@ All components now use SDK/REST API directly — no Polymarket CLI dependency.
 
 - Python 3.10+
 - **Minimum server specs**: 2-core 2GB (2 coins serial PTB) / 4-core 4GB (3 coins parallel PTB)
-- [py-clob-client](https://github.com/Polymarket/py-clob-client) (`pip install py-clob-client`)
+- [py-clob-client-v2](https://github.com/Polymarket/py-clob-client-v2) (`pip install py-clob-client-v2`)
 - [websocket-client](https://pypi.org/project/websocket-client/) (`pip install websocket-client`) — Binance WebSocket price stream
 - Chromium browser + system dependencies (optional, Playwright PTB fallback only — primary PTB uses crypto-price API)
 

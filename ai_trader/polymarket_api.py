@@ -24,6 +24,37 @@ def normalize_orderbook(bids, asks):
     return sorted_bids, sorted_asks
 
 
+def _level_to_price_size(level):
+    if isinstance(level, dict):
+        price = level.get("price")
+        size = level.get("size")
+    else:
+        price = getattr(level, "price", None)
+        size = getattr(level, "size", None)
+    if price is None or size is None:
+        return None
+    return {"price": price, "size": size}
+
+
+def extract_orderbook_levels(book):
+    if not book:
+        return [], []
+
+    if isinstance(book, dict):
+        raw_bids = book.get("bids") or []
+        raw_asks = book.get("asks") or []
+    else:
+        raw_bids = getattr(book, "bids", None) or []
+        raw_asks = getattr(book, "asks", None) or []
+
+    bids = [_level_to_price_size(level) for level in raw_bids]
+    asks = [_level_to_price_size(level) for level in raw_asks]
+    return normalize_orderbook(
+        [level for level in bids if level is not None],
+        [level for level in asks if level is not None],
+    )
+
+
 def _slug_start_timestamp(slug):
     """从 5m market slug 提取开始时间戳。"""
     try:

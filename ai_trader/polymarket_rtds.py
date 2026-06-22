@@ -9,6 +9,7 @@ WebSocket 连接 wss://ws-live-data.polymarket.com，订阅 crypto_prices_chainl
 import json
 import threading
 import time
+from collections import deque
 
 from ai_trader.ws_ssl import get_websocket_sslopt
 
@@ -90,6 +91,7 @@ class ChainlinkPriceStream:
         self.last_update = {}   # {"BTC": time.time(), ...}
         self.source_timestamps = {}  # {"BTC": provider_ts, ...}
         self.update_count = {}  # {"BTC": 123, ...}
+        self.price_history = {}  # {"BTC": deque([(ts, price), ...])}
         self._running = False
         self._thread = None
         self._ws = None
@@ -142,6 +144,18 @@ class ChainlinkPriceStream:
             "source_age_ms": source_age_ms,
             "updates": self.update_count.get(coin, 0),
         }
+
+    def get_price_history(self, coin="BTC", window_sec=60):
+        """Return recent (ts, price) Chainlink points for Binance spread alignment."""
+        now = time.time()
+        cutoff = now - float(window_sec)
+        points = list(self.price_history.get(coin, ()))
+        latest_price = self.prices.get(coin)
+        latest_ts = self.last_update.get(coin, 0)
+        if latest_price is not None and latest_ts >= cutoff:
+            if not points or points[-1][0] != latest_ts:
+                points.append((latest_ts, latest_price))
+        return sorted((ts, price) for ts, price in points if ts >= cutoff)
 
     def wait_for_update(self, timeout=1.0, with_details=False):
         """阻塞等待 Chainlink 推送新价格，或到 timeout 秒后返回。
@@ -238,6 +252,11 @@ class ChainlinkPriceStream:
                 self.last_update[coin] = received_at
                 self.source_timestamps[coin] = source_ts
                 self.update_count[coin] = self.update_count.get(coin, 0) + 1
+                history = self.price_history.get(coin)
+                if history is None:
+                    history = deque(maxlen=1000)
+                    self.price_history[coin] = history
+                history.append((received_at, price))
                 self._last_event = {
                     "coin": coin,
                     "price": price,
